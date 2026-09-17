@@ -67,6 +67,9 @@ pocket-pirate-cyd/
 🧑‍💻 Creator & Author
 Joshua Lorson (Evil0ctopus)
 
+Support My Work
+[![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/Evil0ctopus)
+
 📜 License
 Distributed under the terms of the MIT License.
 
