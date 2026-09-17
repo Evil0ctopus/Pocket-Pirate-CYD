@@ -1,6 +1,6 @@
 # 🏴‍☠️ Pocket-Pirate-CYD
 
-<img width="1848" height="4000" alt="20260917_084137" src="https://github.com/user-attachments/assets/992e6dfd-d129-4ae0-95d4-3a98ccf2ce3d" />
+<img width="400" height="4000" alt="20260917_084137"style="transform: rotate(90deg);" src="https://github.com/user-attachments/assets/992e6dfd-d129-4ae0-95d4-3a98ccf2ce3d" />
 
 A pirate-themed handheld utility and firmware suite built specifically for the ESP32-S3 2.8" TFT Touch Module (commonly known as the **Cheap Black Display** or **CYD**). Transform your pocket hardware into a fully functional pirate captain's dashboard complete with pixel art, interactive menus, and modular tools!
 
