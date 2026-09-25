@@ -30,7 +30,7 @@ Pocket-Pirate-CYD comes packed with custom assets and modular features designed 
 1. **Visual Studio Code** installed on your workstation.
 2. The **PlatformIO IDE** extension installed inside VS Code.
 3. A USB-C cable connected to your ESP32-S3 CYD board.
-4. For the serial device test helper: Python 3 with `pyserial` and `Pillow` (`pip install pyserial pillow`).
+4. For the serial device test helper: Python 3, then `pip install -r tools/requirements.txt` (`pyserial`, `Pillow`).
 
 ### Installation & Flashing
 
@@ -61,7 +61,13 @@ Pocket-Pirate-CYD comes packed with custom assets and modular features designed 
 
 `tools/device_test.py` drives the firmware's USB serial test hooks (`INFO` / `TAP` / `SHOT`) and writes PNGs under `device_shots/`.
 
-There is **no hardcoded COM port**. Pass `--port`, or omit it to auto-detect when exactly one USB serial port is present:
+Install deps once:
+
+```bash
+pip install -r tools/requirements.txt
+```
+
+There is **no hardcoded COM port**. Pass `--port`, or omit it to auto-detect when exactly one USB serial port is present. If multiple USB serial devices are connected, `--port` is required:
 
 ```bash
 # Windows example
@@ -93,6 +99,7 @@ Pocket-Pirate-CYD/
 ├── include/             # Header files
 ├── src/                 # Main source code logic
 ├── tools/               # Helper scripts and utilities
+│   └── requirements.txt # pip deps for device_test.py
 ├── platformio.ini       # PlatformIO build configuration
 └── LICENSE              # MIT License
 ```
