@@ -9,7 +9,7 @@ Usage:
     python tools/device_test.py --port /dev/ttyACM0
     python tools/device_test.py              # auto-detect if exactly one USB port
 
-Requires: pyserial, Pillow
+Requires: pip install -r tools/requirements.txt  (pyserial, Pillow)
 """
 
 import argparse
