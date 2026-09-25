@@ -4,19 +4,77 @@
 Uses the firmware's serial test hooks (TAP/SHOT/INFO). Screenshots decode the
 raw RGB565 canvas dump into PNGs in device_shots/.
 
-Usage: python tools/device_test.py [port]     # default COM16
+Usage:
+    python tools/device_test.py --port COM3
+    python tools/device_test.py --port /dev/ttyACM0
+    python tools/device_test.py              # auto-detect if exactly one USB port
+
+Requires: pyserial, Pillow
 """
 
+import argparse
 import os
 import sys
 import time
 
 import serial
+from serial.tools import list_ports
 from PIL import Image
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "COM16"
 OUT = "device_shots"
-os.makedirs(OUT, exist_ok=True)
+
+
+def is_likely_usb_serial(port_info):
+    """Prefer USB CDC/UART adapters; skip bare platform ports like ttyS0."""
+    if port_info.vid is not None:
+        return True
+    name = port_info.device.rsplit("/", 1)[-1].lower()
+    if name.startswith("com") and name[3:].isdigit():
+        return True
+    return name.startswith((
+        "ttyacm",
+        "ttyusb",
+        "cu.usb",
+        "cu.wchusbserial",
+        "cu.usbserial",
+        "cu.usbmodem",
+    ))
+
+
+def resolve_port(explicit):
+    """Return an explicit port, or auto-detect when exactly one USB serial port exists."""
+    if explicit:
+        return explicit
+
+    all_ports = list(list_ports.comports())
+    ports = [p for p in all_ports if is_likely_usb_serial(p)]
+
+    if not ports:
+        lines = [
+            "No USB serial ports found.",
+            "Connect the CYD over USB, then pass --port explicitly, e.g.:",
+            "  python tools/device_test.py --port COM3              # Windows",
+            "  python tools/device_test.py --port /dev/ttyACM0      # Linux",
+            "  python tools/device_test.py --port /dev/cu.usbmodem* # macOS",
+        ]
+        if all_ports:
+            lines.append("Non-USB ports seen (not auto-selected):")
+            for p in all_ports:
+                lines.append(f"  {p.device}: {p.description}")
+        sys.exit("\n".join(lines))
+
+    if len(ports) == 1:
+        chosen = ports[0].device
+        print(f"Auto-detected serial port: {chosen} ({ports[0].description})")
+        return chosen
+
+    print("Multiple USB serial ports found; pass --port explicitly:")
+    for p in ports:
+        print(f"  {p.device}: {p.description}")
+    sys.exit(
+        "Usage: python tools/device_test.py --port <PORT>\n"
+        "Example: python tools/device_test.py --port COM3"
+    )
 
 
 class Dev:
@@ -82,7 +140,19 @@ class Dev:
 
 
 def main():
-    d = Dev(PORT)
+    parser = argparse.ArgumentParser(
+        description="Drive Pocket Pirate firmware over USB serial and capture screenshots."
+    )
+    parser.add_argument(
+        "--port", "-p",
+        help="Serial port (e.g. COM3, /dev/ttyACM0). Auto-detects if exactly one USB serial port is present.",
+    )
+    args = parser.parse_args()
+
+    port = resolve_port(args.port)
+    os.makedirs(OUT, exist_ok=True)
+
+    d = Dev(port)
     print(d.info())
     d.shot("01_boot")
 
