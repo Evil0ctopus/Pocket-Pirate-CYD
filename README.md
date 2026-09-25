@@ -108,7 +108,7 @@ Pocket-Pirate-CYD/
 
 ## 🧑‍💻 Creator & Author
 
-Joshua Lorson (Evil0ctopus)
+Evil0ctopus
 
 ### Support My Work
 
@@ -119,3 +119,4 @@ Joshua Lorson (Evil0ctopus)
 ## 📜 License
 
 Distributed under the terms of the MIT License.
+
