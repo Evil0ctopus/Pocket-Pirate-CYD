@@ -58,11 +58,28 @@ def main() -> None:
     app = build / "firmware.bin"
     boot_app0 = build / "boot_app0.bin"
 
+    factory = build / "firmware.factory.bin"
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prefer PlatformIO's own combined image when present (includes boot_app0).
+    if factory.is_file() and app.is_file():
+        shutil.copy2(factory, args.output)
+        size = args.output.stat().st_size
+        print(f"Copied PlatformIO factory image ({size} bytes) -> {args.output}")
+        print("Flash with: esptool.py --chip esp32s3 --port PORT write_flash 0x0", args.output.name)
+        # Also stage app-only sibling for OTA convenience when called from CI.
+        app_out = args.output.with_name(args.output.stem + "-app.bin")
+        # Only auto-write -app.bin when output is the canonical release name.
+        if "cheap-black-display.bin" in args.output.name and "-app" not in args.output.name:
+            shutil.copy2(app, args.output.with_name(
+                "Pocket-Pirate-CYD-cheap-black-display-app.bin"))
+            print("Also wrote app-only ->", args.output.with_name(
+                "Pocket-Pirate-CYD-cheap-black-display-app.bin"))
+        return
+
     for req in (bootloader, partitions, app):
         if not req.is_file():
             sys.exit(f"missing {req} — run: pio run -e {args.env}")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = find_esptool() + [
         "--chip",
