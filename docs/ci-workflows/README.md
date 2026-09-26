@@ -1,10 +1,28 @@
 # CI workflow templates
 
-These are the intended GitHub Actions workflows for Pocket-Pirate-CYD.
+These YAML files are the intended GitHub Actions workflows for Pocket-Pirate-CYD.
+Copies also live under `.github/workflows/` when the pushing token has the
+`workflow` OAuth scope.
 
-The agent OAuth token that landed v0.2.0 **lacks the `workflow` scope**, so `.github/workflows/*` could not be pushed. To enable CI + tagged firmware releases:
+## If `.github/workflows/` push is rejected
 
-1. Copy both YAML files into `.github/workflows/` on `main` (or open a PR with that change) using an account/token that has the `workflow` scope.
-2. Push a tag `v*` (or use **Release firmware → workflow_dispatch**) to publish `.bin` assets automatically.
+Agent / fine-grained tokens sometimes lack the **`workflow`** scope. Symptoms:
 
-Until then, use the [v0.2.0 release binary](https://github.com/Evil0ctopus/Pocket-Pirate-CYD/releases/tag/v0.2.0) or `pio run -e cheap-black-display`.
+- `refusing to allow a Personal Access Token to create or update workflow`
+- `git push` rejected for paths under `.github/workflows/`
+
+**Fix (Josh):** grant the `workflow` scope on the token (classic PAT) or use
+the GitHub website / a scoped app to commit the two files from this folder
+into `.github/workflows/` on `main`. Then push a tag `v*` (or run
+**Release firmware → workflow_dispatch**) to publish binaries.
+
+Until CI is live, build locally:
+
+```bash
+pio run -e cheap-black-display
+python tools/package_firmware.py   # merged factory image @ 0x0
+```
+
+Release assets must be the **merged** bin (bootloader + partitions + app),
+not the app-only `firmware.bin`. The app-only image is published alongside
+as `…-app.bin` for OTA.

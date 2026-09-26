@@ -14,9 +14,14 @@
 #include "gps.h"
 #include "led.h"
 #include "oui.h"
+#include "ota.h"
 #include "pirate_theme.h"
 #include "power.h"
 #include "spyglass_signatures.h"
+
+#ifndef PP_VERSION
+#define PP_VERSION "0.3.0"
+#endif
 
 using namespace CheapBlackDisplay;
 
@@ -604,7 +609,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.2.0,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.3.0,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -835,13 +840,16 @@ void sgClose() { WiFi.scanDelete(); }
 void sgDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   txt(x + 8, y + 4, theme::kGold, 1, "Watchtowers spotted: %d", sgHitCount);
-  if (!spyglass::hasVerifiedSignature()) {
+  if (spyglass::hasVerifiedSignature()) {
+    txt(x + 8, y + 18, theme::kGood, 1, "Verified field OUIs armed (DeFlock).");
+    txt(x + 8, y + 30, theme::kInkDim, 1, "OUI hit = strong; keyword = candidate.");
+  } else {
     txt(x + 8, y + 20, theme::kWarn, 1, "Keyword heuristics only -- hits are");
     txt(x + 8, y + 32, theme::kInkDim, 1, "candidates. Verify against DeFlock.");
   }
   int rows = min(sgHitCount, 10);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 54 + i * 14;
+    int ry = y + 48 + i * 14;
     txt(x + 8, ry, theme::kBad, 1, "%s", sgHits[i].label.c_str());
     txt(x + 8, ry + 6, theme::kInkDim, 1, "%s  %s  %ddB",
         sgHits[i].ssid.c_str(), sgHits[i].bssid.c_str(), sgHits[i].rssi);
@@ -1009,32 +1017,138 @@ bool hiTouch(int16_t, int16_t) { return false; }
 }  // namespace
 
 // ===========================================================================
-//  9. Captain's Log -- microSD file browser (read-only)
+//  9. Captain's Log -- microSD browser + WiGLE / text preview
 // ===========================================================================
 namespace {
-String clFiles[24];
-long clSizes[24];
+String clFiles[32];
+long clSizes[32];
 int clCount = 0;
+int clScroll = 0;
+int clMode = 0;  // 0=list, 1=preview
+String clOpenName;
+String clLines[14];
+int clLineCount = 0;
+int clPreviewScroll = 0;
+bool clIsWigle = false;
+int clWigleRows = 0;
+int clWigleUnique = 0;
+
 void clRefresh() {
   clCount = 0;
+  clScroll = 0;
   if (!app::sdReady()) return;
   File dir = SD_MMC.open("/");
   if (!dir) return;
   File f = dir.openNextFile();
-  while (f && clCount < 24) {
+  while (f && clCount < 32) {
     String n = String(f.name());
     int slash = n.lastIndexOf('/');
     if (slash >= 0) n = n.substring(slash + 1);
-    clFiles[clCount] = (f.isDirectory() ? String("[") + n + "]" : n);
-    clSizes[clCount] = f.isDirectory() ? -1 : (long)f.size();
+    if (f.isDirectory()) {
+      clFiles[clCount] = String("[") + n + "]";
+      clSizes[clCount] = -1;
+    } else {
+      clFiles[clCount] = n;
+      clSizes[clCount] = (long)f.size();
+    }
     clCount++;
     f = dir.openNextFile();
   }
   dir.close();
 }
-void clOpen() { clRefresh(); }
+
+bool clLooksText(const String& name) {
+  String l = name;
+  l.toLowerCase();
+  return l.endsWith(".csv") || l.endsWith(".txt") || l.endsWith(".log") ||
+         l.endsWith(".json") || l.endsWith(".nmea") || l.endsWith(".md");
+}
+
+void clLoadPreview(const String& name) {
+  clOpenName = name;
+  clLineCount = 0;
+  clPreviewScroll = 0;
+  clIsWigle = false;
+  clWigleRows = 0;
+  clWigleUnique = 0;
+  for (int i = 0; i < 14; i++) clLines[i] = "";
+  if (!app::sdReady()) return;
+  String path = String("/") + name;
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) {
+    clLines[0] = "(could not open)";
+    clLineCount = 1;
+    return;
+  }
+  String lower = name;
+  lower.toLowerCase();
+  clIsWigle = lower.endsWith(".csv") &&
+              (lower.indexOf("wigle") >= 0 || lower == "wigle.csv");
+
+  if (clIsWigle) {
+    // Summarize WiGLE CSV: skip meta + header, collect unique SSIDs sample.
+    uint32_t hashes[64];
+    int hashCount = 0;
+    auto ssidHash = [](const String& s) -> uint32_t {
+      uint32_t h = 2166136261u;
+      for (size_t i = 0; i < s.length(); i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+      }
+      return h;
+    };
+    int lineNo = 0;
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (!line.length()) continue;
+      lineNo++;
+      if (lineNo == 1 && line.startsWith("WigleWifi")) continue;
+      if (line.startsWith("MAC,SSID")) continue;
+      clWigleRows++;
+      // MAC,SSID,AuthMode,...
+      int c1 = line.indexOf(',');
+      int c2 = c1 >= 0 ? line.indexOf(',', c1 + 1) : -1;
+      int c3 = c2 >= 0 ? line.indexOf(',', c2 + 1) : -1;
+      int c4 = c3 >= 0 ? line.indexOf(',', c3 + 1) : -1;
+      int c5 = c4 >= 0 ? line.indexOf(',', c4 + 1) : -1;
+      int c6 = c5 >= 0 ? line.indexOf(',', c5 + 1) : -1;
+      if (c1 < 0 || c2 < 0 || c6 < 0) continue;
+      String ssid = line.substring(c1 + 1, c2);
+      String auth = line.substring(c2 + 1, c3);
+      String rssi = line.substring(c5 + 1, c6);
+      if (!ssid.length()) ssid = "<hidden>";
+      uint32_t h = ssidHash(ssid);
+      bool found = false;
+      for (int i = 0; i < hashCount; i++)
+        if (hashes[i] == h) { found = true; break; }
+      if (!found && hashCount < 64) hashes[hashCount++] = h;
+      if (clLineCount < 14) {
+        if (ssid.length() > 14) ssid = ssid.substring(0, 14);
+        if (auth.length() > 10) auth = auth.substring(0, 10);
+        clLines[clLineCount++] =
+            ssid + "  " + rssi + "dB  " + auth;
+      }
+    }
+    clWigleUnique = hashCount;
+  } else {
+    while (f.available() && clLineCount < 14) {
+      String line = f.readStringUntil('\n');
+      line.replace('\r', ' ');
+      if (line.length() > 42) line = line.substring(0, 42);
+      clLines[clLineCount++] = line;
+    }
+  }
+  f.close();
+}
+
+void clOpen() {
+  clMode = 0;
+  clRefresh();
+}
 void clTick(uint32_t) {}
-void clClose() {}
+void clClose() { clMode = 0; }
+
 void clDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   if (!app::sdReady()) {
@@ -1042,18 +1156,104 @@ void clDraw(int x, int y, int w, int h) {
     txt(x + 8, y + 26, theme::kInkDim, 1, "Insert a microSD and reopen.");
     return;
   }
-  txt(x + 8, y + 4, theme::kGold, 1, "Ship's hold: %d items", clCount);
-  int rows = min(clCount, 15);
+
+  if (clMode == 1) {
+    // Preview pane
+    G().fillRoundRect(x + 8, y + 4, 70, 18, 3, theme::kPanelHi);
+    txt(x + 16, y + 8, theme::kInk, 1, "< Back");
+    String title = clOpenName;
+    if (title.length() > 22) title = title.substring(0, 22);
+    txt(x + 86, y + 8, theme::kGold, 1, "%s", title.c_str());
+
+    if (clIsWigle) {
+      txt(x + 8, y + 28, theme::kGood, 1, "WiGLE: %d rows, %d unique SSIDs",
+          clWigleRows, clWigleUnique);
+      txt(x + 8, y + 40, theme::kInkDim, 1, "SSID           RSSI  Auth");
+      int rows = min(clLineCount, 10);
+      for (int i = 0; i < rows; i++) {
+        int ry = y + 54 + i * 12;
+        txt(x + 8, ry, theme::kInk, 1, "%s", clLines[i].c_str());
+      }
+      if (clWigleRows == 0)
+        txt(x + 8, y + 54, theme::kInkDim, 1, "(empty log — sail Chart Room)");
+    } else {
+      txt(x + 8, y + 28, theme::kInkDim, 1, "Preview (first lines):");
+      int rows = min(clLineCount, 12);
+      for (int i = 0; i < rows; i++) {
+        int ry = y + 42 + i * 12;
+        txt(x + 8, ry, theme::kInk, 1, "%s", clLines[i].c_str());
+      }
+      if (clLineCount == 0)
+        txt(x + 8, y + 42, theme::kInkDim, 1, "(empty or binary file)");
+    }
+    return;
+  }
+
+  // List pane
+  txt(x + 8, y + 4, theme::kGold, 1, "Captain's Log: %d items  (tap open)",
+      clCount);
+  txt(x + 8, y + 16, theme::kInkDim, 1, "Tap row = preview  |  empty = refresh");
+  const int visible = 12;
+  if (clScroll > clCount - visible) clScroll = max(0, clCount - visible);
+  if (clScroll < 0) clScroll = 0;
+  int rows = min(visible, clCount - clScroll);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 18 + i * 12;
-    String nm = clFiles[i];
-    if (nm.length() > 26) nm = nm.substring(0, 26);
-    txt(x + 8, ry, theme::kInk, 1, "%s", nm.c_str());
-    if (clSizes[i] >= 0)
-      txt(x + 236, ry, theme::kInkDim, 1, "%ldB", clSizes[i]);
+    int idx = clScroll + i;
+    int ry = y + 32 + i * 13;
+    bool wigle = false;
+    String low = clFiles[idx];
+    low.toLowerCase();
+    if (low.indexOf("wigle") >= 0 && low.endsWith(".csv")) wigle = true;
+    String nm = clFiles[idx];
+    if (nm.length() > 24) nm = nm.substring(0, 24);
+    txt(x + 8, ry, wigle ? theme::kGood : theme::kInk, 1, "%s", nm.c_str());
+    if (clSizes[idx] >= 0)
+      txt(x + 236, ry, theme::kInkDim, 1, "%ldB", clSizes[idx]);
+  }
+  // Scroll affordances
+  if (clCount > visible) {
+    G().fillRoundRect(x + 280, y + 32, 28, 22, 3, theme::kPanelHi);
+    txt(x + 288, y + 37, theme::kInk, 1, "^");
+    G().fillRoundRect(x + 280, y + 160, 28, 22, 3, theme::kPanelHi);
+    txt(x + 288, y + 165, theme::kInk, 1, "v");
   }
 }
-bool clTouch(int16_t, int16_t) {
+
+bool clTouch(int16_t x, int16_t y) {
+  int ly = y - 44;  // content-local
+  if (clMode == 1) {
+    if (ly >= 0 && ly <= 28 && x >= 8 && x <= 90) {
+      clMode = 0;
+      return true;
+    }
+    return true;
+  }
+  // Scroll buttons
+  if (clCount > 12 && x >= 270) {
+    if (ly >= 28 && ly <= 60) {
+      clScroll = max(0, clScroll - 4);
+      return true;
+    }
+    if (ly >= 156 && ly <= 190) {
+      clScroll = min(max(0, clCount - 12), clScroll + 4);
+      return true;
+    }
+  }
+  // Row tap
+  if (ly >= 28 && ly <= 190 && x < 270) {
+    int row = (ly - 28) / 13;
+    int idx = clScroll + row;
+    if (idx >= 0 && idx < clCount && clSizes[idx] >= 0) {
+      if (clLooksText(clFiles[idx])) {
+        clLoadPreview(clFiles[idx]);
+        clMode = 1;
+      } else {
+        tools::toast("Binary — use companion LOGGET");
+      }
+      return true;
+    }
+  }
+  // Empty tap refreshes
   clRefresh();
   return true;
 }
@@ -1183,55 +1383,111 @@ bool slTouch(int16_t x, int16_t y) {
 //  12. Settings Cabin
 // ===========================================================================
 namespace {
-void seOpen() {}
+bool seOtaBusy = false;
+
+void seOpen() { seOtaBusy = false; }
 void seTick(uint32_t) {}
 void seClose() {}
 void seDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 6, theme::kInk, 2, "Settings Cabin");
-  txt(x + 8, y + 32, theme::kInkDim, 1, "Captain: %s  (%s Lv %d)",
+  txt(x + 8, y + 4, theme::kInk, 2, "Settings Cabin");
+  txt(x + 8, y + 26, theme::kInkDim, 1, "%s  %s Lv%d  fw %s",
       game::profile.name, game::rankTitle(game::profile.level),
-      game::profile.level);
+      game::profile.level, PP_VERSION);
 
-  // Rename row
-  G().fillRoundRect(x + 8, y + 48, 170, 28, 5, theme::kPanelHi);
-  txt(x + 18, y + 57, theme::kInk, 1, "Rename yer pirate...");
+  // Rename
+  G().fillRoundRect(x + 8, y + 42, 150, 24, 4, theme::kPanelHi);
+  txt(x + 16, y + 49, theme::kInk, 1, "Rename…");
 
-  // Brightness row
-  txt(x + 8, y + 90, theme::kInk, 1, "Brightness: %d%%", app::brightness());
-  G().fillRoundRect(x + 150, y + 84, 30, 22, 4, theme::kPanelHi);
-  txt(x + 160, y + 90, theme::kInk, 2, "-");
-  G().fillRoundRect(x + 186, y + 84, 30, 22, 4, theme::kPanelHi);
-  txt(x + 196, y + 90, theme::kInk, 2, "+");
+  // Brightness
+  txt(x + 168, y + 49, theme::kInk, 1, "Bri %d", app::brightness());
+  G().fillRoundRect(x + 232, y + 42, 28, 24, 4, theme::kPanelHi);
+  txt(x + 240, y + 48, theme::kInk, 2, "-");
+  G().fillRoundRect(x + 264, y + 42, 28, 24, 4, theme::kPanelHi);
+  txt(x + 272, y + 48, theme::kInk, 2, "+");
 
-  // Sound row
-  G().fillRoundRect(x + 8, y + 116, 150, 28, 5,
+  // Sound + idle-sleep toggles
+  G().fillRoundRect(x + 8, y + 72, 120, 24, 4,
                     app::sound() ? theme::kGood : theme::kLocked);
-  txt(x + 18, y + 124, theme::kInk, 1, "Sound: %s (tap)",
-      app::sound() ? "ON" : "off");
+  txt(x + 16, y + 79, theme::kInk, 1, "Sound:%s", app::sound() ? "ON" : "off");
+  G().fillRoundRect(x + 136, y + 72, 160, 24, 4,
+                    power::idleSleep() ? theme::kWarn : theme::kPanelHi);
+  txt(x + 144, y + 79, theme::kInk, 1, "Idle sleep:%s",
+      power::idleSleep() ? "ON" : "off");
 
-  // Reset row
-  G().fillRoundRect(x + 8, y + 152, 180, 28, 5, theme::kBad);
-  txt(x + 18, y + 160, theme::kInk, 1, "Reset progress (tap)");
-  txt(x + 8, y + 188, theme::kInkDim, 1,
-      "LED profile lives in the Signal Lantern.");
+  // Sleep now
+  G().fillRoundRect(x + 8, y + 102, 140, 24, 4, theme::kSeaFoam);
+  txt(x + 16, y + 109, theme::kInk, 1, "Sleep now (touch wake)");
+
+  // OTA
+  G().fillRoundRect(x + 156, y + 102, 140, 24, 4,
+                    (ota::wifiConfigured() && ota::urlConfigured())
+                        ? theme::kGold
+                        : theme::kLocked);
+  txt(x + 164, y + 109, theme::kInk, 1, seOtaBusy ? "OTA…" : "OTA Update");
+
+  txt(x + 8, y + 134, theme::kInkDim, 1, "OTA: %s", ota::status());
+  if (ota::wifiConfigured())
+    txt(x + 8, y + 146, theme::kInkDim, 1, "WiFi:%s  URL:%s",
+        ota::wifiSsid(), ota::urlConfigured() ? "set" : "none");
+  else
+    txt(x + 8, y + 146, theme::kInkDim, 1,
+        "Set WiFi+URL via companion WIFICFG/OTAURL");
+
+  // Reset
+  G().fillRoundRect(x + 8, y + 168, 170, 24, 4, theme::kBad);
+  txt(x + 16, y + 175, theme::kInk, 1, "Reset progress");
 }
+
 bool seTouch(int16_t x, int16_t y) {
-  int ly = y - 44;  // to content-local
-  if (ly >= 42 && ly <= 82 && x >= 8 && x <= 190) {
-    app::requestRename();
-    return false;  // main switches screens; no tool redraw needed
+  int ly = y - 44;
+  if (ly >= 38 && ly <= 70) {
+    if (x >= 8 && x <= 165) {
+      app::requestRename();
+      return false;
+    }
+    if (x >= 226 && x <= 262) {
+      app::setBrightness(app::brightness() - 10);
+      return true;
+    }
+    if (x >= 260 && x <= 300) {
+      app::setBrightness(app::brightness() + 10);
+      return true;
+    }
   }
-  if (ly >= 84 && ly <= 112) {
-    if (x >= 144 && x <= 182) app::setBrightness(app::brightness() - 10);
-    else if (x >= 183 && x <= 222) app::setBrightness(app::brightness() + 10);
-    return true;
+  if (ly >= 68 && ly <= 100) {
+    if (x >= 8 && x <= 132) {
+      app::setSound(!app::sound());
+      return true;
+    }
+    if (x >= 136 && x <= 300) {
+      power::setIdleSleep(!power::idleSleep());
+      tools::toast(power::idleSleep() ? "Idle sleep ON (3m)" : "Idle sleep off");
+      return true;
+    }
   }
-  if (ly >= 114 && ly <= 148 && x >= 8 && x <= 170) {
-    app::setSound(!app::sound());
-    return true;
+  if (ly >= 98 && ly <= 130) {
+    if (x >= 8 && x <= 152) {
+      game::save();
+      tools::toast("Sleeping — tap screen to wake");
+      delay(500);
+      power::deepSleepNow();
+      return true;
+    }
+    if (x >= 156 && x <= 300) {
+      if (!ota::wifiConfigured() || !ota::urlConfigured()) {
+        tools::toast("Need WIFICFG + OTAURL first");
+        return true;
+      }
+      seOtaBusy = true;
+      tools::toast("OTA starting…");
+      bool ok = ota::runUpdate();
+      seOtaBusy = false;
+      if (!ok) tools::toast("OTA: %s", ota::status());
+      return true;
+    }
   }
-  if (ly >= 150 && ly <= 184 && x >= 8 && x <= 200) {
+  if (ly >= 164 && ly <= 196 && x >= 8 && x <= 190) {
     game::resetProgress();
     tools::toast("Progress reset");
     return true;
@@ -1464,7 +1720,7 @@ static const Tool kTools[] = {
      rwDraw, rwTouch},
     {"Hull Inspection", "Network audit", theme::kGold, hiOpen, hiTick, hiClose,
      hiDraw, hiTouch},
-    {"Captain's Log", "SD file browser", theme::kSail, clOpen, clTick, clClose,
+    {"Captain's Log", "SD browser + WiGLE", theme::kSail, clOpen, clTick, clClose,
      clDraw, clTouch},
     {"Ship's Systems", "Diagnostics", theme::kSeaFoam, ssOpen, ssTick, ssClose,
      ssDraw, ssTouch},

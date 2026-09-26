@@ -211,3 +211,24 @@ world loop then blits the parallax layers (scrolling clouds/waves), plays the
 captain's `idle` clip, bobs the ship, and switches to the `wave` clip on tap.
 Anything missing falls back to the vector renderer, so a partial art pack is
 fine — add one captain at a time.
+
+---
+
+## Shippable packs in this repo
+
+You do **not** need commissioned art to ship a good look. Two packs are ready:
+
+| Folder | Role |
+|--------|------|
+| `artpack_pixel/` | Primary shippable pixel pack (idle/wave/fight/jig/look, ships, sky/waves/deck) |
+| `artpack_sample/` | Minimal pipeline-validation pack (idle + wave only) |
+
+Quick gallery on your PC:
+
+```bash
+python tools/preview_world.py artpack_pixel --avatar 0 --tier 2
+# refreshes artpack_pixel/preview.gif + preview.png
+```
+
+On device: copy `artpack_pixel/*` → microSD `/art/`, reboot. Firmware falls back
+to vector chibi art if `/art/` is missing.
