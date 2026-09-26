@@ -1,3 +1,3 @@
-# Dependencies for tools/device_test.py (USB serial + PNG screenshots)
+# Dependencies for tools/device_test.py and tools/companion.py
 pyserial>=3.5
 Pillow>=9.0.0

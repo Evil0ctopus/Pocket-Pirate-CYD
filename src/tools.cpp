@@ -6,13 +6,16 @@
 #include <SD_MMC.h>
 
 #include <set>
+#include <strings.h>
 
 #include "app.h"
 #include "board_pins.h"
 #include "game_state.h"
+#include "gps.h"
 #include "led.h"
 #include "oui.h"
 #include "pirate_theme.h"
+#include "power.h"
 #include "spyglass_signatures.h"
 
 using namespace CheapBlackDisplay;
@@ -104,6 +107,7 @@ uint64_t bssidKey(const uint8_t* b) {
 
 // Session set of already-rewarded BSSIDs so xp is only granted for new finds.
 std::set<uint64_t> g_seenAp;
+int g_lastWifiCount = 0;
 
 // ===========================================================================
 //  Shared BLE scan (used by Harbor Ledger, Tracker Watch, Spyglass)
@@ -283,14 +287,86 @@ void bleTick(uint32_t now) {
 }  // namespace
 
 // ===========================================================================
-//  1. Crow's Nest -- Wi-Fi survey
+//  1. Crow's Nest -- Wi-Fi survey (sort / filter / detail / scroll)
 // ===========================================================================
 namespace {
-uint32_t cnLast = 0;
+struct CnNet {
+  char ssid[33];
+  uint8_t bssid[6];
+  int32_t rssi;
+  uint8_t channel;
+  wifi_auth_mode_t auth;
+};
+CnNet cnNets[48];
+int cnCount = 0;
 int cnProcessed = -1;
+uint32_t cnLast = 0;
+int cnScroll = 0;          // first visible row
+int cnSort = 0;            // 0=RSSI 1=CH 2=SSID
+int cnFilter = 0;          // 0=All 1=Open 2=Secure
+int cnDetail = -1;         // index into cnNets, or -1
+
+int cnVisibleIdx[48];
+int cnVisibleCount = 0;
+
+void cnRebuildVisible() {
+  cnVisibleCount = 0;
+  for (int i = 0; i < cnCount; i++) {
+    bool open = (cnNets[i].auth == WIFI_AUTH_OPEN);
+    if (cnFilter == 1 && !open) continue;
+    if (cnFilter == 2 && open) continue;
+    cnVisibleIdx[cnVisibleCount++] = i;
+  }
+  auto cmp = [](int a, int b) {
+    const CnNet& A = cnNets[a];
+    const CnNet& B = cnNets[b];
+    if (cnSort == 1) {
+      if (A.channel != B.channel) return A.channel < B.channel;
+      return A.rssi > B.rssi;
+    }
+    if (cnSort == 2) {
+      int c = strcasecmp(A.ssid, B.ssid);
+      if (c != 0) return c < 0;
+      return A.rssi > B.rssi;
+    }
+    return A.rssi > B.rssi;
+  };
+  for (int i = 1; i < cnVisibleCount; i++) {
+    int v = cnVisibleIdx[i], j = i;
+    while (j > 0 && cmp(v, cnVisibleIdx[j - 1])) {
+      cnVisibleIdx[j] = cnVisibleIdx[j - 1];
+      j--;
+    }
+    cnVisibleIdx[j] = v;
+  }
+  int maxScroll = max(0, cnVisibleCount - 10);
+  if (cnScroll > maxScroll) cnScroll = maxScroll;
+}
+
+void cnCapture(int st) {
+  cnCount = 0;
+  for (int i = 0; i < st && cnCount < 48; i++) {
+    CnNet& n = cnNets[cnCount];
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) ssid = "<hidden>";
+    strncpy(n.ssid, ssid.c_str(), sizeof(n.ssid) - 1);
+    n.ssid[sizeof(n.ssid) - 1] = 0;
+    const uint8_t* bs = WiFi.BSSID(i);
+    if (bs) memcpy(n.bssid, bs, 6);
+    else memset(n.bssid, 0, 6);
+    n.rssi = WiFi.RSSI(i);
+    n.channel = (uint8_t)WiFi.channel(i);
+    n.auth = WiFi.encryptionType(i);
+    cnCount++;
+  }
+  g_lastWifiCount = cnCount;
+  cnRebuildVisible();
+}
 
 void cnOpen() {
   cnProcessed = -1;
+  cnDetail = -1;
+  cnScroll = 0;
   wifiScanBegin();
   cnLast = millis();
 }
@@ -298,6 +374,7 @@ void cnTick(uint32_t now) {
   int st = wifiScanState();
   if (st >= 0 && st != cnProcessed) {
     cnProcessed = st;
+    cnCapture(st);
     for (int i = 0; i < st; i++) {
       uint64_t k = bssidKey(WiFi.BSSID(i));
       if (g_seenAp.insert(k).second) {
@@ -308,39 +385,159 @@ void cnTick(uint32_t now) {
     }
     tools::toast("Charted %d networks", st);
   }
-  if (st < 0 && now - cnLast > 8000) {  // idle -> rescan
+  if (st < 0 && now - cnLast > 8000) {
     wifiScanBegin();
     cnLast = now;
   }
 }
-void cnClose() { WiFi.scanDelete(); }
-void cnDraw(int x, int y, int w, int h) {
+void cnClose() {
+  WiFi.scanDelete();
+  cnDetail = -1;
+}
+uint16_t cnDarkInk() { return 0x18C3; }
+
+void cnDrawDetail(int x, int y, int w, int h) {
+  body(x, y, w, h);
+  if (cnDetail < 0 || cnDetail >= cnCount) {
+    txt(x + 8, y + 8, theme::kInkDim, 1, "No network selected.");
+    return;
+  }
+  const CnNet& n = cnNets[cnDetail];
+  char mac[18];
+  snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", n.bssid[0],
+           n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5]);
+  const char* ven = oui::vendor(n.bssid);
+  txt(x + 8, y + 6, theme::kGold, 2, "Look closer");
+  txt(x + 8, y + 32, theme::kInk, 1, "SSID: %s", n.ssid);
+  txt(x + 8, y + 48, theme::kInk, 1, "BSSID: %s", mac);
+  txt(x + 8, y + 64, theme::kSeaFoam, 1, "Vendor: %s", ven[0] ? ven : "unknown");
+  txt(x + 8, y + 80, theme::kInk, 1, "Auth: %s", encLabel(n.auth));
+  txt(x + 8, y + 96, theme::kInk, 1, "RSSI: %d dBm   CH: %u", (int)n.rssi,
+      (unsigned)n.channel);
+  rssiBars(x + 200, y + 96, n.rssi);
+  G().fillRoundRect(x + 8, y + h - 36, 90, 28, 5, theme::kPanelHi);
+  txt(x + 28, y + h - 26, theme::kInk, 1, "BACK");
+  G().fillRoundRect(x + 110, y + h - 36, 100, 28, 5, theme::kGold);
+  txt(x + 128, y + h - 26, cnDarkInk(), 1, "RESCAN");
+}
+
+void cnDrawList(int x, int y, int w, int h) {
   body(x, y, w, h);
   int st = wifiScanState();
-  if (st < 0) {
+  if (st < 0 && cnCount == 0) {
     txt(x + 8, y + 6, theme::kInkDim, 1, "Sweeping the horizon...");
     return;
   }
-  txt(x + 8, y + 4, theme::kGold, 1, "%d networks in sight", st);
-  int rows = min(st, 14);
-  for (int i = 0; i < rows; i++) {
-    int ry = y + 18 + i * 12;
-    String ssid = WiFi.SSID(i);
-    if (ssid.length() == 0) ssid = "<hidden>";
-    if (ssid.length() > 15) ssid = ssid.substring(0, 15);
-    rssiBars(x + 6, ry, WiFi.RSSI(i));
-    txt(x + 26, ry, theme::kInk, 1, "%s", ssid.c_str());
-    const uint8_t* bs = WiFi.BSSID(i);
-    const char* ven = bs ? oui::vendor(bs) : "";
-    if (ven[0]) txt(x + 128, ry, theme::kSeaFoam, 1, "%.9s", ven);
-    txt(x + 196, ry, theme::kInkDim, 1, "c%02d", WiFi.channel(i));
-    txt(x + 234, ry, riskColor(encRisk(WiFi.encryptionType(i))), 1, "%s",
-        encLabel(WiFi.encryptionType(i)));
+  txt(x + 8, y + 2, theme::kGold, 1, "%d nets", cnCount);
+  // Sort / filter chips
+  const char* sorts[] = {"RSSI", "CH", "SSID"};
+  for (int i = 0; i < 3; i++) {
+    int bx = x + 70 + i * 42;
+    G().fillRoundRect(bx, y + 0, 40, 14, 3,
+                      cnSort == i ? theme::kGold : theme::kPanelHi);
+    txt(bx + 6, y + 3, cnSort == i ? 0x18C3 : theme::kInkDim, 1, "%s",
+        sorts[i]);
   }
+  const char* filters[] = {"All", "Open", "Sec"};
+  for (int i = 0; i < 3; i++) {
+    int bx = x + 200 + i * 36;
+    G().fillRoundRect(bx, y + 0, 34, 14, 3,
+                      cnFilter == i ? theme::kSeaFoam : theme::kPanelHi);
+    txt(bx + 4, y + 3, cnFilter == i ? 0x18C3 : theme::kInkDim, 1, "%s",
+        filters[i]);
+  }
+
+  constexpr int kRows = 10;
+  int rows = min(cnVisibleCount - cnScroll, kRows);
+  for (int r = 0; r < rows; r++) {
+    int idx = cnVisibleIdx[cnScroll + r];
+    const CnNet& n = cnNets[idx];
+    int ry = y + 18 + r * 14;
+    rssiBars(x + 4, ry, n.rssi);
+    char ssid[16];
+    strncpy(ssid, n.ssid, 15);
+    ssid[15] = 0;
+    txt(x + 24, ry, theme::kInk, 1, "%s", ssid);
+    const char* ven = oui::vendor(n.bssid);
+    if (ven[0]) txt(x + 130, ry, theme::kSeaFoam, 1, "%.8s", ven);
+    txt(x + 196, ry, theme::kInkDim, 1, "c%02u", (unsigned)n.channel);
+    txt(x + 234, ry, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
+  }
+  // Scroll affordances
+  if (cnScroll > 0)
+    txt(x + 300, y + 20, theme::kGold, 1, "^");
+  if (cnScroll + kRows < cnVisibleCount)
+    txt(x + 300, y + h - 16, theme::kGold, 1, "v");
+  txt(x + 8, y + h - 12, theme::kInkDim, 1, "Tap row=detail  tap empty=rescan");
 }
-bool cnTouch(int16_t, int16_t) {
+void cnDraw(int x, int y, int w, int h) {
+  if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
+  else cnDrawList(x, y, w, h);
+}
+bool cnTouch(int16_t x, int16_t y) {
+  // Content-local coords (main already passes absolute; tools use absolute
+  // matching onDraw region). Match Settings Cabin style: y is absolute.
+  int ly = y;  // absolute screen y; content starts ~44
+  int cx = x;
+  if (cnDetail >= 0) {
+    if (ly >= 204 && ly <= 240) {
+      if (cx >= 8 && cx <= 100) {
+        cnDetail = -1;
+        return true;
+      }
+      if (cx >= 110 && cx <= 220) {
+        cnDetail = -1;
+        wifiScanBegin();
+        cnLast = millis();
+        cnProcessed = -1;
+        return true;
+      }
+    }
+    cnDetail = -1;
+    return true;
+  }
+  // Sort chips (y around 44+2)
+  if (ly >= 44 && ly <= 62) {
+    for (int i = 0; i < 3; i++) {
+      int bx = 70 + i * 42;
+      if (cx >= bx && cx <= bx + 40) {
+        cnSort = i;
+        cnRebuildVisible();
+        return true;
+      }
+    }
+    for (int i = 0; i < 3; i++) {
+      int bx = 200 + i * 36;
+      if (cx >= bx && cx <= bx + 34) {
+        cnFilter = i;
+        cnScroll = 0;
+        cnRebuildVisible();
+        return true;
+      }
+    }
+  }
+  // Scroll edges
+  if (cx >= 290) {
+    if (ly < 120) {
+      if (cnScroll > 0) cnScroll--;
+      return true;
+    }
+    if (ly > 160) {
+      if (cnScroll + 10 < cnVisibleCount) cnScroll++;
+      return true;
+    }
+  }
+  // Row tap -> detail
+  if (ly >= 62 && ly <= 62 + 10 * 14) {
+    int r = (ly - 62) / 14;
+    if (r >= 0 && cnScroll + r < cnVisibleCount) {
+      cnDetail = cnVisibleIdx[cnScroll + r];
+      return true;
+    }
+  }
   wifiScanBegin();
   cnLast = millis();
+  cnProcessed = -1;
   return true;
 }
 }  // namespace
@@ -380,8 +577,6 @@ uint32_t crLoggedSession = 0;
 int crProcessed = -1;
 bool crHeader = false;
 
-// WiGLE-style capability string from our auth mode (best effort; the CCMP/TKIP
-// cipher detail isn't exposed by the Arduino scan API, so we approximate it).
 const char* wigleAuth(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN: return "[ESS]";
@@ -396,9 +591,8 @@ const char* wigleAuth(wifi_auth_mode_t m) {
   }
 }
 
-// Synthetic "FirstSeen" from uptime -- there is no RTC/GPS on board, so this is
-// a monotonic placeholder. Add a GPS module (with time) to get real fixes.
 void firstSeen(char* out, size_t n) {
+  if (gps::formatTimestamp(out, n)) return;
   uint32_t s = millis() / 1000;
   snprintf(out, n, "2000-01-01 %02lu:%02lu:%02lu", (unsigned long)(s / 3600),
            (unsigned long)((s % 3600) / 60), (unsigned long)(s % 60));
@@ -409,9 +603,8 @@ void crEnsureHeader() {
   if (!SD_MMC.exists(kWigleFile)) {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
-      // WiGLE pre-header line, then the column header.
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=1.0,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.2.0,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -427,29 +620,42 @@ void crOpen() {
   wifiScanBegin();
 }
 void crTick(uint32_t now) {
+  (void)now;
   int st = wifiScanState();
   if (st >= 0 && st != crProcessed) {
     crProcessed = st;
+    g_lastWifiCount = st;
     if (app::sdReady()) {
       File f = SD_MMC.open(kWigleFile, FILE_APPEND);
       if (f) {
         char ts[24];
         firstSeen(ts, sizeof(ts));
+        bool fix = gps::hasFix();
+        double lat = fix ? gps::latitude() : 0.0;
+        double lon = fix ? gps::longitude() : 0.0;
+        double alt = fix ? gps::altitudeM() : 0.0;
+        double acc = fix ? gps::hdop() * 5.0 : 0.0;  // rough meters from HDOP
         for (int i = 0; i < st; i++) {
-          // lat/lon/alt/accuracy left blank; wire a GPS module to fill them.
           String ssid = WiFi.SSID(i);
-          ssid.replace(",", " ");  // keep the CSV well-formed
-          f.printf("%s,%s,%s,%s,%d,%d,,,,,WIFI\n", WiFi.BSSIDstr(i).c_str(),
-                   ssid.c_str(), wigleAuth(WiFi.encryptionType(i)), ts,
-                   WiFi.channel(i), WiFi.RSSI(i));
+          ssid.replace(",", " ");
+          if (fix) {
+            f.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%.1f,WIFI\n",
+                     WiFi.BSSIDstr(i).c_str(), ssid.c_str(),
+                     wigleAuth(WiFi.encryptionType(i)), ts, WiFi.channel(i),
+                     WiFi.RSSI(i), lat, lon, alt, acc);
+          } else {
+            f.printf("%s,%s,%s,%s,%d,%d,,,,,WIFI\n", WiFi.BSSIDstr(i).c_str(),
+                     ssid.c_str(), wigleAuth(WiFi.encryptionType(i)), ts,
+                     WiFi.channel(i), WiFi.RSSI(i));
+          }
           crLoggedSession++;
         }
         f.close();
         game::addLoot(game::Loot::Cargo, 1);
-        tools::toast("Logged %d to hold", st);
+        tools::toast(fix ? "Logged %d + GPS" : "Logged %d (no GPS)", st);
       }
     }
-    wifiScanBegin();  // continuous survey
+    wifiScanBegin();
   }
 }
 void crClose() { WiFi.scanDelete(); }
@@ -462,30 +668,54 @@ void crDraw(int x, int y, int w, int h) {
       "SD card: %s", app::sdReady() ? "mounted" : "not found");
   txt(x + 8, y + 90, theme::kGold, 1, "Rows logged this voyage: %lu",
       (unsigned long)crLoggedSession);
-  txt(x + 8, y + 110, theme::kInkDim, 1, "Lat/lon/time need a GPS module.");
-  txt(x + 8, y + 140, theme::kInkDim, 1, "Passive survey - no association.");
+  bool fix = gps::hasFix();
+  txt(x + 8, y + 110, fix ? theme::kGood : theme::kWarn, 1, "GPS: %s",
+      gps::statusLabel());
+  if (fix) {
+    txt(x + 8, y + 126, theme::kInk, 1, "%.5f, %.5f  alt %.0fm",
+        gps::latitude(), gps::longitude(), gps::altitudeM());
+  } else {
+    txt(x + 8, y + 126, theme::kInkDim, 1,
+        "No fix: lat/lon blank in CSV until fix.");
+  }
+  txt(x + 8, y + 150, theme::kInkDim, 1, "UART GPS on GPIO43 RX / 44 TX.");
+  txt(x + 8, y + 166, theme::kInkDim, 1, "Passive survey - no association.");
 }
 bool crTouch(int16_t, int16_t) { return false; }
 }  // namespace
 
 // ===========================================================================
-//  4. Lookout -- channel occupancy analyzer
+//  4. Lookout -- channel occupancy analyzer (histogram + detail)
 // ===========================================================================
 namespace {
 int lkHist[14] = {0};
+int lkOpenHist[14] = {0};
 int lkProcessed = -1;
+int lkSelected = 0;  // 0 = none, 1..13 = channel detail
+int lkTotal = 0;
+
 void lkOpen() {
   lkProcessed = -1;
+  lkSelected = 0;
   wifiScanBegin();
 }
 void lkTick(uint32_t now) {
+  (void)now;
   int st = wifiScanState();
   if (st >= 0 && st != lkProcessed) {
     lkProcessed = st;
-    for (int c = 1; c <= 13; c++) lkHist[c] = 0;
+    lkTotal = st;
+    g_lastWifiCount = st;
+    for (int c = 1; c <= 13; c++) {
+      lkHist[c] = 0;
+      lkOpenHist[c] = 0;
+    }
     for (int i = 0; i < st; i++) {
       int c = WiFi.channel(i);
-      if (c >= 1 && c <= 13) lkHist[c]++;
+      if (c >= 1 && c <= 13) {
+        lkHist[c]++;
+        if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) lkOpenHist[c]++;
+      }
     }
     wifiScanBegin();
   }
@@ -493,21 +723,59 @@ void lkTick(uint32_t now) {
 void lkClose() { WiFi.scanDelete(); }
 void lkDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kGold, 1, "APs per channel (1-13)");
+  txt(x + 8, y + 2, theme::kGold, 1, "APs/ch 1-13  (tap bar)");
+  txt(x + 180, y + 2, theme::kInkDim, 1, "n=%d", lkTotal);
   int maxv = 1;
   for (int c = 1; c <= 13; c++) maxv = max(maxv, lkHist[c]);
-  int baseY = y + h - 20;
-  int bw = 20;
+  int baseY = y + h - 36;
+  int plotH = h - 56;
+  int bw = 18;
+  int gap = 3;
   for (int c = 1; c <= 13; c++) {
-    int bx = x + 8 + (c - 1) * (bw + 2);
-    int bh = (lkHist[c] * (h - 50)) / maxv;
-    uint16_t col = lkHist[c] >= maxv && maxv > 1 ? theme::kWarn : theme::kGood;
+    int bx = x + 10 + (c - 1) * (bw + gap);
+    int bh = maxv ? (lkHist[c] * plotH) / maxv : 0;
+    bool sel = (lkSelected == c);
+    uint16_t col = sel ? theme::kGold
+                       : (lkHist[c] >= maxv && maxv > 1 ? theme::kWarn
+                                                        : theme::kGood);
     G().fillRect(bx, baseY - bh, bw, bh, col);
-    txt(bx + 4, baseY + 4, theme::kInkDim, 1, "%d", c);
-    if (lkHist[c]) txt(bx + 4, baseY - bh - 10, theme::kInk, 1, "%d", lkHist[c]);
+    // open-AP overlay in red tip
+    if (lkOpenHist[c] > 0 && bh > 0) {
+      int oh = max(2, (lkOpenHist[c] * plotH) / maxv);
+      if (oh > bh) oh = bh;
+      G().fillRect(bx, baseY - oh, bw, oh, theme::kBad);
+    }
+    if (sel) G().drawRect(bx - 1, baseY - bh - 1, bw + 2, bh + 2, theme::kInk);
+    txt(bx + (c >= 10 ? 1 : 5), baseY + 4, theme::kInkDim, 1, "%d", c);
+    if (lkHist[c])
+      txt(bx + 2, baseY - bh - 10, theme::kInk, 1, "%d", lkHist[c]);
+  }
+  // legend + detail
+  txt(x + 8, y + h - 20, theme::kGood, 1, "sec");
+  txt(x + 40, y + h - 20, theme::kBad, 1, "open");
+  if (lkSelected >= 1 && lkSelected <= 13) {
+    txt(x + 100, y + h - 20, theme::kGold, 1, "CH%d: %d AP (%d open)",
+        lkSelected, lkHist[lkSelected], lkOpenHist[lkSelected]);
+  } else {
+    txt(x + 100, y + h - 20, theme::kInkDim, 1, "crowded=gold tip");
   }
 }
-bool lkTouch(int16_t, int16_t) { return false; }
+bool lkTouch(int16_t x, int16_t y) {
+  int baseY = 44 + 196 - 36;  // approximate content bottom
+  (void)baseY;
+  int bw = 18, gap = 3;
+  // Content region y starts at 44; bars roughly from y+16 to y+h-36
+  for (int c = 1; c <= 13; c++) {
+    int bx = 10 + (c - 1) * (bw + gap);
+    if (x >= bx && x <= bx + bw && y >= 60 && y <= 220) {
+      lkSelected = (lkSelected == c) ? 0 : c;
+      return true;
+    }
+  }
+  wifiScanBegin();
+  lkProcessed = -1;
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -795,12 +1063,6 @@ bool clTouch(int16_t, int16_t) {
 //  10. Ship's Systems -- diagnostics
 // ===========================================================================
 namespace {
-int ssBatteryPct() {
-  uint32_t mv = analogReadMilliVolts(BATTERY_ADC) * 2;  // typical /2 divider
-  if (mv < 3300) mv = 3300;
-  if (mv > 4200) mv = 4200;
-  return (int)((mv - 3300) * 100 / 900);
-}
 void ssOpen() {}
 void ssTick(uint32_t) {}
 void ssClose() {}
@@ -828,12 +1090,15 @@ void ssDraw(int x, int y, int w, int h) {
   txt(x + 8, ry, theme::kInkDim, 1, "Uptime:%lu:%02lu:%02lu",
       (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60),
       (unsigned long)(up % 60));
-  ry += 20;
-  int pct = ssBatteryPct();
-  txt(x + 8, ry, theme::kGold, 1, "Battery: ~%d%%", pct);
-  G().drawRoundRect(x + 100, ry - 2, 104, 12, 2, theme::kInk);
-  G().fillRect(x + 102, ry, pct, 8,
-               pct < 20 ? theme::kBad : theme::kGood);
+  ry += 14;
+  txt(x + 8, ry, theme::kInkDim, 1, "GPS:   %s", gps::statusLabel());
+  ry += 16;
+  int pct = power::batteryPct();
+  txt(x + 8, ry, theme::kGold, 1, "Power: %s  (%lu mV)", power::powerLabel(),
+      (unsigned long)power::batteryMv());
+  G().drawRoundRect(x + 8, ry + 14, 104, 12, 2, theme::kInk);
+  G().fillRect(x + 10, ry + 16, pct, 8,
+               power::lowBattery() ? theme::kBad : theme::kGood);
 }
 bool ssTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1142,24 +1407,35 @@ void siClose() {}
 void siDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   txt(x + 8, y + 6, theme::kInk, 2, "Ship's Instruments");
-  int ry = y + 38;
+  int ry = y + 34;
   txt(x + 8, ry, theme::kGold, 1, "Core temp: %.1f C  /  %.0f F", siTemp,
       siTemp * 9.0f / 5.0f + 32.0f);
-  ry += 22;
-  uint32_t mv = analogReadMilliVolts(BATTERY_ADC) * 2;  // typical /2 divider
-  int pct = ssBatteryPct();
-  txt(x + 8, ry, theme::kGold, 1, "Battery: ~%d%%  (%lu mV)", pct,
-      (unsigned long)mv);
+  ry += 18;
+  int pct = power::batteryPct();
+  txt(x + 8, ry, theme::kGold, 1, "Power: %s  (%lu mV)", power::powerLabel(),
+      (unsigned long)power::batteryMv());
   G().drawRoundRect(x + 8, ry + 14, 104, 12, 2, theme::kInk);
-  G().fillRect(x + 10, ry + 16, pct, 8, pct < 20 ? theme::kBad : theme::kGood);
-  ry += 44;
-  txt(x + 8, ry, theme::kInkDim, 1, "Core temp is the on-die sensor -- it");
+  G().fillRect(x + 10, ry + 16, pct, 8,
+               power::lowBattery() ? theme::kBad : theme::kGood);
+  ry += 36;
+  bool fix = gps::hasFix();
+  txt(x + 8, ry, fix ? theme::kGood : theme::kWarn, 1, "GPS: %s",
+      gps::statusLabel());
+  ry += 14;
+  if (fix) {
+    txt(x + 8, ry, theme::kInk, 1, "%.5f, %.5f", gps::latitude(),
+        gps::longitude());
+    ry += 12;
+    txt(x + 8, ry, theme::kInkDim, 1, "alt %.0fm  sats %lu  hdop %.1f",
+        gps::altitudeM(), (unsigned long)gps::satellites(), gps::hdop());
+  } else {
+    txt(x + 8, ry, theme::kInkDim, 1, "Wire GPS TX->GPIO43 RX->GPIO44.");
+  }
+  ry += 18;
+  txt(x + 8, ry, theme::kInkDim, 1, "Core temp is on-die (reads warm).");
   ry += 12;
-  txt(x + 8, ry, theme::kInkDim, 1, "reads warm and is approximate.");
-  ry += 16;
-  txt(x + 8, ry, theme::kInkDim, 1, "Add a BME280 on I2C for real air");
-  ry += 12;
-  txt(x + 8, ry, theme::kInkDim, 1, "temp/humidity/pressure. Mic: unwired.");
+  txt(x + 8, ry, theme::kInkDim, 1, "Bri %d%%  SD %s", app::brightness(),
+      app::sdReady() ? "ok" : "no");
 }
 bool siTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1210,5 +1486,8 @@ const Tool& at(int i) {
   if (i >= count()) i = count() - 1;
   return kTools[i];
 }
+
+int lastWifiCount() { return g_lastWifiCount; }
+int lastBleCount() { return g_bleCount; }
 
 }  // namespace tools

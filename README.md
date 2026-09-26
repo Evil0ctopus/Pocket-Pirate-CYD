@@ -21,6 +21,11 @@ Pocket-Pirate-CYD comes packed with custom assets and modular features designed 
   * Built-in helper scripts and tools located in the `tools/` directory to assist with asset conversion, flashing workflows, and system debugging.
 * **📦 Modular Firmware Layout:**
   * Cleanly structured codebase utilizing PlatformIO for seamless expansion, custom hardware hooks, and easy deployment.
+* **📡 Passive stations (metadata only):** Crow's Nest Wi-Fi survey (sort/filter/detail), Lookout channel histogram, Chart Room WiGLE CSV logger — **no deauth / injection / handshake capture**.
+* **🧭 Optional UART GPS:** Chart Room + Instruments show fix status; WiGLE rows get real lat/lon/alt/UTC when a fix is available (`docs/GPS.md`).
+* **🔋 World HUD:** DECK/SHIP status strip for battery/USB, SD, brightness, GPS; low-battery toast; dim-on-idle.
+* **🖥️ USB companion:** Line/JSON protocol + `tools/companion.py` (`docs/COMPANION.md`).
+* **⚙️ CI / releases:** GitHub Actions builds PlatformIO firmware; version tags `v*` publish `.bin` assets.
 
 ---
 
@@ -87,19 +92,53 @@ If no USB serial ports are found, or several are present, the script exits with 
 
 ---
 
+## 💾 Flash a release binary
+
+CI builds `cheap-black-display` on every PR/push. Tagged releases (`v*`) attach:
+
+`Pocket-Pirate-CYD-cheap-black-display.bin`
+
+```bash
+# From source (recommended)
+pio run -e cheap-black-display -t upload
+
+# Or esptool (discover your port first — do not assume COM16)
+esptool.py --chip esp32s3 --port PORT write_flash 0x0 \
+  Pocket-Pirate-CYD-cheap-black-display.bin
+```
+
+Firmware version string: **0.2.0** (`PP_VERSION`).
+
+### Optional GPS wiring
+
+See [`docs/GPS.md`](docs/GPS.md). Summary: GPS TX→**GPIO43**, GPS RX→**GPIO44**, GND, 3V3 @ 9600 baud. Works without a module (graceful `NO GPS`).
+
+### USB companion
+
+```bash
+pip install -r tools/requirements.txt
+python tools/companion.py --port PORT status
+python tools/companion.py watch
+```
+
+Full protocol: [`docs/COMPANION.md`](docs/COMPANION.md).
+
+---
+
 ## 📁 Project layout
 
 ```
 Pocket-Pirate-CYD/
+├── .github/workflows/   # PlatformIO CI + tagged firmware releases
 ├── .vscode/             # VS Code workspace settings
 ├── artpack_pixel/       # Pixel art assets and UI packs
 ├── artpack_sample/      # Sample art assets and references
 ├── device_shots/        # Photos and screenshots of the hardware
-├── docs/                # Documentation and schematics
-├── include/             # Header files
-├── src/                 # Main source code logic
-├── tools/               # Helper scripts and utilities
-│   └── requirements.txt # pip deps for device_test.py
+├── docs/                # GPS wiring, companion protocol, art packs
+├── include/             # Headers (board_pins, gps, power, tools, …)
+├── src/                 # Firmware sources
+├── tools/               # device_test.py, companion.py, art helpers
+│   └── requirements.txt # pip deps (pyserial, Pillow)
 ├── platformio.ini       # PlatformIO build configuration
 └── LICENSE              # MIT License
 ```

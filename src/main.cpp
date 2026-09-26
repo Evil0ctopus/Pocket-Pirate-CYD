@@ -13,13 +13,20 @@
 #include "captains.h"
 #include "chibi.h"
 #include "game_state.h"
+#include "gps.h"
 #include "gfx_util.h"
 #include "led.h"
 #include "pirate_theme.h"
+#include "power.h"
 #include "tools.h"
 #include "touch.h"
 
 using namespace CheapBlackDisplay;
+
+#ifndef PP_VERSION
+#define PP_VERSION "0.2.0"
+#endif
+
 using gfxu::blend565;
 using gfxu::darken;
 using gfxu::lighten;
@@ -304,6 +311,28 @@ void drawToastOverlay() {
   canvas.print(g_toast);
 }
 
+// Persistent world HUD strip: power / SD / brightness / GPS.
+void drawStatusStrip() {
+  canvas.fillRect(0, 42, 200, 12, rgb(18, 26, 40));
+  canvas.setTextSize(1);
+  uint16_t pc = power::lowBattery() ? theme::kBad
+                                    : (power::usbPowered() ? theme::kGood
+                                                           : theme::kInkDim);
+  canvas.setTextColor(pc);
+  canvas.setCursor(4, 43);
+  canvas.printf("%s", power::powerLabel());
+  canvas.setTextColor(app::sdReady() ? theme::kGood : theme::kInkDim);
+  canvas.setCursor(40, 43);
+  canvas.print(app::sdReady() ? "SD" : "--");
+  canvas.setTextColor(theme::kInkDim);
+  canvas.setCursor(62, 43);
+  canvas.printf("B%d", (int)app::brightness());
+  bool fix = gps::hasFix();
+  canvas.setTextColor(fix ? theme::kGood : theme::kInkDim);
+  canvas.setCursor(96, 43);
+  canvas.printf("GPS:%s", gps::statusLabel());
+}
+
 // Two mini tabs under the header for switching world pages (deck <-> ship).
 // Drawn tall and hit-tested taller still: the calibration capture showed ~15px
 // of vertical touch scatter, so small targets need generous zones.
@@ -395,6 +424,7 @@ void drawWorld() {
   }
 
   drawViewTabs();
+  drawStatusStrip();
 
   // bottom bar: loot + Stations button
   gfxu::vGradient(canvas, 0, 210, 320, 30, rgb(30, 42, 62), rgb(20, 28, 44));
@@ -742,13 +772,89 @@ void handleTap(int16_t x, int16_t y) {
 }
 
 // ---------------------------------------------------------------------------
-//  Serial test hooks: lets a host script drive the UI and see the screen.
-//    TAP <x> <y>  inject a touch tap at landscape coords
-//    SHOT         dump the canvas as raw RGB565 (framed by SHOT_BEGIN/END)
-//    INFO         one-line state summary
+//  USB companion + test hooks (line protocol, newline-terminated).
+//    INFO / STATUS / STATUSJ / HELP / LOGS / LOGGET <path>
+//    TAP <x> <y>  SHOT  BEEP  SCAN
 // ---------------------------------------------------------------------------
+void companionStatusJson() {
+  char ts[24] = "";
+  bool haveTs = gps::formatTimestamp(ts, sizeof(ts));
+  Serial.printf(
+      "{\"ver\":\"%s\",\"screen\":%d,\"sea\":%d,\"lvl\":%u,\"xp\":%lu,"
+      "\"avatar\":%d,\"sd\":%s,\"art\":%s,\"heap\":%u,\"bri\":%u,"
+      "\"bat_pct\":%d,\"bat_mv\":%lu,\"usb\":%s,\"wifi\":%d,\"ble\":%d,"
+      "\"gps\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sats\":%lu"
+      "%s%s%s}\n",
+PP_VERSION, (int)g_screen, (int)g_seaView, game::profile.level,
+      (unsigned long)game::profile.xp, game::profile.avatar,
+      g_sdReady ? "true" : "false", art::available() ? "true" : "false",
+      (unsigned)ESP.getFreeHeap(), (unsigned)app::brightness(),
+      power::batteryPct(), (unsigned long)power::batteryMv(),
+      power::usbPowered() ? "true" : "false", tools::lastWifiCount(),
+      tools::lastBleCount(), gps::statusLabel(),
+      gps::hasFix() ? gps::latitude() : 0.0,
+      gps::hasFix() ? gps::longitude() : 0.0,
+      gps::hasFix() ? gps::altitudeM() : 0.0,
+      (unsigned long)gps::satellites(), haveTs ? ",\"time\":\"" : "",
+      haveTs ? ts : "", haveTs ? "\"" : "");
+}
+
+void companionListLogs() {
+  if (!g_sdReady) {
+    Serial.println("LOGS err=no_sd");
+    return;
+  }
+  File root = SD_MMC.open("/");
+  if (!root || !root.isDirectory()) {
+    Serial.println("LOGS err=open");
+    return;
+  }
+  Serial.println("LOGS_BEGIN");
+  File f = root.openNextFile();
+  int n = 0;
+  while (f && n < 64) {
+    if (!f.isDirectory()) {
+      Serial.printf("LOG %s %lu\n", f.name(), (unsigned long)f.size());
+      n++;
+    }
+    f = root.openNextFile();
+  }
+  Serial.printf("LOGS_END count=%d\n", n);
+}
+
+void companionGetLog(const char* path) {
+  if (!g_sdReady) {
+    Serial.println("LOGGET err=no_sd");
+    return;
+  }
+  if (!path || path[0] == 0) {
+    Serial.println("LOGGET err=path");
+    return;
+  }
+  char full[64];
+  if (path[0] == '/')
+    snprintf(full, sizeof(full), "%s", path);
+  else
+    snprintf(full, sizeof(full), "/%s", path);
+  File f = SD_MMC.open(full, FILE_READ);
+  if (!f) {
+    Serial.printf("LOGGET err=missing path=%s\n", full);
+    return;
+  }
+  size_t sz = f.size();
+  Serial.printf("LOGGET_BEGIN path=%s size=%u\n", full, (unsigned)sz);
+  uint8_t buf[128];
+  while (true) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    Serial.write(buf, (size_t)n);
+  }
+  f.close();
+  Serial.print("\nLOGGET_END\n");
+}
+
 void handleSerialDebug() {
-  static char buf[48];
+  static char buf[96];
   static int len = 0;
   while (Serial.available()) {
     char ch = (char)Serial.read();
@@ -761,6 +867,7 @@ void handleSerialDebug() {
     if (buf[0] == 0) continue;
     int x = 0, y = 0;
     if (sscanf(buf, "TAP %d %d", &x, &y) == 2) {
+      power::noteActivity(millis());
       handleTap((int16_t)x, (int16_t)y);
       Serial.printf("OK TAP %d %d\n", x, y);
     } else if (strcmp(buf, "SHOT") == 0) {
@@ -777,7 +884,6 @@ void handleSerialDebug() {
       Serial.printf("OK BEEP ready=%d sound=%d\n", (int)audio::ready(),
                     (int)app::sound());
     } else if (strcmp(buf, "SCAN") == 0) {
-      // I2C bus scan (touch bus): evidence for identifying the audio codec.
       Serial.print("SCAN:");
       for (uint8_t a = 1; a < 127; a++) {
         Wire.beginTransmission(a);
@@ -785,12 +891,29 @@ void handleSerialDebug() {
       }
       Serial.println();
     } else if (strcmp(buf, "INFO") == 0) {
-      Serial.printf("INFO screen=%d sea=%d lvl=%u xp=%lu avatar=%d sd=%d art=%d "
-                    "heap=%u frame=%ums\n",
-                    (int)g_screen, (int)g_seaView, game::profile.level,
-                    (unsigned long)game::profile.xp, game::profile.avatar,
-                    (int)g_sdReady, (int)art::available(),
-                    (unsigned)ESP.getFreeHeap(), (unsigned)g_frameMs);
+      Serial.printf(
+          "INFO ver=%s screen=%d sea=%d lvl=%u xp=%lu avatar=%d sd=%d art=%d "
+          "heap=%u frame=%ums bri=%u bat=%d mv=%lu usb=%d wifi=%d ble=%d "
+          "gps=%s\n",
+PP_VERSION, (int)g_screen, (int)g_seaView, game::profile.level,
+          (unsigned long)game::profile.xp, game::profile.avatar,
+          (int)g_sdReady, (int)art::available(), (unsigned)ESP.getFreeHeap(),
+          (unsigned)g_frameMs, (unsigned)app::brightness(), power::batteryPct(),
+          (unsigned long)power::batteryMv(), (int)power::usbPowered(),
+          tools::lastWifiCount(), tools::lastBleCount(), gps::statusLabel());
+    } else if (strcmp(buf, "STATUS") == 0 || strcmp(buf, "STATUSJ") == 0 ||
+               strcmp(buf, "SUMMARY") == 0) {
+      companionStatusJson();
+    } else if (strcmp(buf, "LOGS") == 0) {
+      companionListLogs();
+    } else if (strncmp(buf, "LOGGET ", 7) == 0) {
+      companionGetLog(buf + 7);
+    } else if (strcmp(buf, "HELP") == 0) {
+      Serial.println(
+          "HELP INFO STATUS STATUSJ SUMMARY LOGS LOGGET <path> "
+          "TAP <x> <y> SHOT BEEP SCAN");
+    } else {
+      Serial.printf("ERR unknown cmd: %s\n", buf);
     }
   }
 }
@@ -832,6 +955,8 @@ void setup() {
   game::load();
   led::begin();
   audio::begin();
+  power::begin();
+  gps::begin();
 
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
   g_sdReady = SD_MMC.begin("/sdcard", false);
@@ -846,8 +971,8 @@ void setup() {
     drawWorld();
   present();
 
-  Serial.printf("Pocket Pirate ready. Captain %s Lv%u  SD:%s  art:%s\n",
-                game::profile.name, game::profile.level,
+Serial.printf("Pocket Pirate %s ready. Captain %s Lv%u  SD:%s  art:%s\n",
+                PP_VERSION, game::profile.name, game::profile.level,
                 g_sdReady ? "ok" : "none", art::available() ? "yes" : "no");
   audio::chime();  // boot "ahoy" (no-op if codec absent or sound off)
 }
@@ -859,6 +984,9 @@ void loop() {
 
   handleSerialDebug();
   led::tick(now);
+  power::tick(now);
+  gps::tick(now);
+  power::applyIdleDim(app::brightness(), now);
 
   // Settings Cabin asked for the rename keyboard.
   if (g_renamePending) {
@@ -875,7 +1003,10 @@ void loop() {
 
   touch::read();
   int16_t tx, ty;
-  if (touch::wasTapped(tx, ty)) handleTap(tx, ty);
+  if (touch::wasTapped(tx, ty)) {
+    power::noteActivity(now);
+    handleTap(tx, ty);
+  }
 
   if (g_screen == Screen::Tool && g_toolIndex >= 0)
     tools::at(g_toolIndex).onTick(now);

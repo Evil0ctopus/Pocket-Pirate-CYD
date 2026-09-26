@@ -33,4 +33,8 @@ struct Tool {
 int count();
 const Tool& at(int i);
 
+// Live counters for the USB companion / HUD (updated by scan tools).
+int lastWifiCount();
+int lastBleCount();
+
 }  // namespace tools
