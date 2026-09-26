@@ -114,7 +114,7 @@ esptool.py --chip esp32s3 --port PORT write_flash 0x0 \
 
 The `…-app.bin` asset (when published) is for **OTA only** — see [`docs/OTA.md`](docs/OTA.md).
 
-Firmware version string: **0.3.0** (`PP_VERSION`).
+Firmware version string: **0.4.0** (`PP_VERSION`).
 
 ### CI status
 

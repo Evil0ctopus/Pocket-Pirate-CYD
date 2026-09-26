@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.3.0"
+#define PP_VERSION "0.4.0"
 #endif
 
 using gfxu::blend565;
@@ -200,20 +200,19 @@ void sayRandom() {
 void drawSpeechBubble(uint32_t now) {
   if (now > g_sayUntil || g_say[0] == 0) return;
   uint16_t paper = rgb(250, 250, 244), ink = rgb(24, 18, 28);
-  int w = (int)strlen(g_say) * 6 + 14;
+  int w = (int)strlen(g_say) * 6 + 16;
   if (w > 300) w = 300;
   int x = 160 - w / 2;
   if (x + w > 212) x = 212 - w;  // keep clear of the DECK/SHIP tabs
   if (x < 4) x = 4;
   int y = 46;
-  canvas.fillRect(x, y, w, 20, paper);
-  canvas.drawRect(x, y, w, 20, ink);
-  canvas.fillRect(150, y + 20, 14, 4, paper);   // stepped tail
-  canvas.fillRect(153, y + 24, 9, 3, paper);
-  canvas.fillRect(156, y + 27, 5, 3, paper);
+  canvas.fillSmoothRoundRect(x, y, w, 22, 6, paper);
+  canvas.drawRoundRect(x, y, w, 22, 6, ink);
+  // soft triangular tail
+  canvas.fillTriangle(154, y + 21, 166, y + 21, 160, y + 30, paper);
   canvas.setTextColor(ink);
   canvas.setTextSize(1);
-  canvas.setCursor(x + 7, y + 7);
+  canvas.setCursor(x + 8, y + 8);
   canvas.print(g_say);
 }
 
@@ -263,12 +262,14 @@ void coin(int x, int y, int r) {
 }
 
 void drawHeaderBar() {
-  gfxu::vGradient(canvas, 0, 0, 320, 40, rgb(38, 54, 78), rgb(22, 32, 50));
-  canvas.drawFastHLine(0, 40, 320, theme::kGold);
+  gfxu::vGradient(canvas, 0, 0, 320, 40, theme::kPanel, theme::kBgDeep);
+  canvas.drawFastHLine(0, 39, 320, theme::kGold);
+  canvas.drawFastHLine(0, 40, 320, theme::kTeal);
 
   // avatar chip
-  canvas.fillSmoothCircle(20, 20, 15, rgb(30, 44, 66));
-  coin(20, 20, 9);  // doubloon emblem (the vector ship emblem overflowed)
+  canvas.fillSmoothCircle(20, 20, 15, theme::kPanelSoft);
+  canvas.drawCircle(20, 20, 15, theme::kBorderHi);
+  coin(20, 20, 9);
 
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
@@ -281,13 +282,14 @@ void drawHeaderBar() {
 
   // xp bar (glossy)
   int bx = 150, bw = 110;
-  canvas.fillSmoothRoundRect(bx, 8, bw, 11, 5, rgb(14, 20, 32));
+  canvas.fillSmoothRoundRect(bx, 8, bw, 11, 5, theme::kBgDeep);
+  canvas.drawRoundRect(bx, 8, bw, 11, 5, theme::kBorder);
   int fill = game::levelProgressPct() * (bw - 4) / 100;
   if (fill > 0) {
     canvas.fillSmoothRoundRect(bx + 2, 10, fill, 7, 3, theme::kGold);
     canvas.fillSmoothRoundRect(bx + 2, 10, fill, 3, 2, lighten(theme::kGold, 90));
   }
-  canvas.setTextColor(theme::kInkDim);
+  canvas.setTextColor(theme::kInkMuted);
   canvas.setCursor(bx, 24);
   if (game::profile.level >= game::kMaxLevel)
     canvas.print("MAX RANK");
@@ -304,8 +306,8 @@ void drawHeaderBar() {
 
 void drawToastOverlay() {
   if (millis() > g_toastUntil || g_toast[0] == 0) return;
-  canvas.fillSmoothRoundRect(24, 206, 272, 26, 7, rgb(30, 42, 62));
-  canvas.drawRoundRect(24, 206, 272, 26, 7, theme::kGold);
+  canvas.fillSmoothRoundRect(24, 206, 272, 28, 8, theme::kBgDeep);
+  canvas.drawRoundRect(24, 206, 272, 28, 8, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
   canvas.setCursor(38, 216);
@@ -314,23 +316,24 @@ void drawToastOverlay() {
 
 // Persistent world HUD strip: power / SD / brightness / GPS.
 void drawStatusStrip() {
-  canvas.fillRect(0, 42, 200, 12, rgb(18, 26, 40));
+  canvas.fillSmoothRoundRect(2, 42, 204, theme::kStatusH, 4, theme::kBgDeep);
+  canvas.drawRoundRect(2, 42, 204, theme::kStatusH, 4, theme::kBorder);
   canvas.setTextSize(1);
   uint16_t pc = power::lowBattery() ? theme::kBad
                                     : (power::usbPowered() ? theme::kGood
                                                            : theme::kInkDim);
   canvas.setTextColor(pc);
-  canvas.setCursor(4, 43);
+  canvas.setCursor(6, 45);
   canvas.printf("%s", power::powerLabel());
-  canvas.setTextColor(app::sdReady() ? theme::kGood : theme::kInkDim);
-  canvas.setCursor(40, 43);
+  canvas.setTextColor(app::sdReady() ? theme::kGood : theme::kInkMuted);
+  canvas.setCursor(42, 45);
   canvas.print(app::sdReady() ? "SD" : "--");
   canvas.setTextColor(theme::kInkDim);
-  canvas.setCursor(62, 43);
+  canvas.setCursor(64, 45);
   canvas.printf("B%d", (int)app::brightness());
   bool fix = gps::hasFix();
-  canvas.setTextColor(fix ? theme::kGood : theme::kInkDim);
-  canvas.setCursor(96, 43);
+  canvas.setTextColor(fix ? theme::kGood : theme::kInkMuted);
+  canvas.setCursor(96, 45);
   canvas.printf("GPS:%s", gps::statusLabel());
 }
 
@@ -340,13 +343,14 @@ void drawStatusStrip() {
 void drawViewTabs() {
   const char* names[2] = {"DECK", "SHIP"};
   for (int i = 0; i < 2; i++) {
-    int tx = 212 + i * 54, ty = 44;
+    int tx = 212 + i * 54, ty = 42;
     bool on = (g_seaView == (i == 1));
-    canvas.fillRect(tx, ty, 50, 22, on ? theme::kGold : rgb(30, 42, 62));
-    canvas.drawRect(tx, ty, 50, 22, theme::kGold);
-    canvas.setTextColor(on ? rgb(30, 20, 0) : theme::kInkDim);
+    canvas.fillSmoothRoundRect(tx, ty, 50, 24, 6,
+                               on ? theme::kGold : theme::kPanelSoft);
+    if (!on) canvas.drawRoundRect(tx, ty, 50, 24, 6, theme::kBorder);
+    canvas.setTextColor(on ? theme::kOnGold : theme::kInkDim);
     canvas.setTextSize(1);
-    canvas.setCursor(tx + 13, ty + 7);
+    canvas.setCursor(tx + 13, ty + 8);
     canvas.print(names[i]);
   }
 }
@@ -428,16 +432,17 @@ void drawWorld() {
   drawStatusStrip();
 
   // bottom bar: loot + Stations button
-  gfxu::vGradient(canvas, 0, 210, 320, 30, rgb(30, 42, 62), rgb(20, 28, 44));
+  gfxu::vGradient(canvas, 0, 210, 320, 30, theme::kPanel, theme::kBgDeep);
+  canvas.drawFastHLine(0, 210, 320, theme::kBorder);
   canvas.setTextColor(theme::kInkDim);
   canvas.setCursor(8, 220);
   canvas.printf("Charts %lu  Bottles %lu  Cargo %lu",
                 (unsigned long)game::profile.loot[(int)game::Loot::ChartFragment],
                 (unsigned long)game::profile.loot[(int)game::Loot::MessageBottle],
                 (unsigned long)game::profile.loot[(int)game::Loot::Cargo]);
-  canvas.fillSmoothRoundRect(232, 213, 82, 24, 6, theme::kGold);
-  canvas.setTextColor(rgb(30, 20, 0));
-  canvas.setCursor(244, 221);
+  canvas.fillSmoothRoundRect(228, 213, 86, 24, 7, theme::kGold);
+  canvas.setTextColor(theme::kOnGold);
+  canvas.setCursor(240, 221);
   canvas.print("STATIONS");
 }
 
@@ -445,14 +450,14 @@ void drawWorld() {
 //  Captain select (full-size carousel)
 // ---------------------------------------------------------------------------
 void drawArrow(int cx, int cy, bool right) {
-  canvas.fillSmoothCircle(cx, cy, 16, rgb(30, 44, 66));
+  canvas.fillSmoothCircle(cx, cy, 16, theme::kPanelSoft);
   canvas.drawCircle(cx, cy, 16, theme::kGold);
   int d = right ? 5 : -5;
   canvas.fillTriangle(cx - d, cy - 8, cx - d, cy + 8, cx + d, cy, theme::kInk);
 }
 
 void drawSelect() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, rgb(28, 40, 62), rgb(14, 20, 34));
+  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
   canvas.setTextColor(theme::kGold);
   canvas.setTextSize(2);
   canvas.setCursor(64, 8);
@@ -460,7 +465,7 @@ void drawSelect() {
 
   const pc::Captain& c = pc::kCaptains[g_sel];
   // spotlight
-  canvas.fillSmoothCircle(160, 118, 74, rgb(34, 48, 72));
+  canvas.fillSmoothCircle(160, 118, 74, theme::kPanel);
   if (art::haveCaptain(g_sel, 2)) {
     int fc = art::frameCount(g_sel, 2, art::IDLE);
     if (fc < 1) fc = 1;
@@ -487,14 +492,14 @@ void drawSelect() {
   canvas.print(c.trait);
 
   canvas.fillSmoothRoundRect(112, 210, 96, 26, 7, theme::kGold);
-  canvas.setTextColor(rgb(30, 20, 0));
+  canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(130, 218);
   canvas.print("SET SAIL");
 
   // dots
   for (int i = 0; i < pc::kCaptainCount; i++)
     canvas.fillSmoothCircle(148 + i * 8, 2, 2,
-                            i == g_sel ? theme::kGold : rgb(70, 84, 108));
+                            i == g_sel ? theme::kGold : theme::kLocked);
 }
 
 // ---------------------------------------------------------------------------
@@ -504,13 +509,13 @@ const char* kKeyRows[4] = {"ABCDEFG", "HIJKLMN", "OPQRSTU", "VWXYZ.-"};
 constexpr int kNameMax = 16;
 
 void drawName() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, rgb(28, 40, 62), rgb(14, 20, 34));
+  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
   canvas.setTextColor(theme::kGold);
   canvas.setTextSize(2);
   canvas.setCursor(66, 8);
   canvas.print("Name yer pirate");
 
-  canvas.fillSmoothRoundRect(20, 30, 280, 28, 6, rgb(14, 20, 32));
+  canvas.fillSmoothRoundRect(20, 30, 280, 28, 6, theme::kBgDeep);
   canvas.drawRoundRect(20, 30, 280, 28, 6, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(30, 37);
@@ -523,23 +528,23 @@ void drawName() {
     int ry = 66 + r * 34;
     for (int c = 0; c < 7; c++) {
       int cx = 6 + c * 45;
-      canvas.fillSmoothRoundRect(cx, ry, 43, 30, 5, rgb(32, 44, 66));
+      canvas.fillSmoothRoundRect(cx, ry, 43, 30, 5, theme::kPanel);
       canvas.setTextColor(theme::kInk);
       canvas.setTextSize(2);
       canvas.setCursor(cx + 16, ry + 8);
       canvas.printf("%c", kKeyRows[r][c]);
     }
   }
-  canvas.fillSmoothRoundRect(6, 204, 130, 32, 5, rgb(32, 44, 66));
+  canvas.fillSmoothRoundRect(6, 204, 130, 32, 5, theme::kPanel);
   canvas.setTextColor(theme::kInkDim);
   canvas.setCursor(41, 213);
   canvas.print("SPACE");
-  canvas.fillSmoothRoundRect(142, 204, 80, 32, 5, rgb(96, 44, 44));
+  canvas.fillSmoothRoundRect(142, 204, 80, 32, 5, theme::kBad);
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(164, 213);
   canvas.print("DEL");
   canvas.fillSmoothRoundRect(228, 204, 86, 32, 5, theme::kGold);
-  canvas.setTextColor(rgb(30, 20, 0));
+  canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(242, 213);
   canvas.print("DONE");
 }
@@ -560,7 +565,7 @@ void nameCommit() {
 //  Stations menu
 // ---------------------------------------------------------------------------
 void drawMenu() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, rgb(24, 34, 54), rgb(14, 20, 34));
+  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
   drawHeaderBar();
 
   int total = tools::count();
@@ -568,13 +573,18 @@ void drawMenu() {
   if (g_menuPage >= pages) g_menuPage = 0;
   int base = g_menuPage * kMenuPerPage;
 
+  canvas.fillSmoothRoundRect(4, 44, 200, 14, 4, theme::kPanelSoft);
   canvas.setTextColor(theme::kInkDim);
   canvas.setTextSize(1);
-  canvas.setCursor(8, 46);
+  canvas.setCursor(10, 47);
   canvas.print("Choose a station");
+  canvas.setTextColor(theme::kInkMuted);
+  canvas.setCursor(140, 47);
+  canvas.printf("%d/%d", g_menuPage + 1, max(1, pages));
 
-  int cols = 3, tileW = 100, tileH = 40, gap = 3;
-  int x0 = 6, y0 = 58;
+  // 3×3 tiles — larger touch targets with glyph + title/subtitle hierarchy
+  int cols = 3, tileW = 102, tileH = 48, gap = 4;
+  int x0 = 5, y0 = 62;
   for (int li = 0; li < kMenuPerPage; li++) {
     int i = base + li;
     if (i >= total) break;
@@ -582,30 +592,33 @@ void drawMenu() {
     int tx = x0 + col * (tileW + gap);
     int ty = y0 + row * (tileH + gap);
     const tools::Tool& t = tools::at(i);
-    canvas.fillSmoothRoundRect(tx, ty, tileW, tileH, 6, rgb(32, 44, 66));
-    canvas.fillSmoothRoundRect(tx, ty, 5, tileH, 2, t.accent);
+    canvas.fillSmoothRoundRect(tx, ty, tileW, tileH, 8, theme::kPanel);
+    canvas.drawRoundRect(tx, ty, tileW, tileH, 8, theme::kBorder);
+    canvas.fillSmoothRoundRect(tx, ty, 4, tileH, 2, t.accent);
+    gfxu::drawGlyph(canvas, tx + 18, ty + 24, 11, i, t.accent);
+    // Title may be long — clip visually by cursor start after glyph
     canvas.setTextColor(theme::kInk);
-    canvas.setCursor(tx + 11, ty + 8);
+    canvas.setCursor(tx + 34, ty + 10);
     canvas.print(t.title);
-    canvas.setTextColor(theme::kInkDim);
-    canvas.setCursor(tx + 11, ty + 24);
+    canvas.setTextColor(theme::kInkMuted);
+    canvas.setCursor(tx + 34, ty + 28);
     canvas.print(t.subtitle);
   }
 
   // bottom bar: back to deck + page pager
-  canvas.fillSmoothRoundRect(6, 213, 74, 24, 6, theme::kGold);
-  canvas.setTextColor(rgb(30, 20, 0));
-  canvas.setCursor(20, 221);
+  canvas.fillSmoothRoundRect(6, 213, 78, 24, 7, theme::kGold);
+  canvas.setTextColor(theme::kOnGold);
+  canvas.setCursor(18, 221);
   canvas.print("< DECK");
   if (pages > 1) {
-    canvas.fillSmoothRoundRect(150, 213, 34, 24, 6, rgb(32, 44, 66));
+    canvas.fillSmoothRoundRect(150, 213, 36, 24, 7, theme::kPanelHi);
     canvas.setTextColor(theme::kInk);
     canvas.setCursor(163, 221);
     canvas.print("<");
     canvas.setTextColor(theme::kInkDim);
     canvas.setCursor(192, 221);
     canvas.printf("%d/%d", g_menuPage + 1, pages);
-    canvas.fillSmoothRoundRect(232, 213, 34, 24, 6, rgb(32, 44, 66));
+    canvas.fillSmoothRoundRect(232, 213, 36, 24, 7, theme::kPanelHi);
     canvas.setTextColor(theme::kInk);
     canvas.setCursor(245, 221);
     canvas.print(">");
@@ -614,20 +627,23 @@ void drawMenu() {
 
 void drawToolHeader() {
   const tools::Tool& t = tools::at(g_toolIndex);
-  gfxu::vGradient(canvas, 0, 0, 320, 44, rgb(34, 48, 70), rgb(20, 28, 44));
-  canvas.fillRect(0, 0, 6, 44, t.accent);
-  canvas.fillSmoothRoundRect(8, 8, 54, 28, 6, rgb(24, 34, 52));
+  gfxu::vGradient(canvas, 0, 0, 320, 44, theme::kPanel, theme::kBgDeep);
+  canvas.fillSmoothRoundRect(0, 0, 5, 44, 2, t.accent);
+  canvas.drawFastHLine(0, 43, 320, theme::kBorder);
+  canvas.fillSmoothRoundRect(8, 8, 56, 28, 7, theme::kPanelSoft);
+  canvas.drawRoundRect(8, 8, 56, 28, 7, theme::kBorder);
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
   canvas.setCursor(18, 18);
   canvas.print("< Back");
+  gfxu::drawGlyph(canvas, 82, 22, 10, g_toolIndex, t.accent);
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(2);
-  canvas.setCursor(70, 6);
+  canvas.setCursor(98, 6);
   canvas.print(t.title);
   canvas.setTextColor(theme::kInkDim);
   canvas.setTextSize(1);
-  canvas.setCursor(70, 26);
+  canvas.setCursor(98, 26);
   canvas.print(t.subtitle);
 }
 
@@ -734,7 +750,7 @@ void handleTap(int16_t x, int16_t y) {
           return;
         }
       }
-      int cols = 3, tileW = 100, tileH = 40, gap = 3, x0 = 6, y0 = 58;
+      int cols = 3, tileW = 102, tileH = 48, gap = 4, x0 = 5, y0 = 62;
       int base = g_menuPage * kMenuPerPage;
       for (int li = 0; li < kMenuPerPage; li++) {
         int i = base + li;

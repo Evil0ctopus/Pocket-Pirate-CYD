@@ -11,6 +11,7 @@
 #include "app.h"
 #include "board_pins.h"
 #include "game_state.h"
+#include "gfx_util.h"
 #include "gps.h"
 #include "led.h"
 #include "oui.h"
@@ -20,7 +21,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.3.0"
+#define PP_VERSION "0.4.0"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -32,7 +33,7 @@ namespace {
 
 lgfx::LGFXBase& G() { return *tools::gfx; }
 
-void body(int x, int y, int w, int h) { G().fillRect(x, y, w, h, theme::kPanel); }
+void body(int x, int y, int w, int h) { gfxu::drawBody(G(), x, y, w, h); }
 
 void txt(int x, int y, uint16_t fg, uint8_t size, const char* fmt, ...) {
   char b[96];
@@ -42,9 +43,19 @@ void txt(int x, int y, uint16_t fg, uint8_t size, const char* fmt, ...) {
   va_end(a);
   auto& g = G();
   g.setTextSize(size);
-  g.setTextColor(fg, theme::kPanel);
+  g.setTextColor(fg);  // transparent bg — no Win95 opaque dump
   g.setCursor(x, y);
   g.print(b);
+}
+
+void btn(int x, int y, int w, int h, const char* label, bool primary = true,
+         uint16_t fill = 0) {
+  gfxu::drawButton(G(), x, y, w, h, label, primary, fill);
+}
+
+void chip(int x, int y, int w, int h, const char* label, bool on,
+          uint16_t onColor = theme::kGold) {
+  gfxu::drawChip(G(), x, y, w, h, label, on, onColor);
 }
 
 // Signal-strength pips from an RSSI value.
@@ -344,7 +355,7 @@ void cnRebuildVisible() {
     }
     cnVisibleIdx[j] = v;
   }
-  int maxScroll = max(0, cnVisibleCount - 10);
+  int maxScroll = max(0, cnVisibleCount - 8);
   if (cnScroll > maxScroll) cnScroll = maxScroll;
 }
 
@@ -399,8 +410,6 @@ void cnClose() {
   WiFi.scanDelete();
   cnDetail = -1;
 }
-uint16_t cnDarkInk() { return 0x18C3; }
-
 void cnDrawDetail(int x, int y, int w, int h) {
   body(x, y, w, h);
   if (cnDetail < 0 || cnDetail >= cnCount) {
@@ -412,78 +421,88 @@ void cnDrawDetail(int x, int y, int w, int h) {
   snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", n.bssid[0],
            n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5]);
   const char* ven = oui::vendor(n.bssid);
-  txt(x + 8, y + 6, theme::kGold, 2, "Look closer");
-  txt(x + 8, y + 32, theme::kInk, 1, "SSID: %s", n.ssid);
-  txt(x + 8, y + 48, theme::kInk, 1, "BSSID: %s", mac);
-  txt(x + 8, y + 64, theme::kSeaFoam, 1, "Vendor: %s", ven[0] ? ven : "unknown");
-  txt(x + 8, y + 80, theme::kInk, 1, "Auth: %s", encLabel(n.auth));
-  txt(x + 8, y + 96, theme::kInk, 1, "RSSI: %d dBm   CH: %u", (int)n.rssi,
-      (unsigned)n.channel);
-  rssiBars(x + 200, y + 96, n.rssi);
-  G().fillRoundRect(x + 8, y + h - 36, 90, 28, 5, theme::kPanelHi);
-  txt(x + 28, y + h - 26, theme::kInk, 1, "BACK");
-  G().fillRoundRect(x + 110, y + h - 36, 100, 28, 5, theme::kGold);
-  txt(x + 128, y + h - 26, cnDarkInk(), 1, "RESCAN");
+  txt(x + 10, y + 6, theme::kGold, 2, "Look closer");
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%s", n.ssid);
+  gfxu::drawKVRow(G(), x + 8, y + 28, w - 16, 20, "SSID", buf, theme::kInk);
+  snprintf(buf, sizeof(buf), "%s", mac);
+  gfxu::drawKVRow(G(), x + 8, y + 52, w - 16, 20, "BSSID", buf, theme::kCyan);
+  snprintf(buf, sizeof(buf), "%s", ven[0] ? ven : "unknown");
+  gfxu::drawKVRow(G(), x + 8, y + 76, w - 16, 20, "Vendor", buf, theme::kTeal);
+  snprintf(buf, sizeof(buf), "%s", encLabel(n.auth));
+  gfxu::drawKVRow(G(), x + 8, y + 100, w - 16, 20, "Auth", buf,
+                  riskColor(encRisk(n.auth)));
+  snprintf(buf, sizeof(buf), "%d dBm  CH %u", (int)n.rssi, (unsigned)n.channel);
+  gfxu::drawKVRow(G(), x + 8, y + 124, w - 16, 20, "Signal", buf, theme::kInk);
+  rssiBars(x + w - 36, y + 130, n.rssi);
+  btn(x + 8, y + h - 34, 90, 28, "BACK", false);
+  btn(x + 110, y + h - 34, 100, 28, "RESCAN", true);
 }
 
 void cnDrawList(int x, int y, int w, int h) {
   body(x, y, w, h);
   int st = wifiScanState();
   if (st < 0 && cnCount == 0) {
-    txt(x + 8, y + 6, theme::kInkDim, 1, "Sweeping the horizon...");
+    txt(x + 12, y + 10, theme::kInkDim, 1, "Sweeping the horizon...");
     return;
   }
-  txt(x + 8, y + 2, theme::kGold, 1, "%d nets", cnCount);
-  // Sort / filter chips
+  // Toolbar card
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 22, 5, theme::kPanelSoft);
+  txt(x + 10, y + 8, theme::kGold, 1, "%d nets", cnCount);
   const char* sorts[] = {"RSSI", "CH", "SSID"};
   for (int i = 0; i < 3; i++) {
-    int bx = x + 70 + i * 42;
-    G().fillRoundRect(bx, y + 0, 40, 14, 3,
-                      cnSort == i ? theme::kGold : theme::kPanelHi);
-    txt(bx + 6, y + 3, cnSort == i ? 0x18C3 : theme::kInkDim, 1, "%s",
-        sorts[i]);
+    int bx = x + 68 + i * 40;
+    chip(bx, y + 5, 38, theme::kChipH, sorts[i], cnSort == i, theme::kGold);
   }
   const char* filters[] = {"All", "Open", "Sec"};
   for (int i = 0; i < 3; i++) {
-    int bx = x + 200 + i * 36;
-    G().fillRoundRect(bx, y + 0, 34, 14, 3,
-                      cnFilter == i ? theme::kSeaFoam : theme::kPanelHi);
-    txt(bx + 4, y + 3, cnFilter == i ? 0x18C3 : theme::kInkDim, 1, "%s",
-        filters[i]);
+    int bx = x + 196 + i * 36;
+    chip(bx, y + 5, 34, theme::kChipH, filters[i], cnFilter == i, theme::kTeal);
   }
 
-  constexpr int kRows = 10;
+  constexpr int kRows = 8;
+  constexpr int kRh = theme::kRowH;
+  int listTop = y + 28;
   int rows = min(cnVisibleCount - cnScroll, kRows);
   for (int r = 0; r < rows; r++) {
     int idx = cnVisibleIdx[cnScroll + r];
     const CnNet& n = cnNets[idx];
-    int ry = y + 18 + r * 14;
-    rssiBars(x + 4, ry, n.rssi);
-    char ssid[16];
-    strncpy(ssid, n.ssid, 15);
-    ssid[15] = 0;
-    txt(x + 24, ry, theme::kInk, 1, "%s", ssid);
+    int ry = listTop + r * kRh;
+    if (r & 1) G().fillRect(x + 4, ry, w - 32, kRh, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 4, n.rssi);
+    char ssid[18];
+    strncpy(ssid, n.ssid, 17);
+    ssid[17] = 0;
+    txt(x + 28, ry + 2, theme::kInk, 1, "%s", ssid);
     const char* ven = oui::vendor(n.bssid);
-    if (ven[0]) txt(x + 130, ry, theme::kSeaFoam, 1, "%.8s", ven);
-    txt(x + 196, ry, theme::kInkDim, 1, "c%02u", (unsigned)n.channel);
-    txt(x + 234, ry, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
+    char sec[28];
+    if (ven[0])
+      snprintf(sec, sizeof(sec), "%s  ch%u", ven, (unsigned)n.channel);
+    else
+      snprintf(sec, sizeof(sec), "ch%u", (unsigned)n.channel);
+    if (strlen(sec) > 22) sec[22] = 0;
+    txt(x + 28, ry + 10, theme::kInkMuted, 1, "%s", sec);
+    txt(x + 234, ry + 5, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 40, theme::kBorder);
   }
-  // Scroll affordances
+  // Scroll affordances (larger targets)
   if (cnScroll > 0)
-    txt(x + 300, y + 20, theme::kGold, 1, "^");
+    btn(x + w - 30, listTop, 26, 22, "^", false);
   if (cnScroll + kRows < cnVisibleCount)
-    txt(x + 300, y + h - 16, theme::kGold, 1, "v");
-  txt(x + 8, y + h - 12, theme::kInkDim, 1, "Tap row=detail  tap empty=rescan");
+    btn(x + w - 30, y + h - 36, 26, 22, "v", false);
+  txt(x + 8, y + h - 12, theme::kInkMuted, 1, "Tap row = detail   empty = rescan");
 }
 void cnDraw(int x, int y, int w, int h) {
   if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
   else cnDrawList(x, y, w, h);
 }
 bool cnTouch(int16_t x, int16_t y) {
-  // Content-local coords (main already passes absolute; tools use absolute
-  // matching onDraw region). Match Settings Cabin style: y is absolute.
-  int ly = y;  // absolute screen y; content starts ~44
+  // Absolute screen coords; content region starts at y≈44.
+  int ly = y;
   int cx = x;
+  constexpr int kRows = 8;
+  constexpr int kRh = theme::kRowH;
+  constexpr int kListTop = 44 + 28;  // content y + toolbar
   if (cnDetail >= 0) {
     if (ly >= 204 && ly <= 240) {
       if (cx >= 8 && cx <= 100) {
@@ -501,18 +520,18 @@ bool cnTouch(int16_t x, int16_t y) {
     cnDetail = -1;
     return true;
   }
-  // Sort chips (y around 44+2)
-  if (ly >= 44 && ly <= 62) {
+  // Sort / filter chips in toolbar
+  if (ly >= 44 && ly <= 70) {
     for (int i = 0; i < 3; i++) {
-      int bx = 70 + i * 42;
-      if (cx >= bx && cx <= bx + 40) {
+      int bx = 68 + i * 40;
+      if (cx >= bx && cx <= bx + 38) {
         cnSort = i;
         cnRebuildVisible();
         return true;
       }
     }
     for (int i = 0; i < 3; i++) {
-      int bx = 200 + i * 36;
+      int bx = 196 + i * 36;
       if (cx >= bx && cx <= bx + 34) {
         cnFilter = i;
         cnScroll = 0;
@@ -521,20 +540,20 @@ bool cnTouch(int16_t x, int16_t y) {
       }
     }
   }
-  // Scroll edges
+  // Scroll buttons (right edge)
   if (cx >= 290) {
     if (ly < 120) {
       if (cnScroll > 0) cnScroll--;
       return true;
     }
     if (ly > 160) {
-      if (cnScroll + 10 < cnVisibleCount) cnScroll++;
+      if (cnScroll + kRows < cnVisibleCount) cnScroll++;
       return true;
     }
   }
   // Row tap -> detail
-  if (ly >= 62 && ly <= 62 + 10 * 14) {
-    int r = (ly - 62) / 14;
+  if (ly >= kListTop && ly < kListTop + kRows * kRh) {
+    int r = (ly - kListTop) / kRh;
     if (r >= 0 && cnScroll + r < cnVisibleCount) {
       cnDetail = cnVisibleIdx[cnScroll + r];
       return true;
@@ -556,18 +575,28 @@ void hlTick(uint32_t now) { bleTick(now); }
 void hlClose() {}
 void hlDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kGold, 1, "%d bottles adrift", g_bleCount);
-  int rows = min(g_bleCount, 14);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
+  txt(x + 10, y + 7, theme::kGold, 1, "%d bottles adrift", g_bleCount);
+  txt(x + 160, y + 7, theme::kInkMuted, 1, "passive BLE");
+  constexpr int kRh = theme::kRowHCompact;
+  int rows = min(g_bleCount, 11);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 18 + i * 12;
-    rssiBars(x + 6, ry, g_ble[i].rssi);
+    int ry = y + 24 + i * kRh;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 3, g_ble[i].rssi);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
-    if (label.length() > 18) label = label.substring(0, 18);
+    if (label.length() > 16) label = label.substring(0, 16);
     uint16_t c = g_ble[i].kind == 1 ? theme::kWarn : theme::kInk;
-    txt(x + 26, ry, c, 1, "%s", label.c_str());
+    txt(x + 28, ry + 1, c, 1, "%s", label.c_str());
     const char* ven = oui::vendorStr(g_ble[i].mac);
-    if (ven[0]) txt(x + 178, ry, theme::kSeaFoam, 1, "%.8s", ven);
-    txt(x + 250, ry, theme::kInkDim, 1, "%ddB", g_ble[i].rssi);
+    char meta[24];
+    if (ven[0])
+      snprintf(meta, sizeof(meta), "%.7s %ddB", ven, g_ble[i].rssi);
+    else
+      snprintf(meta, sizeof(meta), "%ddB", g_ble[i].rssi);
+    int mw = (int)strlen(meta) * 6;
+    txt(x + w - mw - 10, ry + 4, theme::kInkDim, 1, "%s", meta);
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
 }
 bool hlTouch(int16_t, int16_t) { return false; }
@@ -609,7 +638,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.3.0,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.4.0,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -666,25 +695,30 @@ void crTick(uint32_t now) {
 void crClose() { WiFi.scanDelete(); }
 void crDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 8, theme::kInk, 2, "Chart Room");
-  txt(x + 8, y + 34, theme::kInkDim, 1, "WiGLE 1.4 wardrive log ->");
-  txt(x + 8, y + 46, theme::kInkDim, 1, "%s (upload-ready CSV).", kWigleFile);
-  txt(x + 8, y + 70, app::sdReady() ? theme::kGood : theme::kBad, 1,
-      "SD card: %s", app::sdReady() ? "mounted" : "not found");
-  txt(x + 8, y + 90, theme::kGold, 1, "Rows logged this voyage: %lu",
-      (unsigned long)crLoggedSession);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
+  txt(x + 12, y + 8, theme::kGold, 1, "Chart Room");
+  txt(x + 12, y + 22, theme::kInkMuted, 1, "WiGLE 1.4 wardrive → %s",
+      kWigleFile);
+  char v[40];
+  gfxu::drawKVRow(G(), x + 6, y + 46, w - 12, 20, "SD card",
+                  app::sdReady() ? "mounted" : "not found",
+                  app::sdReady() ? theme::kGood : theme::kBad);
+  snprintf(v, sizeof(v), "%lu", (unsigned long)crLoggedSession);
+  gfxu::drawKVRow(G(), x + 6, y + 70, w - 12, 20, "Rows this voyage", v,
+                  theme::kGold);
   bool fix = gps::hasFix();
-  txt(x + 8, y + 110, fix ? theme::kGood : theme::kWarn, 1, "GPS: %s",
-      gps::statusLabel());
+  gfxu::drawKVRow(G(), x + 6, y + 94, w - 12, 20, "GPS", gps::statusLabel(),
+                  fix ? theme::kGood : theme::kWarn);
   if (fix) {
-    txt(x + 8, y + 126, theme::kInk, 1, "%.5f, %.5f  alt %.0fm",
-        gps::latitude(), gps::longitude(), gps::altitudeM());
+    snprintf(v, sizeof(v), "%.5f, %.5f  %.0fm", gps::latitude(),
+             gps::longitude(), gps::altitudeM());
+    gfxu::drawKVRow(G(), x + 6, y + 118, w - 12, 20, "Fix", v, theme::kCyan);
   } else {
-    txt(x + 8, y + 126, theme::kInkDim, 1,
-        "No fix: lat/lon blank in CSV until fix.");
+    gfxu::drawKVRow(G(), x + 6, y + 118, w - 12, 20, "Fix",
+                    "lat/lon blank until fix", theme::kInkMuted);
   }
-  txt(x + 8, y + 150, theme::kInkDim, 1, "UART GPS on GPIO43 RX / 44 TX.");
-  txt(x + 8, y + 166, theme::kInkDim, 1, "Passive survey - no association.");
+  txt(x + 12, y + 150, theme::kInkMuted, 1, "UART GPS GPIO43 RX / 44 TX");
+  txt(x + 12, y + 166, theme::kInkMuted, 1, "Passive survey — no association.");
 }
 bool crTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -728,41 +762,48 @@ void lkTick(uint32_t now) {
 void lkClose() { WiFi.scanDelete(); }
 void lkDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 2, theme::kGold, 1, "APs/ch 1-13  (tap bar)");
-  txt(x + 180, y + 2, theme::kInkDim, 1, "n=%d", lkTotal);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
+  txt(x + 10, y + 7, theme::kGold, 1, "Channel occupancy");
+  txt(x + 160, y + 7, theme::kInkMuted, 1, "tap a bar · n=%d", lkTotal);
   int maxv = 1;
   for (int c = 1; c <= 13; c++) maxv = max(maxv, lkHist[c]);
-  int baseY = y + h - 36;
-  int plotH = h - 56;
+  int baseY = y + h - 40;
+  int plotH = h - 68;
   int bw = 18;
   int gap = 3;
+  // plot well
+  G().fillSmoothRoundRect(x + 6, y + 24, w - 12, plotH + 18, 6, theme::kPanelSoft);
   for (int c = 1; c <= 13; c++) {
-    int bx = x + 10 + (c - 1) * (bw + gap);
+    int bx = x + 12 + (c - 1) * (bw + gap);
     int bh = maxv ? (lkHist[c] * plotH) / maxv : 0;
     bool sel = (lkSelected == c);
     uint16_t col = sel ? theme::kGold
                        : (lkHist[c] >= maxv && maxv > 1 ? theme::kWarn
-                                                        : theme::kGood);
-    G().fillRect(bx, baseY - bh, bw, bh, col);
-    // open-AP overlay in red tip
+                                                        : theme::kTeal);
+    if (bh > 0)
+      G().fillSmoothRoundRect(bx, baseY - bh, bw, bh, 3, col);
     if (lkOpenHist[c] > 0 && bh > 0) {
       int oh = max(2, (lkOpenHist[c] * plotH) / maxv);
       if (oh > bh) oh = bh;
-      G().fillRect(bx, baseY - oh, bw, oh, theme::kBad);
+      G().fillSmoothRoundRect(bx, baseY - oh, bw, oh, 2, theme::kBad);
     }
-    if (sel) G().drawRect(bx - 1, baseY - bh - 1, bw + 2, bh + 2, theme::kInk);
+    if (sel) G().drawRoundRect(bx - 1, baseY - max(bh, 4) - 1, bw + 2,
+                               max(bh, 4) + 2, 3, theme::kInk);
     txt(bx + (c >= 10 ? 1 : 5), baseY + 4, theme::kInkDim, 1, "%d", c);
     if (lkHist[c])
       txt(bx + 2, baseY - bh - 10, theme::kInk, 1, "%d", lkHist[c]);
   }
-  // legend + detail
-  txt(x + 8, y + h - 20, theme::kGood, 1, "sec");
-  txt(x + 40, y + h - 20, theme::kBad, 1, "open");
+  // legend strip
+  G().fillSmoothRoundRect(x + 4, y + h - 22, w - 8, 18, 4, theme::kBgDeep);
+  G().fillSmoothRoundRect(x + 10, y + h - 16, 8, 8, 2, theme::kTeal);
+  txt(x + 22, y + h - 16, theme::kInkDim, 1, "sec");
+  G().fillSmoothRoundRect(x + 52, y + h - 16, 8, 8, 2, theme::kBad);
+  txt(x + 64, y + h - 16, theme::kInkDim, 1, "open");
   if (lkSelected >= 1 && lkSelected <= 13) {
-    txt(x + 100, y + h - 20, theme::kGold, 1, "CH%d: %d AP (%d open)",
+    txt(x + 110, y + h - 16, theme::kGold, 1, "CH%d: %d AP (%d open)",
         lkSelected, lkHist[lkSelected], lkOpenHist[lkSelected]);
   } else {
-    txt(x + 100, y + h - 20, theme::kInkDim, 1, "crowded=gold tip");
+    txt(x + 110, y + h - 16, theme::kInkMuted, 1, "crowded = gold tip");
   }
 }
 bool lkTouch(int16_t x, int16_t y) {
@@ -839,20 +880,28 @@ void sgTick(uint32_t now) {
 void sgClose() { WiFi.scanDelete(); }
 void sgDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kGold, 1, "Watchtowers spotted: %d", sgHitCount);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 40, 5, theme::kPanelSoft);
+  txt(x + 10, y + 8, theme::kGold, 1, "Watchtowers spotted: %d", sgHitCount);
   if (spyglass::hasVerifiedSignature()) {
-    txt(x + 8, y + 18, theme::kGood, 1, "Verified field OUIs armed (DeFlock).");
-    txt(x + 8, y + 30, theme::kInkDim, 1, "OUI hit = strong; keyword = candidate.");
+    txt(x + 10, y + 22, theme::kGood, 1, "Verified field OUIs armed (DeFlock).");
+    txt(x + 10, y + 32, theme::kInkMuted, 1, "OUI hit = strong; keyword = candidate.");
   } else {
-    txt(x + 8, y + 20, theme::kWarn, 1, "Keyword heuristics only -- hits are");
-    txt(x + 8, y + 32, theme::kInkDim, 1, "candidates. Verify against DeFlock.");
+    txt(x + 10, y + 22, theme::kWarn, 1, "Keyword heuristics only — candidates.");
+    txt(x + 10, y + 32, theme::kInkMuted, 1, "Verify against DeFlock.");
   }
-  int rows = min(sgHitCount, 10);
+  constexpr int kRh = theme::kRowH;
+  int rows = min(sgHitCount, 7);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 48 + i * 14;
-    txt(x + 8, ry, theme::kBad, 1, "%s", sgHits[i].label.c_str());
-    txt(x + 8, ry + 6, theme::kInkDim, 1, "%s  %s  %ddB",
-        sgHits[i].ssid.c_str(), sgHits[i].bssid.c_str(), sgHits[i].rssi);
+    int ry = y + 48 + i * kRh;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
+    String lab = sgHits[i].label;
+    if (lab.length() > 28) lab = lab.substring(0, 28);
+    txt(x + 10, ry + 1, theme::kBad, 1, "%s", lab.c_str());
+    char sec[42];
+    snprintf(sec, sizeof(sec), "%s  %ddB", sgHits[i].bssid.c_str(),
+             sgHits[i].rssi);
+    txt(x + 10, ry + 10, theme::kInkMuted, 1, "%s", sec);
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
 }
 bool sgTouch(int16_t, int16_t) { return false; }
@@ -870,21 +919,28 @@ void twDraw(int x, int y, int w, int h) {
   int n = 0;
   for (int i = 0; i < g_bleCount; i++)
     if (g_ble[i].kind == 1) n++;
-  txt(x + 8, y + 4, n ? theme::kWarn : theme::kGood, 1,
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
+  txt(x + 10, y + 8, n ? theme::kWarn : theme::kGood, 1,
       "Possible trackers nearby: %d", n);
-  txt(x + 8, y + 18, theme::kInkDim, 1, "AirTag / Tile / SmartTag signatures");
+  txt(x + 10, y + 20, theme::kInkMuted, 1, "AirTag / Tile / SmartTag signatures");
   int shown = 0;
-  for (int i = 0; i < g_bleCount && shown < 12; i++) {
+  constexpr int kRh = theme::kRowH;
+  for (int i = 0; i < g_bleCount && shown < 8; i++) {
     if (g_ble[i].kind != 1) continue;
-    int ry = y + 36 + shown * 13;
-    rssiBars(x + 6, ry, g_ble[i].rssi);
+    int ry = y + 36 + shown * kRh;
+    if (shown & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 4, g_ble[i].rssi);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
-    txt(x + 26, ry, theme::kWarn, 1, "%s", label.c_str());
-    txt(x + 250, ry, theme::kInkDim, 1, "%ddB", g_ble[i].rssi);
+    if (label.length() > 22) label = label.substring(0, 22);
+    txt(x + 28, ry + 5, theme::kWarn, 1, "%s", label.c_str());
+    char meta[12];
+    snprintf(meta, sizeof(meta), "%ddB", g_ble[i].rssi);
+    txt(x + w - 40, ry + 5, theme::kInkDim, 1, "%s", meta);
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
     shown++;
   }
   if (n == 0)
-    txt(x + 8, y + 40, theme::kInkDim, 1, "All clear - no trackers seen.");
+    txt(x + 12, y + 48, theme::kInkMuted, 1, "All clear — no trackers seen.");
 }
 bool twTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -945,23 +1001,28 @@ void rwClose() {
 void rwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   bool recent = (millis() - rwLastHit) < 4000 && (rwDeauth + rwDisassoc) > 0;
-  txt(x + 8, y + 8, theme::kInk, 2, "Rigging Watch");
-  txt(x + 8, y + 34, theme::kInkDim, 1, "Listening for deauth storms  ch %d",
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
+  txt(x + 12, y + 8, theme::kGold, 1, "Rigging Watch");
+  txt(x + 12, y + 22, theme::kInkMuted, 1, "Listening for deauth storms · ch %d",
       rwChannel);
-  txt(x + 8, y + 60, theme::kBad, 1, "Deauth frames:   %lu",
-      (unsigned long)rwDeauth);
-  txt(x + 8, y + 74, theme::kWarn, 1, "Disassoc frames: %lu",
-      (unsigned long)rwDisassoc);
-  txt(x + 8, y + 96, theme::kInkDim, 1, "Last source: %s", rwLastSrc);
-  txt(x + 8, y + 108, theme::kInkDim, 1, "Last RSSI:   %d dB", rwLastRssi);
+  char v[24];
+  snprintf(v, sizeof(v), "%lu", (unsigned long)rwDeauth);
+  gfxu::drawKVRow(G(), x + 6, y + 46, w - 12, 22, "Deauth frames", v, theme::kBad);
+  snprintf(v, sizeof(v), "%lu", (unsigned long)rwDisassoc);
+  gfxu::drawKVRow(G(), x + 6, y + 72, w - 12, 22, "Disassoc frames", v,
+                  theme::kWarn);
+  gfxu::drawKVRow(G(), x + 6, y + 98, w - 12, 22, "Last source", rwLastSrc,
+                  theme::kCyan);
+  snprintf(v, sizeof(v), "%d dB", rwLastRssi);
+  gfxu::drawKVRow(G(), x + 6, y + 124, w - 12, 22, "Last RSSI", v);
   if (recent) {
-    G().fillRoundRect(x + 8, y + 130, w - 16, 26, 4, theme::kBad);
-    G().setTextColor(theme::kInk, theme::kBad);
+    G().fillSmoothRoundRect(x + 6, y + 154, w - 12, 28, 6, theme::kBad);
+    G().setTextColor(theme::kInk);
     G().setTextSize(1);
-    G().setCursor(x + 16, y + 139);
-    G().print("ALERT: attack frames detected nearby!");
+    G().setCursor(x + 14, y + 164);
+    G().print("ALERT: attack frames nearby!");
   } else {
-    txt(x + 8, y + 134, theme::kGood, 1, "Calm seas - no attack detected.");
+    txt(x + 12, y + 160, theme::kGood, 1, "Calm seas — no attack detected.");
   }
 }
 bool rwTouch(int16_t, int16_t) { return false; }
@@ -994,23 +1055,32 @@ void hiTick(uint32_t now) {
 void hiClose() { WiFi.scanDelete(); }
 void hiDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 6, theme::kInk, 2, "Hull Inspection");
-  txt(x + 8, y + 32, theme::kInkDim, 1, "%d networks audited", hiTotal);
-  txt(x + 8, y + 52, theme::kBad, 1, "Open / WEP (risky):  %d", hiOpen_);
-  txt(x + 8, y + 66, theme::kWarn, 1, "WPA (aging):         %d", hiWeak);
-  txt(x + 8, y + 80, theme::kGood, 1, "WPA3 (strong):       %d", hiStrong);
-  txt(x + 8, y + 104, theme::kInkDim, 1, "Your network should read WPA2/3,");
-  txt(x + 8, y + 116, theme::kInkDim, 1, "never OPEN or WEP. Turn off WPS");
-  txt(x + 8, y + 128, theme::kInkDim, 1, "and enable PMF on the router.");
-  int rows = min(hiTotal, 6);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
+  txt(x + 10, y + 6, theme::kGold, 1, "Hull Inspection");
+  txt(x + 10, y + 18, theme::kInkMuted, 1, "%d networks audited · passive",
+      hiTotal);
+  char v[12];
+  snprintf(v, sizeof(v), "%d", hiOpen_);
+  gfxu::drawKVRow(G(), x + 6, y + 36, w - 12, 18, "Open / WEP (risky)", v,
+                  theme::kBad);
+  snprintf(v, sizeof(v), "%d", hiWeak);
+  gfxu::drawKVRow(G(), x + 6, y + 56, w - 12, 18, "WPA (aging)", v, theme::kWarn);
+  snprintf(v, sizeof(v), "%d", hiStrong);
+  gfxu::drawKVRow(G(), x + 6, y + 76, w - 12, 18, "WPA3 (strong)", v,
+                  theme::kGood);
+  txt(x + 10, y + 100, theme::kInkMuted, 1, "Prefer WPA2/3 · disable WPS · enable PMF");
+  constexpr int kRh = theme::kRowHCompact;
+  int rows = min(hiTotal, 5);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 150 + i * 12;
+    int ry = y + 116 + i * kRh;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     wifi_auth_mode_t m = WiFi.encryptionType(i);
     String ssid = WiFi.SSID(i);
     if (ssid.length() == 0) ssid = "<hidden>";
     if (ssid.length() > 18) ssid = ssid.substring(0, 18);
-    txt(x + 8, ry, theme::kInk, 1, "%s", ssid.c_str());
-    txt(x + 230, ry, riskColor(encRisk(m)), 1, "%s", encLabel(m));
+    txt(x + 10, ry + 4, theme::kInk, 1, "%s", ssid.c_str());
+    txt(x + 230, ry + 4, riskColor(encRisk(m)), 1, "%s", encLabel(m));
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
 }
 bool hiTouch(int16_t, int16_t) { return false; }
@@ -1159,8 +1229,7 @@ void clDraw(int x, int y, int w, int h) {
 
   if (clMode == 1) {
     // Preview pane
-    G().fillRoundRect(x + 8, y + 4, 70, 18, 3, theme::kPanelHi);
-    txt(x + 16, y + 8, theme::kInk, 1, "< Back");
+    btn(x + 8, y + 4, 70, 20, "< Back", false);
     String title = clOpenName;
     if (title.length() > 22) title = title.substring(0, 22);
     txt(x + 86, y + 8, theme::kGold, 1, "%s", title.c_str());
@@ -1190,32 +1259,38 @@ void clDraw(int x, int y, int w, int h) {
   }
 
   // List pane
-  txt(x + 8, y + 4, theme::kGold, 1, "Captain's Log: %d items  (tap open)",
-      clCount);
-  txt(x + 8, y + 16, theme::kInkDim, 1, "Tap row = preview  |  empty = refresh");
-  const int visible = 12;
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
+  txt(x + 10, y + 6, theme::kGold, 1, "Captain's Log · %d items", clCount);
+  txt(x + 10, y + 16, theme::kInkMuted, 1, "Tap row = preview   empty = refresh");
+  const int visible = 8;
+  constexpr int kRh = theme::kRowH;
   if (clScroll > clCount - visible) clScroll = max(0, clCount - visible);
   if (clScroll < 0) clScroll = 0;
   int rows = min(visible, clCount - clScroll);
   for (int i = 0; i < rows; i++) {
     int idx = clScroll + i;
-    int ry = y + 32 + i * 13;
+    int ry = y + 32 + i * kRh;
     bool wigle = false;
     String low = clFiles[idx];
     low.toLowerCase();
     if (low.indexOf("wigle") >= 0 && low.endsWith(".csv")) wigle = true;
     String nm = clFiles[idx];
-    if (nm.length() > 24) nm = nm.substring(0, 24);
-    txt(x + 8, ry, wigle ? theme::kGood : theme::kInk, 1, "%s", nm.c_str());
-    if (clSizes[idx] >= 0)
-      txt(x + 236, ry, theme::kInkDim, 1, "%ldB", clSizes[idx]);
+    if (nm.length() > 22) nm = nm.substring(0, 22);
+    if (i & 1) G().fillRect(x + 4, ry, w - 36, kRh, theme::kPanelSoft);
+    txt(x + 10, ry + 5, wigle ? theme::kGood : theme::kInk, 1, "%s",
+        nm.c_str());
+    if (clSizes[idx] >= 0) {
+      char sz[16];
+      snprintf(sz, sizeof(sz), "%ldB", clSizes[idx]);
+      int mw = (int)strlen(sz) * 6;
+      txt(x + w - mw - 40, ry + 5, theme::kInkDim, 1, "%s", sz);
+    }
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 40, theme::kBorder);
   }
   // Scroll affordances
   if (clCount > visible) {
-    G().fillRoundRect(x + 280, y + 32, 28, 22, 3, theme::kPanelHi);
-    txt(x + 288, y + 37, theme::kInk, 1, "^");
-    G().fillRoundRect(x + 280, y + 160, 28, 22, 3, theme::kPanelHi);
-    txt(x + 288, y + 165, theme::kInk, 1, "v");
+    btn(x + 280, y + 32, 28, 22, "^", false);
+    btn(x + 280, y + 160, 28, 22, "v", false);
   }
 }
 
@@ -1229,19 +1304,19 @@ bool clTouch(int16_t x, int16_t y) {
     return true;
   }
   // Scroll buttons
-  if (clCount > 12 && x >= 270) {
+  if (clCount > 8 && x >= 270) {
     if (ly >= 28 && ly <= 60) {
-      clScroll = max(0, clScroll - 4);
+      clScroll = max(0, clScroll - 3);
       return true;
     }
     if (ly >= 156 && ly <= 190) {
-      clScroll = min(max(0, clCount - 12), clScroll + 4);
+      clScroll = min(max(0, clCount - 8), clScroll + 3);
       return true;
     }
   }
-  // Row tap
+  // Row tap (theme::kRowH = 18)
   if (ly >= 28 && ly <= 190 && x < 270) {
-    int row = (ly - 28) / 13;
+    int row = (ly - 28) / theme::kRowH;
     int idx = clScroll + row;
     if (idx >= 0 && idx < clCount && clSizes[idx] >= 0) {
       if (clLooksText(clFiles[idx])) {
@@ -1268,37 +1343,35 @@ void ssTick(uint32_t) {}
 void ssClose() {}
 void ssDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 6, theme::kInk, 2, "Ship's Systems");
-  int ry = y + 34;
-  txt(x + 8, ry, theme::kInkDim, 1, "Chip:  %s  x%d @ %dMHz",
-      ESP.getChipModel(), ESP.getChipCores(), getCpuFrequencyMhz());
-  ry += 14;
-  txt(x + 8, ry, theme::kInkDim, 1, "Heap:  %u KB free",
-      (unsigned)(ESP.getFreeHeap() / 1024));
-  ry += 14;
-  txt(x + 8, ry, theme::kInkDim, 1, "PSRAM: %u / %u KB free",
-      (unsigned)(ESP.getFreePsram() / 1024),
-      (unsigned)(ESP.getPsramSize() / 1024));
-  ry += 14;
-  txt(x + 8, ry, theme::kInkDim, 1, "Flash: %u MB",
-      (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
-  ry += 14;
-  txt(x + 8, ry, theme::kInkDim, 1, "SD:    %s",
-      app::sdReady() ? "mounted" : "absent");
-  ry += 14;
+  txt(x + 10, y + 6, theme::kGold, 1, "Ship's Systems");
+  char v[40];
+  snprintf(v, sizeof(v), "%s x%d @ %dMHz", ESP.getChipModel(),
+           ESP.getChipCores(), getCpuFrequencyMhz());
+  gfxu::drawKVRow(G(), x + 6, y + 24, w - 12, 18, "Chip", v, theme::kCyan);
+  snprintf(v, sizeof(v), "%u KB free", (unsigned)(ESP.getFreeHeap() / 1024));
+  gfxu::drawKVRow(G(), x + 6, y + 44, w - 12, 18, "Heap", v);
+  snprintf(v, sizeof(v), "%u / %u KB", (unsigned)(ESP.getFreePsram() / 1024),
+           (unsigned)(ESP.getPsramSize() / 1024));
+  gfxu::drawKVRow(G(), x + 6, y + 64, w - 12, 18, "PSRAM", v, theme::kTeal);
+  snprintf(v, sizeof(v), "%u MB",
+           (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
+  gfxu::drawKVRow(G(), x + 6, y + 84, w - 12, 18, "Flash", v);
+  gfxu::drawKVRow(G(), x + 6, y + 104, w - 12, 18, "SD",
+                  app::sdReady() ? "mounted" : "absent",
+                  app::sdReady() ? theme::kGood : theme::kBad);
   uint32_t up = millis() / 1000;
-  txt(x + 8, ry, theme::kInkDim, 1, "Uptime:%lu:%02lu:%02lu",
-      (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60),
-      (unsigned long)(up % 60));
-  ry += 14;
-  txt(x + 8, ry, theme::kInkDim, 1, "GPS:   %s", gps::statusLabel());
-  ry += 16;
+  snprintf(v, sizeof(v), "%lu:%02lu:%02lu", (unsigned long)(up / 3600),
+           (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
+  gfxu::drawKVRow(G(), x + 6, y + 124, w - 12, 18, "Uptime", v);
+  gfxu::drawKVRow(G(), x + 6, y + 144, w - 12, 18, "GPS", gps::statusLabel(),
+                  gps::hasFix() ? theme::kGood : theme::kInkDim);
   int pct = power::batteryPct();
-  txt(x + 8, ry, theme::kGold, 1, "Power: %s  (%lu mV)", power::powerLabel(),
-      (unsigned long)power::batteryMv());
-  G().drawRoundRect(x + 8, ry + 14, 104, 12, 2, theme::kInk);
-  G().fillRect(x + 10, ry + 16, pct, 8,
-               power::lowBattery() ? theme::kBad : theme::kGood);
+  snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
+           (unsigned long)power::batteryMv());
+  gfxu::drawKVRow(G(), x + 6, y + 164, w - 12, 18, "Power", v, theme::kGold);
+  G().drawRoundRect(x + 6, y + 186, 104, 10, 3, theme::kBorder);
+  G().fillSmoothRoundRect(x + 8, y + 188, max(1, pct), 6, 2,
+                          power::lowBattery() ? theme::kBad : theme::kGood);
 }
 bool ssTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1314,10 +1387,10 @@ void slDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   txt(x + 8, y + 6, theme::kInk, 2, "Signal Lantern");
 
-  // Mode row (tap to cycle)
-  G().fillRoundRect(x + 8, y + 32, 140, 30, 5, theme::kPanelHi);
-  txt(x + 18, y + 42, theme::kGold, 1, "Mode: %s", led::modeName(led::mode()));
-  txt(x + 158, y + 42, theme::kInkDim, 1, "(tap to cycle)");
+  char modeLab[24];
+  snprintf(modeLab, sizeof(modeLab), "Mode: %s", led::modeName(led::mode()));
+  btn(x + 8, y + 32, 150, 30, modeLab, false);
+  txt(x + 168, y + 42, theme::kInkMuted, 1, "tap to cycle");
 
   // Color swatches
   txt(x + 8, y + 72, theme::kInkDim, 1, "Color:");
@@ -1325,23 +1398,19 @@ void slDraw(int x, int y, int w, int h) {
     uint32_t c = led::colorRgb(i);
     uint16_t col565 = G().color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     int sx = x + 52 + i * 32;
-    G().fillRoundRect(sx, y + 66, 26, 26, 4, col565);
+    G().fillSmoothRoundRect(sx, y + 66, 26, 26, 5, col565);
     if (i == led::colorIdx())
-      G().drawRoundRect(sx - 2, y + 64, 30, 30, 5, theme::kInk);
+      G().drawRoundRect(sx - 2, y + 64, 30, 30, 6, theme::kGold);
   }
 
   // LED brightness row
   txt(x + 8, y + 108, theme::kInk, 1, "Glow: %d%%", led::brightness());
-  G().fillRoundRect(x + 150, y + 102, 30, 24, 4, theme::kPanelHi);
-  txt(x + 160, y + 108, theme::kInk, 2, "-");
-  G().fillRoundRect(x + 186, y + 102, 30, 24, 4, theme::kPanelHi);
-  txt(x + 196, y + 108, theme::kInk, 2, "+");
+  btn(x + 150, y + 102, 30, 24, "-", false);
+  btn(x + 186, y + 102, 30, 24, "+", false);
 
   // Sound row
-  G().fillRoundRect(x + 8, y + 140, 150, 30, 5,
-                    app::sound() ? theme::kGood : theme::kLocked);
-  txt(x + 18, y + 150, theme::kInk, 1, "Sound: %s (tap)",
-      app::sound() ? "ON" : "off");
+  btn(x + 8, y + 140, 150, 30, app::sound() ? "Sound: ON" : "Sound: off",
+      false, app::sound() ? theme::kGood : theme::kLocked);
 
   txt(x + 8, y + 182, theme::kInkDim, 1,
       "Profile persists & glows on every screen.");
@@ -1390,53 +1459,45 @@ void seTick(uint32_t) {}
 void seClose() {}
 void seDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kInk, 2, "Settings Cabin");
-  txt(x + 8, y + 26, theme::kInkDim, 1, "%s  %s Lv%d  fw %s",
+  // Identity card
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 34, 6, theme::kPanelSoft);
+  txt(x + 12, y + 8, theme::kGold, 1, "Settings Cabin");
+  txt(x + 12, y + 22, theme::kInkDim, 1, "%s · %s Lv%d · fw %s",
       game::profile.name, game::rankTitle(game::profile.level),
       game::profile.level, PP_VERSION);
 
-  // Rename
-  G().fillRoundRect(x + 8, y + 42, 150, 24, 4, theme::kPanelHi);
-  txt(x + 16, y + 49, theme::kInk, 1, "Rename…");
+  // Row: Rename + Brightness
+  btn(x + 8, y + 42, 118, 26, "Rename…", false);
+  char bri[16];
+  snprintf(bri, sizeof(bri), "Bri %d", app::brightness());
+  txt(x + 134, y + 50, theme::kInkDim, 1, "%s", bri);
+  btn(x + 232, y + 42, 28, 26, "-", false);
+  btn(x + 264, y + 42, 28, 26, "+", false);
 
-  // Brightness
-  txt(x + 168, y + 49, theme::kInk, 1, "Bri %d", app::brightness());
-  G().fillRoundRect(x + 232, y + 42, 28, 24, 4, theme::kPanelHi);
-  txt(x + 240, y + 48, theme::kInk, 2, "-");
-  G().fillRoundRect(x + 264, y + 42, 28, 24, 4, theme::kPanelHi);
-  txt(x + 272, y + 48, theme::kInk, 2, "+");
+  // Row: Sound + Idle sleep
+  btn(x + 8, y + 74, 120, 26, app::sound() ? "Sound: ON" : "Sound: off",
+      false, app::sound() ? theme::kGood : theme::kLocked);
+  btn(x + 136, y + 74, 160, 26,
+      power::idleSleep() ? "Idle sleep: ON" : "Idle sleep: off", false,
+      power::idleSleep() ? theme::kWarn : theme::kPanelHi);
 
-  // Sound + idle-sleep toggles
-  G().fillRoundRect(x + 8, y + 72, 120, 24, 4,
-                    app::sound() ? theme::kGood : theme::kLocked);
-  txt(x + 16, y + 79, theme::kInk, 1, "Sound:%s", app::sound() ? "ON" : "off");
-  G().fillRoundRect(x + 136, y + 72, 160, 24, 4,
-                    power::idleSleep() ? theme::kWarn : theme::kPanelHi);
-  txt(x + 144, y + 79, theme::kInk, 1, "Idle sleep:%s",
-      power::idleSleep() ? "ON" : "off");
+  // Row: Sleep / OTA
+  btn(x + 8, y + 106, 140, 26, "Sleep now", false, theme::kTeal);
+  bool otaOk = ota::wifiConfigured() && ota::urlConfigured();
+  btn(x + 156, y + 106, 140, 26, seOtaBusy ? "OTA…" : "OTA Update", otaOk,
+      otaOk ? 0 : theme::kLocked);
 
-  // Sleep now
-  G().fillRoundRect(x + 8, y + 102, 140, 24, 4, theme::kSeaFoam);
-  txt(x + 16, y + 109, theme::kInk, 1, "Sleep now (touch wake)");
-
-  // OTA
-  G().fillRoundRect(x + 156, y + 102, 140, 24, 4,
-                    (ota::wifiConfigured() && ota::urlConfigured())
-                        ? theme::kGold
-                        : theme::kLocked);
-  txt(x + 164, y + 109, theme::kInk, 1, seOtaBusy ? "OTA…" : "OTA Update");
-
-  txt(x + 8, y + 134, theme::kInkDim, 1, "OTA: %s", ota::status());
+  // Status block
+  G().fillSmoothRoundRect(x + 4, y + 138, w - 8, 28, 5, theme::kBgDeep);
+  txt(x + 10, y + 144, theme::kInkMuted, 1, "OTA: %s", ota::status());
   if (ota::wifiConfigured())
-    txt(x + 8, y + 146, theme::kInkDim, 1, "WiFi:%s  URL:%s",
+    txt(x + 10, y + 154, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
         ota::wifiSsid(), ota::urlConfigured() ? "set" : "none");
   else
-    txt(x + 8, y + 146, theme::kInkDim, 1,
+    txt(x + 10, y + 154, theme::kInkMuted, 1,
         "Set WiFi+URL via companion WIFICFG/OTAURL");
 
-  // Reset
-  G().fillRoundRect(x + 8, y + 168, 170, 24, 4, theme::kBad);
-  txt(x + 16, y + 175, theme::kInk, 1, "Reset progress");
+  btn(x + 8, y + 172, 170, 24, "Reset progress", false, theme::kBad);
 }
 
 bool seTouch(int16_t x, int16_t y) {
@@ -1586,28 +1647,32 @@ void pwClose() {
 }
 void pwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kGold, 1, "Clients probing: %d  (ch %d)", pwCount,
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
+  txt(x + 10, y + 6, theme::kGold, 1, "Clients probing: %d  (ch %d)", pwCount,
       pwChannel);
-  txt(x + 8, y + 16, theme::kInkDim, 1, "%lu probe frames heard passively",
+  txt(x + 10, y + 16, theme::kInkMuted, 1, "%lu probe frames · passive",
       (unsigned long)pwTotal);
-  int rows = min(pwCount, 13);
+  constexpr int kRh = theme::kRowHCompact;
+  int rows = min(pwCount, 10);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 32 + i * 13;
-    rssiBars(x + 6, ry, pwList[i].rssi);
+    int ry = y + 32 + i * kRh;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 3, pwList[i].rssi);
     if (pwList[i].ssid[0]) {
       String s = String(pwList[i].ssid);
-      if (s.length() > 16) s = s.substring(0, 16);
-      txt(x + 26, ry, theme::kInk, 1, "%s", s.c_str());
+      if (s.length() > 14) s = s.substring(0, 14);
+      txt(x + 28, ry + 4, theme::kInk, 1, "%s", s.c_str());
     } else {
-      txt(x + 26, ry, theme::kInkDim, 1, "<broadcast>");
+      txt(x + 28, ry + 4, theme::kInkDim, 1, "<broadcast>");
     }
     const char* ven = oui::vendorStr(String(pwList[i].mac));
-    txt(x + 150, ry, theme::kSeaFoam, 1, "%.8s",
+    txt(x + 150, ry + 4, theme::kTeal, 1, "%.8s",
         ven[0] ? ven : pwList[i].mac + 9);
-    txt(x + 250, ry, theme::kInkDim, 1, "x%u", pwList[i].hits);
+    txt(x + 250, ry + 4, theme::kInkDim, 1, "x%u", pwList[i].hits);
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
   if (pwCount == 0)
-    txt(x + 8, y + 40, theme::kInkDim, 1, "Listening... hop the channels.");
+    txt(x + 12, y + 48, theme::kInkMuted, 1, "Listening… hopping channels.");
 }
 bool pwTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1621,27 +1686,31 @@ void dbTick(uint32_t now) { bleTick(now); }
 void dbClose() {}
 void dbDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 4, theme::kGold, 1, "Decoding %d advertisers", g_bleCount);
-  int rows = min(g_bleCount, 11);
+  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 16, 4, theme::kPanelSoft);
+  txt(x + 10, y + 6, theme::kGold, 1, "Decoding %d advertisers", g_bleCount);
+  constexpr int kRh = theme::kRowH;
+  int rows = min(g_bleCount, 9);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 20 + i * 15;
+    int ry = y + 22 + i * kRh;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
     if (label.length() > 20) label = label.substring(0, 20);
-    txt(x + 8, ry, theme::kInk, 1, "%s", label.c_str());
-    txt(x + 252, ry, theme::kInkDim, 1, "%ddB", g_ble[i].rssi);
+    txt(x + 10, ry + 1, theme::kInk, 1, "%s", label.c_str());
+    txt(x + w - 40, ry + 1, theme::kInkDim, 1, "%ddB", g_ble[i].rssi);
     const char* co = bleCompanyName(g_ble[i].company);
     if (g_ble[i].detail[0])
-      txt(x + 16, ry + 7, theme::kSeaFoam, 1, "%s", g_ble[i].detail);
+      txt(x + 16, ry + 10, theme::kTeal, 1, "%s", g_ble[i].detail);
     else if (co[0])
-      txt(x + 16, ry + 7, theme::kSeaFoam, 1, "%s", co);
+      txt(x + 16, ry + 10, theme::kTeal, 1, "%s", co);
     else if (g_ble[i].company)
-      txt(x + 16, ry + 7, theme::kInkDim, 1, "company 0x%04X",
+      txt(x + 16, ry + 10, theme::kInkMuted, 1, "company 0x%04X",
           g_ble[i].company);
     else
-      txt(x + 16, ry + 7, theme::kInkDim, 1, "no manufacturer data");
+      txt(x + 16, ry + 10, theme::kInkMuted, 1, "no manufacturer data");
+    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
   if (g_bleCount == 0)
-    txt(x + 8, y + 20, theme::kInkDim, 1, "Sampling the air...");
+    txt(x + 12, y + 28, theme::kInkMuted, 1, "Sampling the air...");
 }
 bool dbTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1662,36 +1731,35 @@ void siTick(uint32_t now) {
 void siClose() {}
 void siDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 6, theme::kInk, 2, "Ship's Instruments");
-  int ry = y + 34;
-  txt(x + 8, ry, theme::kGold, 1, "Core temp: %.1f C  /  %.0f F", siTemp,
-      siTemp * 9.0f / 5.0f + 32.0f);
-  ry += 18;
+  txt(x + 10, y + 6, theme::kGold, 1, "Ship's Instruments");
+  char v[40];
+  snprintf(v, sizeof(v), "%.1f C / %.0f F", siTemp,
+           siTemp * 9.0f / 5.0f + 32.0f);
+  gfxu::drawKVRow(G(), x + 6, y + 24, w - 12, 20, "Core temp", v, theme::kGold);
   int pct = power::batteryPct();
-  txt(x + 8, ry, theme::kGold, 1, "Power: %s  (%lu mV)", power::powerLabel(),
-      (unsigned long)power::batteryMv());
-  G().drawRoundRect(x + 8, ry + 14, 104, 12, 2, theme::kInk);
-  G().fillRect(x + 10, ry + 16, pct, 8,
-               power::lowBattery() ? theme::kBad : theme::kGood);
-  ry += 36;
+  snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
+           (unsigned long)power::batteryMv());
+  gfxu::drawKVRow(G(), x + 6, y + 48, w - 12, 20, "Power", v, theme::kGold);
+  G().drawRoundRect(x + 6, y + 72, 104, 10, 3, theme::kBorder);
+  G().fillSmoothRoundRect(x + 8, y + 74, max(1, pct), 6, 2,
+                          power::lowBattery() ? theme::kBad : theme::kGood);
   bool fix = gps::hasFix();
-  txt(x + 8, ry, fix ? theme::kGood : theme::kWarn, 1, "GPS: %s",
-      gps::statusLabel());
-  ry += 14;
+  gfxu::drawKVRow(G(), x + 6, y + 90, w - 12, 20, "GPS", gps::statusLabel(),
+                  fix ? theme::kGood : theme::kWarn);
   if (fix) {
-    txt(x + 8, ry, theme::kInk, 1, "%.5f, %.5f", gps::latitude(),
-        gps::longitude());
-    ry += 12;
-    txt(x + 8, ry, theme::kInkDim, 1, "alt %.0fm  sats %lu  hdop %.1f",
-        gps::altitudeM(), (unsigned long)gps::satellites(), gps::hdop());
+    snprintf(v, sizeof(v), "%.5f, %.5f", gps::latitude(), gps::longitude());
+    gfxu::drawKVRow(G(), x + 6, y + 114, w - 12, 20, "Lat/Lon", v, theme::kCyan);
+    snprintf(v, sizeof(v), "%.0fm  sats %lu  hdop %.1f", gps::altitudeM(),
+             (unsigned long)gps::satellites(), gps::hdop());
+    gfxu::drawKVRow(G(), x + 6, y + 138, w - 12, 20, "Alt/HD", v);
   } else {
-    txt(x + 8, ry, theme::kInkDim, 1, "Wire GPS TX->GPIO43 RX->GPIO44.");
+    gfxu::drawKVRow(G(), x + 6, y + 114, w - 12, 20, "Wiring",
+                    "TX->GPIO43 RX->GPIO44", theme::kInkMuted);
   }
-  ry += 18;
-  txt(x + 8, ry, theme::kInkDim, 1, "Core temp is on-die (reads warm).");
-  ry += 12;
-  txt(x + 8, ry, theme::kInkDim, 1, "Bri %d%%  SD %s", app::brightness(),
-      app::sdReady() ? "ok" : "no");
+  snprintf(v, sizeof(v), "%d%% / %s", app::brightness(),
+           app::sdReady() ? "ok" : "no");
+  gfxu::drawKVRow(G(), x + 6, y + 162, w - 12, 20, "Bri / SD", v);
+  txt(x + 10, y + 188, theme::kInkMuted, 1, "Core temp is on-die (reads warm).");
 }
 bool siTouch(int16_t, int16_t) { return false; }
 }  // namespace
