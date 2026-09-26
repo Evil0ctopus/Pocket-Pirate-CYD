@@ -92,11 +92,11 @@ inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
 inline void drawCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      uint16_t fill = theme::kPanel, uint16_t accent = 0,
                      int radius = theme::kRadiusCard) {
-  g.fillSmoothRoundRect(x, y, w, h, radius, fill);
+  g.fillRoundRect(x, y, w, h, radius, fill);
   g.drawRoundRect(x, y, w, h, radius, theme::kBorder);
   if (accent) {
     int aw = 4;
-    g.fillSmoothRoundRect(x, y, aw + 2, h, radius, accent);
+    g.fillRoundRect(x, y, aw + 2, h, radius, accent);
     g.fillRect(x + aw, y + 1, 2, h - 2, fill);  // clean inner edge
   }
 }
@@ -164,7 +164,7 @@ inline void drawListRow(lgfx::LGFXBase& g, int x, int y, int w, int h, int index
 inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       const char* label, const char* value,
                       uint16_t valueColor = theme::kInk) {
-  g.fillSmoothRoundRect(x, y, w, h, 5, theme::kPanelSoft);
+  g.fillRoundRect(x, y, w, h, 5, theme::kPanelSoft);
   g.setTextSize(1);
   g.setTextColor(theme::kInkDim);
   g.setCursor(x + 8, y + (h - 8) / 2);
@@ -180,13 +180,13 @@ inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
 // Tiny station glyph inside a circle (vector fallbacks — no SD art needed).
 inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
                       uint16_t accent) {
-  g.fillSmoothCircle(cx, cy, r, theme::kPanelSoft);
+  g.fillCircle(cx, cy, r, theme::kPanelSoft);
   g.drawCircle(cx, cy, r, accent);
   uint16_t c = accent;
   switch (kind % 14) {
     case 0:  // Crow's Nest — eye
       g.drawEllipse(cx, cy, r - 3, r / 2, c);
-      g.fillSmoothCircle(cx, cy, 2, c);
+      g.fillCircle(cx, cy, 2, c);
       break;
     case 1:  // Harbor — bottle waves
       g.drawFastHLine(cx - 5, cy - 2, 10, c);
@@ -209,7 +209,7 @@ inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
     case 5:  // Tracker — radar blip
       g.drawCircle(cx, cy, 5, c);
       g.drawCircle(cx, cy, 2, c);
-      g.fillSmoothCircle(cx + 4, cy - 3, 1, c);
+      g.fillCircle(cx + 4, cy - 3, 1, c);
       break;
     case 6:  // Rigging — shield
       g.fillTriangle(cx, cy - 5, cx - 5, cy - 1, cx + 5, cy - 1, c);
@@ -226,19 +226,19 @@ inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
       break;
     case 9:  // Systems — gear-ish
       g.drawCircle(cx, cy, 4, c);
-      g.fillSmoothCircle(cx, cy, 1, c);
+      g.fillCircle(cx, cy, 1, c);
       g.drawFastHLine(cx - 6, cy, 12, c);
       g.drawFastVLine(cx, cy - 6, 12, c);
       break;
     case 10:  // Lantern — bulb
-      g.fillSmoothCircle(cx, cy - 1, 4, c);
+      g.fillCircle(cx, cy - 1, 4, c);
       g.fillRect(cx - 2, cy + 3, 4, 3, c);
       break;
     case 11:  // Settings — sliders
       g.drawFastHLine(cx - 6, cy - 3, 12, c);
       g.drawFastHLine(cx - 6, cy + 3, 12, c);
-      g.fillSmoothCircle(cx - 2, cy - 3, 2, c);
-      g.fillSmoothCircle(cx + 3, cy + 3, 2, c);
+      g.fillCircle(cx - 2, cy - 3, 2, c);
+      g.fillCircle(cx + 3, cy + 3, 2, c);
       break;
     case 12:  // Instruments
       g.drawCircle(cx, cy, 6, c);
