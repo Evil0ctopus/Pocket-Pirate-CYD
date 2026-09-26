@@ -35,4 +35,11 @@ constexpr int I2S_SDI = 8;
 constexpr int BATTERY_ADC = 9;
 constexpr int RGB_LED = 42;
 
+// Optional UART GPS on the board's documented UART header (USB CDC owns
+// console Serial, so UART0 pins 43/44 are free for Serial1).
+// Wiring: GPS TX -> GPIO43 (ESP RX), GPS RX -> GPIO44 (ESP TX), GND, 3V3.
+constexpr int GPS_RX = 43;  // ESP receives NMEA from GPS module TX
+constexpr int GPS_TX = 44;  // ESP may send to GPS module RX (optional)
+constexpr int GPS_BAUD = 9600;
+
 }  // namespace CheapBlackDisplay
