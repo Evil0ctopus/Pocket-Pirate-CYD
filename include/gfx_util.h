@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <LovyanGFX.hpp>
 #include <stdarg.h>
+#include <string.h>
 
 #include "pirate_theme.h"
 
@@ -32,13 +33,59 @@ inline uint16_t darken(uint16_t c, uint8_t amt) {
 }
 
 // Vertical gradient fill from top color to bottom color.
+// step>1 trades smoothness for speed (world/HUD chrome uses 2).
 inline void vGradient(lgfx::LGFXBase& g, int x, int y, int w, int h,
-                      uint16_t top, uint16_t bot) {
-  if (h <= 0) return;
-  for (int i = 0; i < h; i++) {
+                      uint16_t top, uint16_t bot, int step = 1) {
+  if (h <= 0 || w <= 0) return;
+  if (step < 1) step = 1;
+  for (int i = 0; i < h; i += step) {
     uint8_t t = (h <= 1) ? 0 : (uint8_t)(i * 255 / (h - 1));
-    g.drawFastHLine(x, y + i, w, blend565(top, bot, t));
+    int run = step;
+    if (i + run > h) run = h - i;
+    if (run == 1) g.drawFastHLine(x, y + i, w, blend565(top, bot, t));
+    else g.fillRect(x, y + i, w, run, blend565(top, bot, t));
   }
+}
+
+// Clip/ellipsis print so labels never spill past `maxW` pixels (6px/glyph @ size 1).
+inline void printFit(lgfx::LGFXBase& g, int x, int y, int maxW, uint16_t fg,
+                     uint8_t size, const char* s) {
+  if (!s) return;
+  g.setTextSize(size);
+  g.setTextColor(fg);
+  const int gw = 6 * (int)size;
+  if (gw <= 0 || maxW < gw) return;
+  int maxChars = maxW / gw;
+  int n = (int)strlen(s);
+  g.setCursor(x, y);
+  if (n <= maxChars) {
+    g.print(s);
+    return;
+  }
+  if (maxChars <= 2) {
+    g.print("..");
+    return;
+  }
+  char buf[48];
+  int keep = maxChars - 2;
+  if (keep > (int)sizeof(buf) - 3) keep = (int)sizeof(buf) - 3;
+  memcpy(buf, s, keep);
+  buf[keep] = '.';
+  buf[keep + 1] = '.';
+  buf[keep + 2] = 0;
+  g.print(buf);
+}
+
+// Center a label inside a box (uses 6px glyph width at size 1).
+inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
+                          uint16_t fg, uint8_t size, const char* s) {
+  if (!s) return;
+  g.setTextSize(size);
+  g.setTextColor(fg);
+  int tw = (int)strlen(s) * 6 * (int)size;
+  int th = 8 * (int)size;
+  g.setCursor(x + (w - tw) / 2, y + (h - th) / 2);
+  g.print(s);
 }
 
 // Soft rounded card with optional left accent bar and subtle edge.
@@ -54,9 +101,10 @@ inline void drawCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
   }
 }
 
-// Content body panel (station screens) — soft gradient, not a flat Win95 box.
+// Content body panel (station screens). Solid fill (fast); thin top highlight.
 inline void drawBody(lgfx::LGFXBase& g, int x, int y, int w, int h) {
-  vGradient(g, x, y, w, h, theme::kPanel, theme::kBg);
+  g.fillRect(x, y, w, h, theme::kBg);
+  g.fillRect(x, y, w, 3, theme::kPanel);
   g.drawFastHLine(x, y, w, theme::kBorderHi);
 }
 
@@ -68,13 +116,9 @@ inline void drawButton(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       ? fillOverride
                       : (primary ? theme::kGold : theme::kPanelHi);
   uint16_t fg = primary ? theme::kOnGold : theme::kInk;
-  g.fillSmoothRoundRect(x, y, w, h, theme::kRadiusBtn, fill);
+  g.fillRoundRect(x, y, w, h, theme::kRadiusBtn, fill);
   if (!primary) g.drawRoundRect(x, y, w, h, theme::kRadiusBtn, theme::kBorder);
-  g.setTextSize(1);
-  g.setTextColor(fg);
-  int tw = (int)strlen(label) * 6;
-  g.setCursor(x + (w - tw) / 2, y + (h - 8) / 2);
-  g.print(label);
+  printCentered(g, x, y, w, h, fg, 1, label);
 }
 
 // Sort / filter chip (pill).
@@ -82,13 +126,9 @@ inline void drawChip(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      const char* label, bool on, uint16_t onColor = theme::kGold) {
   uint16_t fill = on ? onColor : theme::kPanelSoft;
   uint16_t fg = on ? theme::kOnGold : theme::kInkDim;
-  g.fillSmoothRoundRect(x, y, w, h, theme::kRadiusChip, fill);
+  g.fillRoundRect(x, y, w, h, theme::kRadiusChip, fill);
   if (!on) g.drawRoundRect(x, y, w, h, theme::kRadiusChip, theme::kBorder);
-  g.setTextSize(1);
-  g.setTextColor(fg);
-  int tw = (int)strlen(label) * 6;
-  g.setCursor(x + (w - tw) / 2, y + (h - 8) / 2);
-  g.print(label);
+  printCentered(g, x, y, w, h, fg, 1, label);
 }
 
 inline void drawSeparator(lgfx::LGFXBase& g, int x, int y, int w) {

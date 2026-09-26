@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.4.0"
+#define PP_VERSION "0.4.1"
 #endif
 
 using gfxu::blend565;
@@ -145,6 +145,7 @@ enum class Screen { Select, World, Menu, Tool, Name };
 Screen g_screen = Screen::World;
 int g_toolIndex = -1;
 int g_menuPage = 0;  // paginated stations grid
+bool g_menuDirty = true;  // menu is static — only redraw when dirty / toast
 constexpr int kMenuPerPage = 9;  // 3 cols x 3 rows
 int g_sel = 0;  // captain carousel index on the select screen
 
@@ -203,9 +204,9 @@ void drawSpeechBubble(uint32_t now) {
   int w = (int)strlen(g_say) * 6 + 16;
   if (w > 300) w = 300;
   int x = 160 - w / 2;
-  if (x + w > 212) x = 212 - w;  // keep clear of the DECK/SHIP tabs
+  if (x + w > 206) x = 206 - w;  // keep clear of the DECK/SHIP tabs
   if (x < 4) x = 4;
-  int y = 46;
+  int y = theme::kHeaderH + 4;
   canvas.fillSmoothRoundRect(x, y, w, 22, 6, paper);
   canvas.drawRoundRect(x, y, w, 22, 6, ink);
   // soft triangular tail
@@ -221,34 +222,30 @@ void drawSpeechBubble(uint32_t now) {
 // ---------------------------------------------------------------------------
 void softCloud(int x, int y, int s) {
   uint16_t w = rgb(250, 252, 255);
-  canvas.fillSmoothCircle(x, y, s, w);
-  canvas.fillSmoothCircle(x + s, y + 2, s - 2, w);
-  canvas.fillSmoothCircle(x - s, y + 3, s - 3, w);
-  canvas.fillSmoothCircle(x, y + 4, s + 1, w);
+  canvas.fillCircle(x, y, s, w);
+  canvas.fillCircle(x + s, y + 2, s - 2, w);
+  canvas.fillCircle(x - s, y + 3, s - 3, w);
+  canvas.fillCircle(x, y + 4, s + 1, w);
 }
 
 void drawWorldBg() {
   const int horizon = 150;
+  // step=2: half the scanline work, still reads as a soft sky/sea blend
   gfxu::vGradient(canvas, 0, 0, 320, horizon, rgb(120, 196, 236),
-                  rgb(236, 226, 188));
-  // sun with soft glow
+                  rgb(236, 226, 188), 2);
   int sx = 268, sy = 52;
-  for (int r = 40; r >= 20; r -= 5)
-    canvas.fillSmoothCircle(sx, sy, r,
-                            blend565(rgb(255, 244, 190), rgb(236, 226, 188),
-                                     (uint8_t)(200 - r * 3)));
-  canvas.fillSmoothCircle(sx, sy, 17, rgb(255, 236, 150));
+  canvas.fillCircle(sx, sy, 28, blend565(rgb(255, 244, 190), rgb(236, 226, 188), 160));
+  canvas.fillCircle(sx, sy, 16, rgb(255, 236, 150));
   softCloud(70, 44, 9);
   softCloud(180, 34, 7);
 
-  // sea with animated foam bands
   gfxu::vGradient(canvas, 0, horizon, 320, 240 - horizon, rgb(46, 154, 176),
-                  rgb(18, 92, 138));
+                  rgb(18, 92, 138), 2);
   for (int row = 0; row < 5; row++) {
     int y = horizon + 12 + row * 16;
     int off = ((g_anim + row) % 4) * 6;
     for (int x = -20 + off; x < 330; x += 40)
-      canvas.fillSmoothRoundRect(x, y, 18, 4, 2, rgb(150, 208, 222));
+      canvas.fillRoundRect(x, y, 18, 4, 2, rgb(150, 208, 222));
   }
 }
 
@@ -256,102 +253,105 @@ void drawWorldBg() {
 //  HUD
 // ---------------------------------------------------------------------------
 void coin(int x, int y, int r) {
-  canvas.fillSmoothCircle(x, y, r, theme::kGold);
-  canvas.fillSmoothCircle(x - r / 3, y - r / 3, r / 3, lighten(theme::kGold, 80));
+  canvas.fillCircle(x, y, r, theme::kGold);
+  canvas.fillCircle(x - r / 3, y - r / 3, max(1, r / 3), lighten(theme::kGold, 80));
   canvas.drawCircle(x, y, r, darken(theme::kGold, 60));
 }
 
 void drawHeaderBar() {
-  gfxu::vGradient(canvas, 0, 0, 320, 40, theme::kPanel, theme::kBgDeep);
-  canvas.drawFastHLine(0, 39, 320, theme::kGold);
-  canvas.drawFastHLine(0, 40, 320, theme::kTeal);
+  // Flat fill + thin accents (smooth gradients every frame were a lag source).
+  const int hh = theme::kHeaderH;
+  canvas.fillRect(0, 0, theme::kScreenW, hh, theme::kBgDeep);
+  canvas.fillRect(0, 0, theme::kScreenW, 3, theme::kPanel);
+  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kGold);
+  canvas.drawFastHLine(0, hh, theme::kScreenW, theme::kTeal);
 
   // avatar chip
-  canvas.fillSmoothCircle(20, 20, 15, theme::kPanelSoft);
-  canvas.drawCircle(20, 20, 15, theme::kBorderHi);
-  coin(20, 20, 9);
+  canvas.fillCircle(18, hh / 2, 12, theme::kPanelSoft);
+  canvas.drawCircle(18, hh / 2, 12, theme::kBorderHi);
+  coin(18, hh / 2, 7);
 
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
-  canvas.setCursor(42, 6);
+  canvas.setCursor(36, 4);
   canvas.printf("%s", game::profile.name);
   canvas.setTextColor(theme::kInkDim);
-  canvas.setCursor(42, 18);
-  canvas.printf("%s  Lv %u", game::rankTitle(game::profile.level),
+  canvas.setCursor(36, 16);
+  canvas.printf("%s Lv%u", game::rankTitle(game::profile.level),
                 game::profile.level);
 
-  // xp bar (glossy)
-  int bx = 150, bw = 110;
-  canvas.fillSmoothRoundRect(bx, 8, bw, 11, 5, theme::kBgDeep);
-  canvas.drawRoundRect(bx, 8, bw, 11, 5, theme::kBorder);
+  // xp bar
+  int bx = 148, bw = 118, by = 6;
+  canvas.fillRoundRect(bx, by, bw, 10, 4, theme::kBg);
+  canvas.drawRoundRect(bx, by, bw, 10, 4, theme::kBorder);
   int fill = game::levelProgressPct() * (bw - 4) / 100;
-  if (fill > 0) {
-    canvas.fillSmoothRoundRect(bx + 2, 10, fill, 7, 3, theme::kGold);
-    canvas.fillSmoothRoundRect(bx + 2, 10, fill, 3, 2, lighten(theme::kGold, 90));
-  }
+  if (fill > 0) canvas.fillRoundRect(bx + 2, by + 2, fill, 6, 3, theme::kGold);
   canvas.setTextColor(theme::kInkMuted);
-  canvas.setCursor(bx, 24);
+  canvas.setCursor(bx, 20);
   if (game::profile.level >= game::kMaxLevel)
     canvas.print("MAX RANK");
   else
-    canvas.printf("%lu xp to next", (unsigned long)game::xpToNext());
+    canvas.printf("%lu xp next", (unsigned long)game::xpToNext());
 
-  // doubloons
-  coin(300, 14, 7);
+  // doubloons — keep inside the right edge
+  coin(306, 10, 6);
   canvas.setTextColor(theme::kGold);
-  canvas.setCursor(276, 26);
+  canvas.setCursor(288, 20);
   canvas.printf("%lu",
                 (unsigned long)game::profile.loot[(int)game::Loot::Doubloon]);
 }
 
 void drawToastOverlay() {
   if (millis() > g_toastUntil || g_toast[0] == 0) return;
-  canvas.fillSmoothRoundRect(24, 206, 272, 28, 8, theme::kBgDeep);
-  canvas.drawRoundRect(24, 206, 272, 28, 8, theme::kGold);
+  int ty = theme::kContentBottom - 30;
+  canvas.fillRoundRect(20, ty, 280, 26, 6, theme::kBgDeep);
+  canvas.drawRoundRect(20, ty, 280, 26, 6, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
-  canvas.setCursor(38, 216);
+  canvas.setCursor(32, ty + 9);
   canvas.print(g_toast);
 }
 
 // Persistent world HUD strip: power / SD / brightness / GPS.
 void drawStatusStrip() {
-  canvas.fillSmoothRoundRect(2, 42, 204, theme::kStatusH, 4, theme::kBgDeep);
-  canvas.drawRoundRect(2, 42, 204, theme::kStatusH, 4, theme::kBorder);
+  const int ty = theme::kHeaderH + 2;
+  canvas.fillRoundRect(2, ty, 198, theme::kStatusH, 3, theme::kBgDeep);
+  canvas.drawRoundRect(2, ty, 198, theme::kStatusH, 3, theme::kBorder);
   canvas.setTextSize(1);
   uint16_t pc = power::lowBattery() ? theme::kBad
                                     : (power::usbPowered() ? theme::kGood
                                                            : theme::kInkDim);
+  int textY = ty + 2;
   canvas.setTextColor(pc);
-  canvas.setCursor(6, 45);
+  canvas.setCursor(6, textY);
   canvas.printf("%s", power::powerLabel());
   canvas.setTextColor(app::sdReady() ? theme::kGood : theme::kInkMuted);
-  canvas.setCursor(42, 45);
+  canvas.setCursor(40, textY);
   canvas.print(app::sdReady() ? "SD" : "--");
   canvas.setTextColor(theme::kInkDim);
-  canvas.setCursor(64, 45);
+  canvas.setCursor(62, textY);
   canvas.printf("B%d", (int)app::brightness());
   bool fix = gps::hasFix();
   canvas.setTextColor(fix ? theme::kGood : theme::kInkMuted);
-  canvas.setCursor(96, 45);
+  canvas.setCursor(92, textY);
   canvas.printf("GPS:%s", gps::statusLabel());
 }
 
-// Two mini tabs under the header for switching world pages (deck <-> ship).
-// Drawn tall and hit-tested taller still: the calibration capture showed ~15px
-// of vertical touch scatter, so small targets need generous zones.
+// DECK / SHIP tabs — edge-aligned, labels centered so words always fit.
+// Hit-tested taller than drawn (resistive touch scatter ~15px vertical).
 void drawViewTabs() {
   const char* names[2] = {"DECK", "SHIP"};
+  const int tw = 54, th = 20, gap = 2;
+  const int tx0 = theme::kScreenW - theme::kPad - (tw * 2 + gap);  // 206
+  const int ty = theme::kHeaderH + 2;
   for (int i = 0; i < 2; i++) {
-    int tx = 212 + i * 54, ty = 42;
+    int tx = tx0 + i * (tw + gap);
     bool on = (g_seaView == (i == 1));
-    canvas.fillSmoothRoundRect(tx, ty, 50, 24, 6,
-                               on ? theme::kGold : theme::kPanelSoft);
-    if (!on) canvas.drawRoundRect(tx, ty, 50, 24, 6, theme::kBorder);
-    canvas.setTextColor(on ? theme::kOnGold : theme::kInkDim);
-    canvas.setTextSize(1);
-    canvas.setCursor(tx + 13, ty + 8);
-    canvas.print(names[i]);
+    canvas.fillRoundRect(tx, ty, tw, th, 5,
+                         on ? theme::kGold : theme::kPanelSoft);
+    if (!on) canvas.drawRoundRect(tx, ty, tw, th, 5, theme::kBorder);
+    gfxu::printCentered(canvas, tx, ty, tw, th,
+                        on ? theme::kOnGold : theme::kInk, 1, names[i]);
   }
 }
 
@@ -360,11 +360,10 @@ void drawWorld() {
   int avatar = game::profile.avatar;
   int tier = pc::tierOf(game::profile.level);
 
-  // --- background: vector base, then any illustrated layers on top ---------
-  // The opaque art sky (if present) covers the vector fallback; clouds/waves
-  // are transparent parallax overlays that scroll at different speeds.
-  drawWorldBg();
-  art::drawSky(canvas);
+  // --- background: art sky (cached blit) or vector fallback ---------------
+  // Skipping drawWorldBg when sky art is present avoids a full-screen
+  // per-scanline gradient every frame (major lag source on CYD).
+  if (!art::drawSky(canvas)) drawWorldBg();
   art::drawClouds(canvas, (int)(now / 70));
   art::drawWaves(canvas, (int)(now / 28));
 
@@ -377,7 +376,7 @@ void drawWorld() {
     drawHeaderBar();
     canvas.setTextColor(theme::kInk);
     canvas.setTextSize(1);
-    canvas.setCursor(8, 46);
+    canvas.setCursor(6, theme::kHeaderH + 4);
     canvas.print(game::shipName(game::profile.level));
   } else {
     // --- DECK page: the captain on deck; no ship on this page --------------
@@ -417,7 +416,7 @@ void drawWorld() {
       }
       int fw = art::frameW(avatar, tier), fh = art::frameH(avatar, tier);
       art::drawCaptainFrame(canvas, avatar, tier, clip, frame, 160 - fw / 2,
-                            208 - fh);
+                            theme::kContentBottom - fh);
     } else {
       chibi::drawCaptain(canvas, 128, 96 + bob, avatar, tier);
     }
@@ -431,19 +430,20 @@ void drawWorld() {
   drawViewTabs();
   drawStatusStrip();
 
-  // bottom bar: loot + Stations button
-  gfxu::vGradient(canvas, 0, 210, 320, 30, theme::kPanel, theme::kBgDeep);
-  canvas.drawFastHLine(0, 210, 320, theme::kBorder);
+  // bottom bar: loot + Stations — edge-to-edge, slim chrome
+  const int by = theme::kContentBottom;
+  canvas.fillRect(0, by, theme::kScreenW, theme::kBottomBarH, theme::kBgDeep);
+  canvas.drawFastHLine(0, by, theme::kScreenW, theme::kBorder);
   canvas.setTextColor(theme::kInkDim);
-  canvas.setCursor(8, 220);
+  canvas.setTextSize(1);
+  canvas.setCursor(4, by + 9);
   canvas.printf("Charts %lu  Bottles %lu  Cargo %lu",
                 (unsigned long)game::profile.loot[(int)game::Loot::ChartFragment],
                 (unsigned long)game::profile.loot[(int)game::Loot::MessageBottle],
                 (unsigned long)game::profile.loot[(int)game::Loot::Cargo]);
-  canvas.fillSmoothRoundRect(228, 213, 86, 24, 7, theme::kGold);
-  canvas.setTextColor(theme::kOnGold);
-  canvas.setCursor(240, 221);
-  canvas.print("STATIONS");
+  canvas.fillRoundRect(228, by + 2, 88, theme::kBottomBarH - 4, 6, theme::kGold);
+  gfxu::printCentered(canvas, 228, by + 2, 88, theme::kBottomBarH - 4,
+                      theme::kOnGold, 1, "STATIONS");
 }
 
 // ---------------------------------------------------------------------------
@@ -565,26 +565,33 @@ void nameCommit() {
 //  Stations menu
 // ---------------------------------------------------------------------------
 void drawMenu() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
+  canvas.fillRect(0, 0, theme::kScreenW, theme::kScreenH, theme::kBgDeep);
   drawHeaderBar();
 
   int total = tools::count();
   int pages = (total + kMenuPerPage - 1) / kMenuPerPage;
+  if (pages < 1) pages = 1;
   if (g_menuPage >= pages) g_menuPage = 0;
   int base = g_menuPage * kMenuPerPage;
 
-  canvas.fillSmoothRoundRect(4, 44, 200, 14, 4, theme::kPanelSoft);
+  const int stripY = theme::kHeaderH + 2;
+  canvas.fillRoundRect(2, stripY, theme::kScreenW - 4, 14, 3, theme::kPanelSoft);
   canvas.setTextColor(theme::kInkDim);
   canvas.setTextSize(1);
-  canvas.setCursor(10, 47);
+  canvas.setCursor(8, stripY + 3);
   canvas.print("Choose a station");
   canvas.setTextColor(theme::kInkMuted);
-  canvas.setCursor(140, 47);
-  canvas.printf("%d/%d", g_menuPage + 1, max(1, pages));
+  canvas.setCursor(theme::kScreenW - 36, stripY + 3);
+  canvas.printf("%d/%d", g_menuPage + 1, pages);
 
-  // 3×3 tiles — larger touch targets with glyph + title/subtitle hierarchy
-  int cols = 3, tileW = 102, tileH = 48, gap = 4;
-  int x0 = 5, y0 = 62;
+  // Edge-to-edge 3×3 grid. Short `tile` labels + fit print so words never clip.
+  const int cols = 3, gap = 3;
+  const int x0 = 2;
+  const int y0 = theme::kHeaderH + 20;
+  const int tileW = (theme::kScreenW - x0 * 2 - gap * (cols - 1)) / cols;  // 104
+  const int rows = 3;
+  const int bottomY = theme::kContentBottom;
+  const int tileH = (bottomY - 4 - y0 - gap * (rows - 1)) / rows;  // ~48
   for (int li = 0; li < kMenuPerPage; li++) {
     int i = base + li;
     if (i >= total) break;
@@ -592,59 +599,51 @@ void drawMenu() {
     int tx = x0 + col * (tileW + gap);
     int ty = y0 + row * (tileH + gap);
     const tools::Tool& t = tools::at(i);
-    canvas.fillSmoothRoundRect(tx, ty, tileW, tileH, 8, theme::kPanel);
-    canvas.drawRoundRect(tx, ty, tileW, tileH, 8, theme::kBorder);
-    canvas.fillSmoothRoundRect(tx, ty, 4, tileH, 2, t.accent);
-    gfxu::drawGlyph(canvas, tx + 18, ty + 24, 11, i, t.accent);
-    // Title may be long — clip visually by cursor start after glyph
-    canvas.setTextColor(theme::kInk);
-    canvas.setCursor(tx + 34, ty + 10);
-    canvas.print(t.title);
-    canvas.setTextColor(theme::kInkMuted);
-    canvas.setCursor(tx + 34, ty + 28);
-    canvas.print(t.subtitle);
+    canvas.fillRoundRect(tx, ty, tileW, tileH, 7, theme::kPanel);
+    canvas.drawRoundRect(tx, ty, tileW, tileH, 7, theme::kBorder);
+    canvas.fillRect(tx, ty + 2, 3, tileH - 4, t.accent);
+    gfxu::drawGlyph(canvas, tx + 16, ty + tileH / 2, 10, i, t.accent);
+    // Short tile label only — full title/subtitle live in the tool header.
+    const char* label = (t.tile && t.tile[0]) ? t.tile : t.title;
+    gfxu::printCentered(canvas, tx + 28, ty, tileW - 32, tileH, theme::kInk, 1,
+                        label);
   }
 
-  // bottom bar: back to deck + page pager
-  canvas.fillSmoothRoundRect(6, 213, 78, 24, 7, theme::kGold);
-  canvas.setTextColor(theme::kOnGold);
-  canvas.setCursor(18, 221);
-  canvas.print("< DECK");
+  // bottom bar: back + pager, full width
+  const int by = theme::kContentBottom;
+  canvas.fillRect(0, by, theme::kScreenW, theme::kBottomBarH, theme::kBgDeep);
+  canvas.drawFastHLine(0, by, theme::kScreenW, theme::kBorder);
+  canvas.fillRoundRect(4, by + 2, 72, theme::kBottomBarH - 4, 6, theme::kGold);
+  gfxu::printCentered(canvas, 4, by + 2, 72, theme::kBottomBarH - 4,
+                      theme::kOnGold, 1, "< DECK");
   if (pages > 1) {
-    canvas.fillSmoothRoundRect(150, 213, 36, 24, 7, theme::kPanelHi);
-    canvas.setTextColor(theme::kInk);
-    canvas.setCursor(163, 221);
-    canvas.print("<");
+    canvas.fillRoundRect(148, by + 2, 36, theme::kBottomBarH - 4, 6,
+                         theme::kPanelHi);
+    gfxu::printCentered(canvas, 148, by + 2, 36, theme::kBottomBarH - 4,
+                        theme::kInk, 1, "<");
     canvas.setTextColor(theme::kInkDim);
-    canvas.setCursor(192, 221);
+    canvas.setCursor(192, by + 9);
     canvas.printf("%d/%d", g_menuPage + 1, pages);
-    canvas.fillSmoothRoundRect(232, 213, 36, 24, 7, theme::kPanelHi);
-    canvas.setTextColor(theme::kInk);
-    canvas.setCursor(245, 221);
-    canvas.print(">");
+    canvas.fillRoundRect(236, by + 2, 36, theme::kBottomBarH - 4, 6,
+                         theme::kPanelHi);
+    gfxu::printCentered(canvas, 236, by + 2, 36, theme::kBottomBarH - 4,
+                        theme::kInk, 1, ">");
   }
 }
 
 void drawToolHeader() {
   const tools::Tool& t = tools::at(g_toolIndex);
-  gfxu::vGradient(canvas, 0, 0, 320, 44, theme::kPanel, theme::kBgDeep);
-  canvas.fillSmoothRoundRect(0, 0, 5, 44, 2, t.accent);
-  canvas.drawFastHLine(0, 43, 320, theme::kBorder);
-  canvas.fillSmoothRoundRect(8, 8, 56, 28, 7, theme::kPanelSoft);
-  canvas.drawRoundRect(8, 8, 56, 28, 7, theme::kBorder);
-  canvas.setTextColor(theme::kInk);
-  canvas.setTextSize(1);
-  canvas.setCursor(18, 18);
-  canvas.print("< Back");
-  gfxu::drawGlyph(canvas, 82, 22, 10, g_toolIndex, t.accent);
-  canvas.setTextColor(theme::kInk);
-  canvas.setTextSize(2);
-  canvas.setCursor(98, 6);
-  canvas.print(t.title);
-  canvas.setTextColor(theme::kInkDim);
-  canvas.setTextSize(1);
-  canvas.setCursor(98, 26);
-  canvas.print(t.subtitle);
+  const int hh = theme::kToolHeaderH;
+  canvas.fillRect(0, 0, theme::kScreenW, hh, theme::kBgDeep);
+  canvas.fillRect(0, 0, 4, hh, t.accent);
+  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kBorder);
+  canvas.fillRoundRect(8, 6, 52, hh - 12, 6, theme::kPanelSoft);
+  canvas.drawRoundRect(8, 6, 52, hh - 12, 6, theme::kBorder);
+  gfxu::printCentered(canvas, 8, 6, 52, hh - 12, theme::kInk, 1, "< Back");
+  gfxu::drawGlyph(canvas, 78, hh / 2, 9, g_toolIndex, t.accent);
+  gfxu::printFit(canvas, 92, 6, theme::kScreenW - 98, theme::kInk, 2, t.title);
+  gfxu::printFit(canvas, 92, 24, theme::kScreenW - 98, theme::kInkDim, 1,
+                 t.subtitle);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,52 +704,67 @@ void handleTap(int16_t x, int16_t y) {
       break;
     }
 
-    case Screen::World:
-      // Tab hit zones are much taller than the drawn tabs (vertical scatter).
-      if (y >= 40 && y <= 78 && x >= 208 && x < 264) {   // DECK tab
+    case Screen::World: {
+      // Tab hit zones taller/wider than drawn tabs (resistive scatter).
+      const int tabY0 = theme::kHeaderH;
+      const int tabY1 = theme::kHeaderH + 40;
+      const int tw = 54, gap = 2;
+      const int tx0 = theme::kScreenW - theme::kPad - (tw * 2 + gap);
+      if (y >= tabY0 && y <= tabY1 && x >= tx0 && x < tx0 + tw + gap / 2) {
         g_seaView = false;
         drawWorld();
         present();
-      } else if (y >= 40 && y <= 78 && x >= 264) {       // SHIP tab
+      } else if (y >= tabY0 && y <= tabY1 && x >= tx0 + tw) {
         g_seaView = true;
         drawWorld();
         present();
-      } else if (x >= 226 && y >= 200) {
+      } else if (x >= 220 && y >= theme::kContentBottom - 4) {
         g_screen = Screen::Menu;
+        g_menuDirty = true;
         drawMenu();
         present();
-      } else if (!g_seaView && y > 60 && y < 200) {
+      } else if (!g_seaView && y > theme::kHeaderH + 20 &&
+                 y < theme::kContentBottom) {
         g_actClip = art::WAVE;  // tap: the captain waves back and quips
         g_actStart = millis();
         sayRandom();
         audio::tapChirp();
       }
       break;
+    }
 
     case Screen::Menu: {
       int total = tools::count();
       int pages = (total + kMenuPerPage - 1) / kMenuPerPage;
-      if (y >= 210) {
-        if (x >= 6 && x <= 80) {  // < DECK
+      if (pages < 1) pages = 1;
+      if (y >= theme::kContentBottom) {
+        if (x >= 4 && x <= 80) {  // < DECK
           g_screen = Screen::World;
           drawWorld();
           present();
           return;
         }
-        if (pages > 1 && x >= 150 && x <= 184) {  // prev page
+        if (pages > 1 && x >= 148 && x <= 184) {  // prev page
           g_menuPage = (g_menuPage + pages - 1) % pages;
+          g_menuDirty = true;
           drawMenu();
           present();
           return;
         }
-        if (pages > 1 && x >= 232 && x <= 266) {  // next page
+        if (pages > 1 && x >= 236 && x <= 280) {  // next page
           g_menuPage = (g_menuPage + 1) % pages;
+          g_menuDirty = true;
           drawMenu();
           present();
           return;
         }
       }
-      int cols = 3, tileW = 102, tileH = 48, gap = 4, x0 = 5, y0 = 62;
+      const int cols = 3, gap = 3, x0 = 2;
+      const int y0 = theme::kHeaderH + 20;
+      const int tileW = (theme::kScreenW - x0 * 2 - gap * (cols - 1)) / cols;
+      const int rows = 3;
+      const int tileH =
+          (theme::kContentBottom - 4 - y0 - gap * (rows - 1)) / rows;
       int base = g_menuPage * kMenuPerPage;
       for (int li = 0; li < kMenuPerPage; li++) {
         int i = base + li;
@@ -763,7 +777,8 @@ void handleTap(int16_t x, int16_t y) {
           tools::at(i).onOpen();
           g_screen = Screen::Tool;
           drawToolHeader();
-          tools::at(i).onDraw(0, 44, 320, 196);
+          tools::at(i).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
+                              theme::kScreenH - theme::kToolHeaderH);
           present();
           return;
         }
@@ -772,16 +787,18 @@ void handleTap(int16_t x, int16_t y) {
     }
 
     case Screen::Tool:
-      if (y < 44 && x < 64) {
+      if (y < theme::kToolHeaderH && x < 64) {
         tools::at(g_toolIndex).onClose();
         g_screen = Screen::Menu;
+        g_menuDirty = true;
         drawMenu();
         present();
         return;
       }
       if (tools::at(g_toolIndex).onTouch(x, y)) {
         drawToolHeader();
-        tools::at(g_toolIndex).onDraw(0, 44, 320, 196);
+        tools::at(g_toolIndex).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
+                                      theme::kScreenH - theme::kToolHeaderH);
         present();
       }
       break;
@@ -1053,31 +1070,38 @@ void loop() {
   if (g_screen == Screen::Tool && g_toolIndex >= 0)
     tools::at(g_toolIndex).onTick(now);
 
-  if (g_screen == Screen::World && now - g_lastDraw > 120) {
+  // Redraw cadence: world anim ~6 fps is enough; menu is dirty-flagged;
+  // tools refresh slower now that body() is a cheap solid fill.
+  if (g_screen == Screen::World && now - g_lastDraw > 160) {
     g_lastDraw = now;
     g_anim = (g_anim + 1) % 8;
     drawWorld();
     drawToastOverlay();
     present();
     g_frameMs = millis() - now;
-  } else if (g_screen == Screen::Select && now - g_lastDraw > 140) {
+  } else if (g_screen == Screen::Select && now - g_lastDraw > 180) {
     g_lastDraw = now;
     drawSelect();
     present();
-  } else if (g_screen == Screen::Name && now - g_lastDraw > 200) {
+  } else if (g_screen == Screen::Name && now - g_lastDraw > 250) {
     g_lastDraw = now;  // cursor blink
     drawName();
     present();
-  } else if (g_screen == Screen::Tool && now - g_lastDraw > 220) {
+  } else if (g_screen == Screen::Tool && now - g_lastDraw > 280) {
     g_lastDraw = now;
-    tools::at(g_toolIndex).onDraw(0, 44, 320, 196);
+    tools::at(g_toolIndex).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
+                                  theme::kScreenH - theme::kToolHeaderH);
     drawToastOverlay();
     present();
-  } else if (g_screen == Screen::Menu && now - g_lastDraw > 300) {
-    g_lastDraw = now;
-    drawMenu();
-    drawToastOverlay();
-    present();
+  } else if (g_screen == Screen::Menu) {
+    bool toastLive = (millis() <= g_toastUntil && g_toast[0]);
+    if (g_menuDirty || (toastLive && now - g_lastDraw > 250)) {
+      g_lastDraw = now;
+      g_menuDirty = false;
+      drawMenu();
+      drawToastOverlay();
+      present();
+    }
   }
 
   // Level-up fanfare (XP is awarded inside the tool modules).

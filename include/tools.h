@@ -18,8 +18,9 @@ extern lgfx::LGFXBase* gfx;
 void toast(const char* fmt, ...);
 
 struct Tool {
-  const char* title;     // pirate-flavored station name
+  const char* title;     // pirate-flavored station name (tool header)
   const char* subtitle;  // plain description of what it actually does
+  const char* tile;      // short label for 3-col stations grid (must fit ~10ch)
   uint16_t accent;       // theme accent color for the tile/header
   void (*onOpen)();
   void (*onTick)(uint32_t nowMs);
