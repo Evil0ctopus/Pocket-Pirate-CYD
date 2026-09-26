@@ -42,17 +42,22 @@ constexpr uint16_t kBad = 0xF9A6;      // danger red
 constexpr uint16_t kLocked = 0x528A;   // disabled (blue-gray, not Win95 gray)
 constexpr uint16_t kOnGold = 0x18C3;   // dark ink on gold buttons
 
-// ---- Layout tokens (320×240) ----------------------------------------------
+// ---- Layout tokens (320×240) — slim chrome so content owns the canvas ------
+constexpr int kScreenW = 320;
+constexpr int kScreenH = 240;
 constexpr int kRadiusCard = 8;
 constexpr int kRadiusBtn = 6;
 constexpr int kRadiusChip = 4;
-constexpr int kPad = 8;
-constexpr int kRowH = 18;       // list row height (touch-friendlier)
+constexpr int kPad = 4;              // edge padding (was 8 — reclaim margins)
+constexpr int kRowH = 18;            // list row height (touch-friendlier)
 constexpr int kRowHCompact = 15;
 constexpr int kChipH = 16;
-constexpr int kHeaderH = 40;
-constexpr int kToolHeaderH = 44;
-constexpr int kStatusH = 14;
-constexpr int kBottomBarH = 30;
+constexpr int kHeaderH = 34;         // was 40 — more room for DECK/SHIP/tools
+constexpr int kToolHeaderH = 40;     // was 44
+constexpr int kStatusH = 12;         // was 14
+constexpr int kBottomBarH = 26;      // was 30
+constexpr int kContentTop = kHeaderH;
+constexpr int kContentBottom = kScreenH - kBottomBarH;  // 214
+constexpr int kContentH = kContentBottom - kContentTop; // 180
 
 }  // namespace theme

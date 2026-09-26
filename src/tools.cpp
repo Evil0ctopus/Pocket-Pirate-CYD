@@ -363,10 +363,15 @@ void cnCapture(int st) {
   cnCount = 0;
   for (int i = 0; i < st && cnCount < 48; i++) {
     CnNet& n = cnNets[cnCount];
-    String ssid = WiFi.SSID(i);
-    if (ssid.length() == 0) ssid = "<hidden>";
-    strncpy(n.ssid, ssid.c_str(), sizeof(n.ssid) - 1);
-    n.ssid[sizeof(n.ssid) - 1] = 0;
+    // Copy into fixed buffer without retaining Arduino String temporaries.
+    {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0)
+        strncpy(n.ssid, "<hidden>", sizeof(n.ssid) - 1);
+      else
+        strncpy(n.ssid, ssid.c_str(), sizeof(n.ssid) - 1);
+      n.ssid[sizeof(n.ssid) - 1] = 0;
+    }
     const uint8_t* bs = WiFi.BSSID(i);
     if (bs) memcpy(n.bssid, bs, 6);
     else memset(n.bssid, 0, 6);
@@ -1772,36 +1777,37 @@ namespace tools {
 lgfx::LGFXBase* gfx = nullptr;
 
 static const Tool kTools[] = {
-    {"Crow's Nest", "Wi-Fi survey", theme::kSail, cnOpen, cnTick, cnClose,
+    // title, subtitle, tile (short grid label), accent, handlers...
+    {"Crow's Nest", "Wi-Fi survey", "Nest", theme::kSail, cnOpen, cnTick, cnClose,
      cnDraw, cnTouch},
-    {"Harbor Ledger", "BLE discovery", theme::kSeaFoam, hlOpen, hlTick, hlClose,
-     hlDraw, hlTouch},
-    {"Chart Room", "Wardrive log -> SD", theme::kWood, crOpen, crTick, crClose,
+    {"Harbor Ledger", "BLE discovery", "Harbor", theme::kSeaFoam, hlOpen, hlTick,
+     hlClose, hlDraw, hlTouch},
+    {"Chart Room", "Wardrive log", "Charts", theme::kWood, crOpen, crTick, crClose,
      crDraw, crTouch},
-    {"Lookout", "Channel analyzer", theme::kGood, lkOpen, lkTick, lkClose,
-     lkDraw, lkTouch},
-    {"Spyglass", "Surveillance spotter", theme::kWarn, sgOpen, sgTick, sgClose,
-     sgDraw, sgTouch},
-    {"Tracker Watch", "Anti-stalk BLE", theme::kWarn, twOpen, twTick, twClose,
-     twDraw, twTouch},
-    {"Rigging Watch", "Deauth detector", theme::kBad, rwOpen, rwTick, rwClose,
-     rwDraw, rwTouch},
-    {"Hull Inspection", "Network audit", theme::kGold, hiOpen, hiTick, hiClose,
-     hiDraw, hiTouch},
-    {"Captain's Log", "SD browser + WiGLE", theme::kSail, clOpen, clTick, clClose,
+    {"Lookout", "Channel analyzer", "Lookout", theme::kGood, lkOpen, lkTick,
+     lkClose, lkDraw, lkTouch},
+    {"Spyglass", "Surveillance", "Spyglass", theme::kWarn, sgOpen, sgTick,
+     sgClose, sgDraw, sgTouch},
+    {"Tracker Watch", "Anti-stalk BLE", "Tracker", theme::kWarn, twOpen, twTick,
+     twClose, twDraw, twTouch},
+    {"Rigging Watch", "Deauth detector", "Rigging", theme::kBad, rwOpen, rwTick,
+     rwClose, rwDraw, rwTouch},
+    {"Hull Inspection", "Network audit", "Hull", theme::kGold, hiOpen, hiTick,
+     hiClose, hiDraw, hiTouch},
+    {"Captain's Log", "SD + WiGLE", "Log", theme::kSail, clOpen, clTick, clClose,
      clDraw, clTouch},
-    {"Ship's Systems", "Diagnostics", theme::kSeaFoam, ssOpen, ssTick, ssClose,
-     ssDraw, ssTouch},
-    {"Signal Lantern", "RGB LED / FX", theme::kSun, slOpen, slTick, slClose,
-     slDraw, slTouch},
-    {"Probe Watch", "Client sniffer", theme::kSail, pwOpen, pwTick, pwClose,
-     pwDraw, pwTouch},
-    {"Deep BLE ID", "Adv decoder", theme::kSeaFoam, dbOpen, dbTick, dbClose,
-     dbDraw, dbTouch},
-    {"Instruments", "Onboard sensors", theme::kGold, siOpen, siTick, siClose,
-     siDraw, siTouch},
-    {"Settings Cabin", "Options", theme::kInkDim, seOpen, seTick, seClose,
-     seDraw, seTouch},
+    {"Ship's Systems", "Diagnostics", "Systems", theme::kSeaFoam, ssOpen, ssTick,
+     ssClose, ssDraw, ssTouch},
+    {"Signal Lantern", "RGB LED / FX", "Lantern", theme::kSun, slOpen, slTick,
+     slClose, slDraw, slTouch},
+    {"Probe Watch", "Client sniffer", "Probe", theme::kSail, pwOpen, pwTick,
+     pwClose, pwDraw, pwTouch},
+    {"Deep BLE ID", "Adv decoder", "BLE ID", theme::kSeaFoam, dbOpen, dbTick,
+     dbClose, dbDraw, dbTouch},
+    {"Instruments", "Onboard sensors", "Sensors", theme::kGold, siOpen, siTick,
+     siClose, siDraw, siTouch},
+    {"Settings Cabin", "Options", "Settings", theme::kInkDim, seOpen, seTick,
+     seClose, seDraw, seTouch},
 };
 
 int count() { return sizeof(kTools) / sizeof(kTools[0]); }
