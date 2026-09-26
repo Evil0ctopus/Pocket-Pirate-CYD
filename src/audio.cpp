@@ -175,9 +175,9 @@ void dumpRegs() {
 
 void tapChirp() {
   if (!gate()) return;
-  // Soft wood-block / coin tap (short descending chirp).
-  note(988, 28, 0.32f);
-  note(740, 36, 0.22f);
+  // Soft wood-block / coin tap — keep under ~40ms so taps stay snappy.
+  note(988, 18, 0.30f);
+  note(740, 20, 0.20f);
 }
 
 void chime() {

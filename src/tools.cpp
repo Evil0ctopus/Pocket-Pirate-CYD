@@ -21,7 +21,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.4.0"
+#define PP_VERSION "0.4.2"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -73,8 +73,9 @@ void rssiBars(int x, int y, int rssi) {
 
 // ---- shared Wi-Fi scan ----------------------------------------------------
 void wifiScanBegin() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, false);
+  // Keep this cheap: callers paint station chrome first, then open.
+  // Avoid disconnect() on every enter — it stalls the UI thread ~50-150ms.
+  if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
   WiFi.scanDelete();
   WiFi.scanNetworks(true /*async*/, true /*show hidden*/);
 }
@@ -452,7 +453,7 @@ void cnDrawList(int x, int y, int w, int h) {
     return;
   }
   // Toolbar card
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 22, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 22, 5, theme::kPanelSoft);
   txt(x + 10, y + 8, theme::kGold, 1, "%d nets", cnCount);
   const char* sorts[] = {"RSSI", "CH", "SSID"};
   for (int i = 0; i < 3; i++) {
@@ -580,7 +581,7 @@ void hlTick(uint32_t now) { bleTick(now); }
 void hlClose() {}
 void hlDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
   txt(x + 10, y + 7, theme::kGold, 1, "%d bottles adrift", g_bleCount);
   txt(x + 160, y + 7, theme::kInkMuted, 1, "passive BLE");
   constexpr int kRh = theme::kRowHCompact;
@@ -643,7 +644,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.4.0,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.4.2,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -700,7 +701,7 @@ void crTick(uint32_t now) {
 void crClose() { WiFi.scanDelete(); }
 void crDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
   txt(x + 12, y + 8, theme::kGold, 1, "Chart Room");
   txt(x + 12, y + 22, theme::kInkMuted, 1, "WiGLE 1.4 wardrive → %s",
       kWigleFile);
@@ -767,7 +768,7 @@ void lkTick(uint32_t now) {
 void lkClose() { WiFi.scanDelete(); }
 void lkDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
   txt(x + 10, y + 7, theme::kGold, 1, "Channel occupancy");
   txt(x + 160, y + 7, theme::kInkMuted, 1, "tap a bar · n=%d", lkTotal);
   int maxv = 1;
@@ -777,7 +778,7 @@ void lkDraw(int x, int y, int w, int h) {
   int bw = 18;
   int gap = 3;
   // plot well
-  G().fillSmoothRoundRect(x + 6, y + 24, w - 12, plotH + 18, 6, theme::kPanelSoft);
+  G().fillRoundRect(x + 6, y + 24, w - 12, plotH + 18, 6, theme::kPanelSoft);
   for (int c = 1; c <= 13; c++) {
     int bx = x + 12 + (c - 1) * (bw + gap);
     int bh = maxv ? (lkHist[c] * plotH) / maxv : 0;
@@ -786,11 +787,11 @@ void lkDraw(int x, int y, int w, int h) {
                        : (lkHist[c] >= maxv && maxv > 1 ? theme::kWarn
                                                         : theme::kTeal);
     if (bh > 0)
-      G().fillSmoothRoundRect(bx, baseY - bh, bw, bh, 3, col);
+      G().fillRoundRect(bx, baseY - bh, bw, bh, 3, col);
     if (lkOpenHist[c] > 0 && bh > 0) {
       int oh = max(2, (lkOpenHist[c] * plotH) / maxv);
       if (oh > bh) oh = bh;
-      G().fillSmoothRoundRect(bx, baseY - oh, bw, oh, 2, theme::kBad);
+      G().fillRoundRect(bx, baseY - oh, bw, oh, 2, theme::kBad);
     }
     if (sel) G().drawRoundRect(bx - 1, baseY - max(bh, 4) - 1, bw + 2,
                                max(bh, 4) + 2, 3, theme::kInk);
@@ -799,10 +800,10 @@ void lkDraw(int x, int y, int w, int h) {
       txt(bx + 2, baseY - bh - 10, theme::kInk, 1, "%d", lkHist[c]);
   }
   // legend strip
-  G().fillSmoothRoundRect(x + 4, y + h - 22, w - 8, 18, 4, theme::kBgDeep);
-  G().fillSmoothRoundRect(x + 10, y + h - 16, 8, 8, 2, theme::kTeal);
+  G().fillRoundRect(x + 4, y + h - 22, w - 8, 18, 4, theme::kBgDeep);
+  G().fillRoundRect(x + 10, y + h - 16, 8, 8, 2, theme::kTeal);
   txt(x + 22, y + h - 16, theme::kInkDim, 1, "sec");
-  G().fillSmoothRoundRect(x + 52, y + h - 16, 8, 8, 2, theme::kBad);
+  G().fillRoundRect(x + 52, y + h - 16, 8, 8, 2, theme::kBad);
   txt(x + 64, y + h - 16, theme::kInkDim, 1, "open");
   if (lkSelected >= 1 && lkSelected <= 13) {
     txt(x + 110, y + h - 16, theme::kGold, 1, "CH%d: %d AP (%d open)",
@@ -885,7 +886,7 @@ void sgTick(uint32_t now) {
 void sgClose() { WiFi.scanDelete(); }
 void sgDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 40, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 40, 5, theme::kPanelSoft);
   txt(x + 10, y + 8, theme::kGold, 1, "Watchtowers spotted: %d", sgHitCount);
   if (spyglass::hasVerifiedSignature()) {
     txt(x + 10, y + 22, theme::kGood, 1, "Verified field OUIs armed (DeFlock).");
@@ -924,7 +925,7 @@ void twDraw(int x, int y, int w, int h) {
   int n = 0;
   for (int i = 0; i < g_bleCount; i++)
     if (g_ble[i].kind == 1) n++;
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
   txt(x + 10, y + 8, n ? theme::kWarn : theme::kGood, 1,
       "Possible trackers nearby: %d", n);
   txt(x + 10, y + 20, theme::kInkMuted, 1, "AirTag / Tile / SmartTag signatures");
@@ -1006,7 +1007,7 @@ void rwClose() {
 void rwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   bool recent = (millis() - rwLastHit) < 4000 && (rwDeauth + rwDisassoc) > 0;
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
   txt(x + 12, y + 8, theme::kGold, 1, "Rigging Watch");
   txt(x + 12, y + 22, theme::kInkMuted, 1, "Listening for deauth storms · ch %d",
       rwChannel);
@@ -1021,7 +1022,7 @@ void rwDraw(int x, int y, int w, int h) {
   snprintf(v, sizeof(v), "%d dB", rwLastRssi);
   gfxu::drawKVRow(G(), x + 6, y + 124, w - 12, 22, "Last RSSI", v);
   if (recent) {
-    G().fillSmoothRoundRect(x + 6, y + 154, w - 12, 28, 6, theme::kBad);
+    G().fillRoundRect(x + 6, y + 154, w - 12, 28, 6, theme::kBad);
     G().setTextColor(theme::kInk);
     G().setTextSize(1);
     G().setCursor(x + 14, y + 164);
@@ -1060,7 +1061,7 @@ void hiTick(uint32_t now) {
 void hiClose() { WiFi.scanDelete(); }
 void hiDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
   txt(x + 10, y + 6, theme::kGold, 1, "Hull Inspection");
   txt(x + 10, y + 18, theme::kInkMuted, 1, "%d networks audited · passive",
       hiTotal);
@@ -1264,7 +1265,7 @@ void clDraw(int x, int y, int w, int h) {
   }
 
   // List pane
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
   txt(x + 10, y + 6, theme::kGold, 1, "Captain's Log · %d items", clCount);
   txt(x + 10, y + 16, theme::kInkMuted, 1, "Tap row = preview   empty = refresh");
   const int visible = 8;
@@ -1375,7 +1376,7 @@ void ssDraw(int x, int y, int w, int h) {
            (unsigned long)power::batteryMv());
   gfxu::drawKVRow(G(), x + 6, y + 164, w - 12, 18, "Power", v, theme::kGold);
   G().drawRoundRect(x + 6, y + 186, 104, 10, 3, theme::kBorder);
-  G().fillSmoothRoundRect(x + 8, y + 188, max(1, pct), 6, 2,
+  G().fillRoundRect(x + 8, y + 188, max(1, pct), 6, 2,
                           power::lowBattery() ? theme::kBad : theme::kGood);
 }
 bool ssTouch(int16_t, int16_t) { return false; }
@@ -1403,7 +1404,7 @@ void slDraw(int x, int y, int w, int h) {
     uint32_t c = led::colorRgb(i);
     uint16_t col565 = G().color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     int sx = x + 52 + i * 32;
-    G().fillSmoothRoundRect(sx, y + 66, 26, 26, 5, col565);
+    G().fillRoundRect(sx, y + 66, 26, 26, 5, col565);
     if (i == led::colorIdx())
       G().drawRoundRect(sx - 2, y + 64, 30, 30, 6, theme::kGold);
   }
@@ -1465,7 +1466,7 @@ void seClose() {}
 void seDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   // Identity card
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 34, 6, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 34, 6, theme::kPanelSoft);
   txt(x + 12, y + 8, theme::kGold, 1, "Settings Cabin");
   txt(x + 12, y + 22, theme::kInkDim, 1, "%s · %s Lv%d · fw %s",
       game::profile.name, game::rankTitle(game::profile.level),
@@ -1493,7 +1494,7 @@ void seDraw(int x, int y, int w, int h) {
       otaOk ? 0 : theme::kLocked);
 
   // Status block
-  G().fillSmoothRoundRect(x + 4, y + 138, w - 8, 28, 5, theme::kBgDeep);
+  G().fillRoundRect(x + 4, y + 138, w - 8, 28, 5, theme::kBgDeep);
   txt(x + 10, y + 144, theme::kInkMuted, 1, "OTA: %s", ota::status());
   if (ota::wifiConfigured())
     txt(x + 10, y + 154, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
@@ -1652,7 +1653,7 @@ void pwClose() {
 }
 void pwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
   txt(x + 10, y + 6, theme::kGold, 1, "Clients probing: %d  (ch %d)", pwCount,
       pwChannel);
   txt(x + 10, y + 16, theme::kInkMuted, 1, "%lu probe frames · passive",
@@ -1691,7 +1692,7 @@ void dbTick(uint32_t now) { bleTick(now); }
 void dbClose() {}
 void dbDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillSmoothRoundRect(x + 4, y + 2, w - 8, 16, 4, theme::kPanelSoft);
+  G().fillRoundRect(x + 4, y + 2, w - 8, 16, 4, theme::kPanelSoft);
   txt(x + 10, y + 6, theme::kGold, 1, "Decoding %d advertisers", g_bleCount);
   constexpr int kRh = theme::kRowH;
   int rows = min(g_bleCount, 9);
@@ -1746,7 +1747,7 @@ void siDraw(int x, int y, int w, int h) {
            (unsigned long)power::batteryMv());
   gfxu::drawKVRow(G(), x + 6, y + 48, w - 12, 20, "Power", v, theme::kGold);
   G().drawRoundRect(x + 6, y + 72, 104, 10, 3, theme::kBorder);
-  G().fillSmoothRoundRect(x + 8, y + 74, max(1, pct), 6, 2,
+  G().fillRoundRect(x + 8, y + 74, max(1, pct), 6, 2,
                           power::lowBattery() ? theme::kBad : theme::kGood);
   bool fix = gps::hasFix();
   gfxu::drawKVRow(G(), x + 6, y + 90, w - 12, 20, "GPS", gps::statusLabel(),

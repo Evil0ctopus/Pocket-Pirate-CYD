@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.4.1"
+#define PP_VERSION "0.4.2"
 #endif
 
 using gfxu::blend565;
@@ -45,6 +45,8 @@ class CheapBlackDisplayPanel : public lgfx::LGFX_Device {
     auto bus_config = _bus.config();
     bus_config.spi_host = SPI2_HOST;
     bus_config.spi_mode = 0;
+    // 40 MHz is stable on this Hosyond ILI9341; 80 MHz caused multi-second
+    // push hangs that felt like tap freezes.
     bus_config.freq_write = 40000000;
     bus_config.freq_read = 16000000;
     bus_config.pin_sclk = TFT_SCK;
@@ -62,6 +64,14 @@ class CheapBlackDisplayPanel : public lgfx::LGFX_Device {
     panel_config.memory_height = 320;
     panel_config.panel_width = 240;
     panel_config.panel_height = 320;
+    // Hosyond ES3C28P / ILI9341: GRAM origin == visible panel. Explicit zeros
+    // + dummy_read_pixel prevent the classic landscape "black strip on the
+    // left / content shifted right" misconfig across LovyanGFX versions.
+    panel_config.offset_x = 0;
+    panel_config.offset_y = 0;
+    panel_config.offset_rotation = 0;
+    panel_config.dummy_read_pixel = 8;
+    panel_config.dummy_read_bits = 1;
     panel_config.readable = true;
     // This Hosyond 2.8" panel's controller runs inverted gamma: without INVON
     // (invert=true) every color displays as its negative.
@@ -146,6 +156,7 @@ Screen g_screen = Screen::World;
 int g_toolIndex = -1;
 int g_menuPage = 0;  // paginated stations grid
 bool g_menuDirty = true;  // menu is static — only redraw when dirty / toast
+int g_pendingToolOpen = -1;  // defer onOpen until after chrome is painted
 constexpr int kMenuPerPage = 9;  // 3 cols x 3 rows
 int g_sel = 0;  // captain carousel index on the select screen
 
@@ -208,7 +219,7 @@ void drawSpeechBubble(uint32_t now) {
   if (x < 4) x = 4;
   // Sit below the status strip so the bubble is never clipped.
   int y = theme::kHeaderH + theme::kStatusH + 6;
-  canvas.fillSmoothRoundRect(x, y, w, 22, 6, paper);
+  canvas.fillRoundRect(x, y, w, 22, 6, paper);
   canvas.drawRoundRect(x, y, w, 22, 6, ink);
   // soft triangular tail
   canvas.fillTriangle(154, y + 21, 166, y + 21, 160, y + 30, paper);
@@ -316,8 +327,10 @@ void drawToastOverlay() {
 // Persistent world HUD strip: power / SD / brightness / GPS.
 void drawStatusStrip() {
   const int ty = theme::kHeaderH + 2;
-  canvas.fillRoundRect(2, ty, 198, theme::kStatusH, 3, theme::kBgDeep);
-  canvas.drawRoundRect(2, ty, 198, theme::kStatusH, 3, theme::kBorder);
+  // Full-bleed under tabs: strip runs to just before the DECK tab.
+  const int sw = theme::kScreenW - theme::kPad - (54 * 2 + 2) - 4;  // ~206
+  canvas.fillRoundRect(0, ty, sw, theme::kStatusH, 3, theme::kBgDeep);
+  canvas.drawRoundRect(0, ty, sw, theme::kStatusH, 3, theme::kBorder);
   canvas.setTextSize(1);
   uint16_t pc = power::lowBattery() ? theme::kBad
                                     : (power::usbPowered() ? theme::kGood
@@ -442,8 +455,11 @@ void drawWorld() {
                 (unsigned long)game::profile.loot[(int)game::Loot::ChartFragment],
                 (unsigned long)game::profile.loot[(int)game::Loot::MessageBottle],
                 (unsigned long)game::profile.loot[(int)game::Loot::Cargo]);
-  canvas.fillRoundRect(228, by + 2, 88, theme::kBottomBarH - 4, 6, theme::kGold);
-  gfxu::printCentered(canvas, 228, by + 2, 88, theme::kBottomBarH - 4,
+  // Flush to the right panel edge (no right gutter).
+  const int btnW = 92;
+  const int btnX = theme::kScreenW - btnW;
+  canvas.fillRoundRect(btnX, by + 2, btnW, theme::kBottomBarH - 4, 6, theme::kGold);
+  gfxu::printCentered(canvas, btnX, by + 2, btnW, theme::kBottomBarH - 4,
                       theme::kOnGold, 1, "STATIONS");
 }
 
@@ -451,7 +467,7 @@ void drawWorld() {
 //  Captain select (full-size carousel)
 // ---------------------------------------------------------------------------
 void drawArrow(int cx, int cy, bool right) {
-  canvas.fillSmoothCircle(cx, cy, 16, theme::kPanelSoft);
+  canvas.fillCircle(cx, cy, 16, theme::kPanelSoft);
   canvas.drawCircle(cx, cy, 16, theme::kGold);
   int d = right ? 5 : -5;
   canvas.fillTriangle(cx - d, cy - 8, cx - d, cy + 8, cx + d, cy, theme::kInk);
@@ -466,7 +482,7 @@ void drawSelect() {
 
   const pc::Captain& c = pc::kCaptains[g_sel];
   // spotlight
-  canvas.fillSmoothCircle(160, 118, 74, theme::kPanel);
+  canvas.fillCircle(160, 118, 74, theme::kPanel);
   if (art::haveCaptain(g_sel, 2)) {
     int fc = art::frameCount(g_sel, 2, art::IDLE);
     if (fc < 1) fc = 1;
@@ -492,14 +508,14 @@ void drawSelect() {
   canvas.setCursor(160 - trW / 2, 196);
   canvas.print(c.trait);
 
-  canvas.fillSmoothRoundRect(112, 210, 96, 26, 7, theme::kGold);
+  canvas.fillRoundRect(112, 210, 96, 26, 7, theme::kGold);
   canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(130, 218);
   canvas.print("SET SAIL");
 
   // dots
   for (int i = 0; i < pc::kCaptainCount; i++)
-    canvas.fillSmoothCircle(148 + i * 8, 2, 2,
+    canvas.fillCircle(148 + i * 8, 2, 2,
                             i == g_sel ? theme::kGold : theme::kLocked);
 }
 
@@ -516,7 +532,7 @@ void drawName() {
   canvas.setCursor(66, 8);
   canvas.print("Name yer pirate");
 
-  canvas.fillSmoothRoundRect(20, 30, 280, 28, 6, theme::kBgDeep);
+  canvas.fillRoundRect(20, 30, 280, 28, 6, theme::kBgDeep);
   canvas.drawRoundRect(20, 30, 280, 28, 6, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(30, 37);
@@ -529,22 +545,22 @@ void drawName() {
     int ry = 66 + r * 34;
     for (int c = 0; c < 7; c++) {
       int cx = 6 + c * 45;
-      canvas.fillSmoothRoundRect(cx, ry, 43, 30, 5, theme::kPanel);
+      canvas.fillRoundRect(cx, ry, 43, 30, 5, theme::kPanel);
       canvas.setTextColor(theme::kInk);
       canvas.setTextSize(2);
       canvas.setCursor(cx + 16, ry + 8);
       canvas.printf("%c", kKeyRows[r][c]);
     }
   }
-  canvas.fillSmoothRoundRect(6, 204, 130, 32, 5, theme::kPanel);
+  canvas.fillRoundRect(6, 204, 130, 32, 5, theme::kPanel);
   canvas.setTextColor(theme::kInkDim);
   canvas.setCursor(41, 213);
   canvas.print("SPACE");
-  canvas.fillSmoothRoundRect(142, 204, 80, 32, 5, theme::kBad);
+  canvas.fillRoundRect(142, 204, 80, 32, 5, theme::kBad);
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(164, 213);
   canvas.print("DEL");
-  canvas.fillSmoothRoundRect(228, 204, 86, 32, 5, theme::kGold);
+  canvas.fillRoundRect(228, 204, 86, 32, 5, theme::kGold);
   canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(242, 213);
   canvas.print("DONE");
@@ -576,23 +592,23 @@ void drawMenu() {
   int base = g_menuPage * kMenuPerPage;
 
   const int stripY = theme::kHeaderH + 2;
-  canvas.fillRoundRect(2, stripY, theme::kScreenW - 4, 14, 3, theme::kPanelSoft);
+  canvas.fillRect(0, stripY, theme::kScreenW, 14, theme::kPanelSoft);
   canvas.setTextColor(theme::kInkDim);
   canvas.setTextSize(1);
-  canvas.setCursor(8, stripY + 3);
+  canvas.setCursor(6, stripY + 3);
   canvas.print("Choose a station");
   canvas.setTextColor(theme::kInkMuted);
-  canvas.setCursor(theme::kScreenW - 36, stripY + 3);
+  canvas.setCursor(theme::kScreenW - 34, stripY + 3);
   canvas.printf("%d/%d", g_menuPage + 1, pages);
 
-  // Edge-to-edge 3×3 grid. Short `tile` labels + fit print so words never clip.
-  const int cols = 3, gap = 3;
-  const int x0 = 2;
-  const int y0 = theme::kHeaderH + 20;
-  const int tileW = (theme::kScreenW - x0 * 2 - gap * (cols - 1)) / cols;  // 104
+  // True edge-to-edge 3×3 grid (x0=0, remainder folded into last column).
+  const int cols = 3, gap = 2;
+  const int x0 = 0;
+  const int y0 = theme::kHeaderH + 18;
   const int rows = 3;
   const int bottomY = theme::kContentBottom;
-  const int tileH = (bottomY - 4 - y0 - gap * (rows - 1)) / rows;  // ~48
+  const int tileH = (bottomY - 2 - y0 - gap * (rows - 1)) / rows;
+  const int tileW = (theme::kScreenW - gap * (cols - 1)) / cols;
   for (int li = 0; li < kMenuPerPage; li++) {
     int i = base + li;
     if (i >= total) break;
@@ -614,8 +630,8 @@ void drawMenu() {
   const int by = theme::kContentBottom;
   canvas.fillRect(0, by, theme::kScreenW, theme::kBottomBarH, theme::kBgDeep);
   canvas.drawFastHLine(0, by, theme::kScreenW, theme::kBorder);
-  canvas.fillRoundRect(4, by + 2, 72, theme::kBottomBarH - 4, 6, theme::kGold);
-  gfxu::printCentered(canvas, 4, by + 2, 72, theme::kBottomBarH - 4,
+  canvas.fillRoundRect(0, by + 2, 76, theme::kBottomBarH - 4, 6, theme::kGold);
+  gfxu::printCentered(canvas, 0, by + 2, 76, theme::kBottomBarH - 4,
                       theme::kOnGold, 1, "< DECK");
   if (pages > 1) {
     canvas.fillRoundRect(148, by + 2, 36, theme::kBottomBarH - 4, 6,
@@ -625,10 +641,10 @@ void drawMenu() {
     canvas.setTextColor(theme::kInkDim);
     canvas.setCursor(192, by + 9);
     canvas.printf("%d/%d", g_menuPage + 1, pages);
-    canvas.fillRoundRect(236, by + 2, 36, theme::kBottomBarH - 4, 6,
+    canvas.fillRoundRect(theme::kScreenW - 40, by + 2, 40, theme::kBottomBarH - 4, 6,
                          theme::kPanelHi);
-    gfxu::printCentered(canvas, 236, by + 2, 36, theme::kBottomBarH - 4,
-                        theme::kInk, 1, ">");
+    gfxu::printCentered(canvas, theme::kScreenW - 40, by + 2, 40,
+                        theme::kBottomBarH - 4, theme::kInk, 1, ">");
   }
 }
 
@@ -715,20 +731,24 @@ void handleTap(int16_t x, int16_t y) {
         g_seaView = false;
         drawWorld();
         present();
+        g_lastDraw = millis();
       } else if (y >= tabY0 && y <= tabY1 && x >= tx0 + tw) {
         g_seaView = true;
         drawWorld();
         present();
-      } else if (x >= 220 && y >= theme::kContentBottom - 4) {
+        g_lastDraw = millis();
+      } else if (x >= theme::kScreenW - 100 && y >= theme::kContentBottom - 4) {
         g_screen = Screen::Menu;
         g_menuDirty = true;
         drawMenu();
         present();
+        g_lastDraw = millis();  // avoid immediate loop re-draw
       } else if (!g_seaView && y > theme::kHeaderH + 20 &&
                  y < theme::kContentBottom) {
         g_actClip = art::WAVE;  // tap: the captain waves back and quips
         g_actStart = millis();
         sayRandom();
+        // Chirp is blocking I2S (~64ms) — skip on nav; keep for deck flavor only.
         audio::tapChirp();
       }
       break;
@@ -739,10 +759,11 @@ void handleTap(int16_t x, int16_t y) {
       int pages = (total + kMenuPerPage - 1) / kMenuPerPage;
       if (pages < 1) pages = 1;
       if (y >= theme::kContentBottom) {
-        if (x >= 4 && x <= 80) {  // < DECK
+        if (x <= 84) {  // < DECK
           g_screen = Screen::World;
           drawWorld();
           present();
+          g_lastDraw = millis();
           return;
         }
         if (pages > 1 && x >= 148 && x <= 184) {  // prev page
@@ -750,22 +771,24 @@ void handleTap(int16_t x, int16_t y) {
           g_menuDirty = true;
           drawMenu();
           present();
+          g_lastDraw = millis();
           return;
         }
-        if (pages > 1 && x >= 236 && x <= 280) {  // next page
+        if (pages > 1 && x >= theme::kScreenW - 44) {  // next page
           g_menuPage = (g_menuPage + 1) % pages;
           g_menuDirty = true;
           drawMenu();
           present();
+          g_lastDraw = millis();
           return;
         }
       }
-      const int cols = 3, gap = 3, x0 = 2;
-      const int y0 = theme::kHeaderH + 20;
-      const int tileW = (theme::kScreenW - x0 * 2 - gap * (cols - 1)) / cols;
+      const int cols = 3, gap = 2, x0 = 0;
+      const int y0 = theme::kHeaderH + 18;
+      const int tileW = (theme::kScreenW - gap * (cols - 1)) / cols;
       const int rows = 3;
       const int tileH =
-          (theme::kContentBottom - 4 - y0 - gap * (rows - 1)) / rows;
+          (theme::kContentBottom - 2 - y0 - gap * (rows - 1)) / rows;
       int base = g_menuPage * kMenuPerPage;
       for (int li = 0; li < kMenuPerPage; li++) {
         int i = base + li;
@@ -774,13 +797,15 @@ void handleTap(int16_t x, int16_t y) {
         int tx = x0 + col * (tileW + gap);
         int ty = y0 + row * (tileH + gap);
         if (x >= tx && x <= tx + tileW && y >= ty && y <= ty + tileH) {
+          // Paint station chrome FIRST, start RF work after present().
           g_toolIndex = i;
-          tools::at(i).onOpen();
           g_screen = Screen::Tool;
           drawToolHeader();
           tools::at(i).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
                               theme::kScreenH - theme::kToolHeaderH);
           present();
+          g_lastDraw = millis();
+          g_pendingToolOpen = i;
           return;
         }
       }
@@ -789,11 +814,13 @@ void handleTap(int16_t x, int16_t y) {
 
     case Screen::Tool:
       if (y < theme::kToolHeaderH && x < 64) {
+        g_pendingToolOpen = -1;
         tools::at(g_toolIndex).onClose();
         g_screen = Screen::Menu;
         g_menuDirty = true;
         drawMenu();
         present();
+        g_lastDraw = millis();
         return;
       }
       if (tools::at(g_toolIndex).onTouch(x, y)) {
@@ -1002,7 +1029,12 @@ void setup() {
   touch::begin();
 
   display.init();
-  display.setRotation(1);
+  display.setRotation(1);  // landscape 320×240
+  if (display.width() != 320 || display.height() != 240) {
+    Serial.printf("[gfx] WARN panel %dx%d after rot1 (want 320x240)\n",
+                  display.width(), display.height());
+  }
+  display.fillScreen(0x0000);  // clear GRAM so no stale strip outside the window
   app::setBrightness(g_brightness);
 
   // Allocate the compositing canvas in PSRAM.
@@ -1066,14 +1098,25 @@ void loop() {
   if (touch::wasTapped(tx, ty)) {
     power::noteActivity(now);
     handleTap(tx, ty);
+    now = millis();  // handleTap may have burned time painting
+  }
+
+  // Heavy station enter (WiFi.mode / scan / promiscuous) runs AFTER chrome
+  // has already been pushed — navigation feels instant.
+  if (g_pendingToolOpen >= 0) {
+    int idx = g_pendingToolOpen;
+    g_pendingToolOpen = -1;
+    if (g_screen == Screen::Tool && g_toolIndex == idx) {
+      tools::at(idx).onOpen();
+    }
   }
 
   if (g_screen == Screen::Tool && g_toolIndex >= 0)
     tools::at(g_toolIndex).onTick(now);
 
-  // Redraw cadence: world anim ~6 fps is enough; menu is dirty-flagged;
-  // tools refresh slower now that body() is a cheap solid fill.
-  if (g_screen == Screen::World && now - g_lastDraw > 160) {
+  // Redraw cadence: world ~5 fps; menu dirty-flagged; tools slower.
+  // Touch is polled above so a mid-frame tap still lands next iteration.
+  if (g_screen == Screen::World && now - g_lastDraw > 200) {
     g_lastDraw = now;
     g_anim = (g_anim + 1) % 8;
     drawWorld();
@@ -1088,7 +1131,7 @@ void loop() {
     g_lastDraw = now;  // cursor blink
     drawName();
     present();
-  } else if (g_screen == Screen::Tool && now - g_lastDraw > 280) {
+  } else if (g_screen == Screen::Tool && now - g_lastDraw > 320) {
     g_lastDraw = now;
     tools::at(g_toolIndex).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
                                   theme::kScreenH - theme::kToolHeaderH);
