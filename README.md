@@ -23,9 +23,12 @@ Pocket-Pirate-CYD comes packed with custom assets and modular features designed 
   * Cleanly structured codebase utilizing PlatformIO for seamless expansion, custom hardware hooks, and easy deployment.
 * **📡 Passive stations (metadata only):** Crow's Nest Wi-Fi survey (sort/filter/detail), Lookout channel histogram, Chart Room WiGLE CSV logger — **no deauth / injection / handshake capture**.
 * **🧭 Optional UART GPS:** Chart Room + Instruments show fix status; WiGLE rows get real lat/lon/alt/UTC when a fix is available (`docs/GPS.md`).
-* **🔋 World HUD:** DECK/SHIP status strip for battery/USB, SD, brightness, GPS; low-battery toast; dim-on-idle.
-* **🖥️ USB companion:** Line/JSON protocol + `tools/companion.py` (`docs/COMPANION.md`).
-* **⚙️ CI / releases:** GitHub Actions builds PlatformIO firmware; version tags `v*` publish `.bin` assets.
+* **🔋 Power UX:** CHG/FULL/%/LOW labels, dim-on-idle, optional idle deep-sleep + Settings **Sleep now** (touch wake).
+* **📜 Captain's Log:** SD browser with text/CSV preview and on-device WiGLE viewer.
+* **🔭 Spyglass:** DeFlock / @NitekryDPaul field OUIs (detect-only) + keyword heuristics.
+* **🛰️ OTA:** Settings Cabin update-from-URL (app image); configure via companion (`docs/OTA.md`).
+* **🖥️ USB companion:** Line/JSON protocol + WiGLE `summarize` / `export` helpers (`docs/COMPANION.md`).
+* **⚙️ CI / releases:** Workflow templates publish **merged 0x0** factory bins (+ app-only for OTA).
 
 ---
 
@@ -94,34 +97,48 @@ If no USB serial ports are found, or several are present, the script exits with 
 
 ## 💾 Flash a release binary
 
-CI builds `cheap-black-display` on every PR/push. Tagged releases (`v*`) attach:
-
-`Pocket-Pirate-CYD-cheap-black-display.bin`
+Release asset `Pocket-Pirate-CYD-cheap-black-display.bin` is a **merged factory
+image** (bootloader + partition table + app). Write it at **offset 0x0**.
+Do **not** flash the app-only `firmware.bin` / `…-app.bin` at 0x0.
 
 ```bash
 # From source (recommended)
 pio run -e cheap-black-display -t upload
 
-# Or esptool (discover your port first — do not assume COM16)
+# Or package locally then esptool (discover your port — COM numbers change)
+pio run -e cheap-black-display
+python tools/package_firmware.py
 esptool.py --chip esp32s3 --port PORT write_flash 0x0 \
-  Pocket-Pirate-CYD-cheap-black-display.bin
+  dist/Pocket-Pirate-CYD-cheap-black-display.bin
 ```
 
-Firmware version string: **0.2.0** (`PP_VERSION`).
+The `…-app.bin` asset (when published) is for **OTA only** — see [`docs/OTA.md`](docs/OTA.md).
+
+Firmware version string: **0.3.0** (`PP_VERSION`).
+
+### CI status
+
+Workflow templates live in [`docs/ci-workflows/`](docs/ci-workflows/) and (when
+the GitHub token has the **`workflow`** OAuth scope) under `.github/workflows/`.
+If Actions are missing on the repo, ask the maintainer to grant `workflow` scope
+and copy those YAML files — builds/releases will then run automatically on
+`main` / tags `v*`.
 
 ### Optional GPS wiring
 
 See [`docs/GPS.md`](docs/GPS.md). Summary: GPS TX→**GPIO43**, GPS RX→**GPIO44**, GND, 3V3 @ 9600 baud. Works without a module (graceful `NO GPS`).
 
-### USB companion
+### USB companion + WiGLE CSV tools
 
 ```bash
 pip install -r tools/requirements.txt
 python tools/companion.py --port PORT status
 python tools/companion.py watch
+python tools/companion.py summarize wigle.csv
+python tools/companion.py export wigle.csv --format geojson -o points.geojson
 ```
 
-Full protocol: [`docs/COMPANION.md`](docs/COMPANION.md).
+Full protocol + OTA helpers: [`docs/COMPANION.md`](docs/COMPANION.md), [`docs/OTA.md`](docs/OTA.md).
 
 ---
 
@@ -134,7 +151,7 @@ Pocket-Pirate-CYD/
 ├── artpack_pixel/       # Pixel art assets and UI packs
 ├── artpack_sample/      # Sample art assets and references
 ├── device_shots/        # Photos and screenshots of the hardware
-├── docs/                # GPS wiring, companion protocol, art packs
+├── docs/                # GPS, companion, OTA, art packs, CI templates
 ├── include/             # Headers (board_pins, gps, power, tools, …)
 ├── src/                 # Firmware sources
 ├── tools/               # device_test.py, companion.py, art helpers
@@ -144,6 +161,21 @@ Pocket-Pirate-CYD/
 ```
 
 ---
+
+
+## 🖼️ Gallery
+
+Shippable pixel art pack + on-device captures (no commissioned art required):
+
+| Preview | Notes |
+|---------|-------|
+| ![artpack preview](artpack_pixel/preview.png) | `artpack_pixel` world composite (`preview.gif` in same folder) |
+| ![roster](artpack_pixel/roster_tiers.png) | Captain roster × tiers |
+| ![deck](device_shots/03_world_deck.png) | World DECK |
+| ![crowsnest](device_shots/10_crowsnest_results.png) | Crow's Nest results |
+| ![settings](device_shots/25_settings.png) | Settings Cabin |
+
+Copy `artpack_pixel/*` to the microSD `/art/` folder. Pipeline docs: [`docs/ART_PACK.md`](docs/ART_PACK.md).
 
 ## 🧑‍💻 Creator & Author
 

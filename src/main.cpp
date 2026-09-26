@@ -16,6 +16,7 @@
 #include "gps.h"
 #include "gfx_util.h"
 #include "led.h"
+#include "ota.h"
 #include "pirate_theme.h"
 #include "power.h"
 #include "tools.h"
@@ -24,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.2.0"
+#define PP_VERSION "0.3.0"
 #endif
 
 using gfxu::blend565;
@@ -854,7 +855,7 @@ void companionGetLog(const char* path) {
 }
 
 void handleSerialDebug() {
-  static char buf[96];
+  static char buf[220];
   static int len = 0;
   while (Serial.available()) {
     char ch = (char)Serial.read();
@@ -908,9 +909,33 @@ PP_VERSION, (int)g_screen, (int)g_seaView, game::profile.level,
       companionListLogs();
     } else if (strncmp(buf, "LOGGET ", 7) == 0) {
       companionGetLog(buf + 7);
+    } else if (strncmp(buf, "WIFICFG ", 8) == 0) {
+      // WIFICFG ssid|password   (pipe separates; spaces allowed in either)
+      char* rest = buf + 8;
+      char* bar = strchr(rest, '|');
+      if (!bar) {
+        Serial.println("ERR WIFICFG use: WIFICFG ssid|password");
+      } else {
+        *bar = 0;
+        ota::setWifi(rest, bar + 1);
+        Serial.printf("OK WIFICFG ssid=%s\n", ota::wifiSsid());
+      }
+    } else if (strncmp(buf, "OTAURL ", 7) == 0) {
+      ota::setUrl(buf + 7);
+      Serial.printf("OK OTAURL %s\n", ota::url());
+    } else if (strcmp(buf, "OTARUN") == 0) {
+      Serial.println("OK OTARUN starting");
+      bool ok = ota::runUpdate();
+      Serial.printf("OTARUN %s status=%s\n", ok ? "ok" : "fail", ota::status());
+    } else if (strcmp(buf, "SLEEP") == 0) {
+      Serial.println("OK SLEEP");
+      Serial.flush();
+      game::save();
+      power::deepSleepNow();
     } else if (strcmp(buf, "HELP") == 0) {
       Serial.println(
-          "HELP INFO STATUS STATUSJ SUMMARY LOGS LOGGET <path> "
+          "HELP INFO STATUS LOGS LOGGET <path> "
+          "WIFICFG ssid|pass OTAURL <url> OTARUN SLEEP "
           "TAP <x> <y> SHOT BEEP SCAN");
     } else {
       Serial.printf("ERR unknown cmd: %s\n", buf);
@@ -956,6 +981,7 @@ void setup() {
   led::begin();
   audio::begin();
   power::begin();
+  ota::begin();
   gps::begin();
 
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);

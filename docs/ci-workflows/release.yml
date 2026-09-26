@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag name to create/use (e.g. v0.2.0); leave empty to build only"
+        description: "Tag name to create/use (e.g. v0.3.0); leave empty to build only"
         required: false
         default: ""
 
@@ -25,19 +25,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PlatformIO
+      - name: Install PlatformIO + esptool
         run: |
           python -m pip install --upgrade pip
-          pip install platformio
+          pip install platformio esptool
 
       - name: Build cheap-black-display
         run: pio run -e cheap-black-display
 
-      - name: Stage firmware binary
+      - name: Package merged factory image (0x0)
         run: |
-          mkdir -p dist
+          python tools/package_firmware.py \
+            -o dist/Pocket-Pirate-CYD-cheap-black-display.bin
+          # Also keep the app-only image for OTA (HTTPUpdate expects app @ 0x10000 layout)
           cp .pio/build/cheap-black-display/firmware.bin \
-             dist/Pocket-Pirate-CYD-cheap-black-display.bin
+             dist/Pocket-Pirate-CYD-cheap-black-display-app.bin
           ls -la dist
 
       - name: Upload build artifact
@@ -50,20 +52,21 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Pocket-Pirate-CYD-cheap-black-display.bin
+          files: |
+            dist/Pocket-Pirate-CYD-cheap-black-display.bin
+            dist/Pocket-Pirate-CYD-cheap-black-display-app.bin
           generate_release_notes: true
           body: |
             ## Pocket Pirate CYD firmware
 
-            Flash with PlatformIO or esptool:
+            **Factory image** (`…-cheap-black-display.bin`) = bootloader + partitions + app.
+            Flash at **0x0**:
 
             ```bash
-            # PlatformIO (from a clone)
-            pio run -e cheap-black-display -t upload
-
-            # Or esptool (USB CDC / UART0)
             esptool.py --chip esp32s3 --port PORT write_flash 0x0 \
               Pocket-Pirate-CYD-cheap-black-display.bin
             ```
 
-            Passive / metadata-only RF. See README for GPS wiring and companion protocol.
+            **App-only** (`…-app.bin`) is for OTA / `HTTPUpdate` (not for raw 0x0 flash).
+
+            Passive / metadata-only RF. See README + `docs/OTA.md`.

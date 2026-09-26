@@ -175,23 +175,32 @@ void dumpRegs() {
 
 void tapChirp() {
   if (!gate()) return;
-  note(880, 70, 0.4f);
+  // Soft wood-block / coin tap (short descending chirp).
+  note(988, 28, 0.32f);
+  note(740, 36, 0.22f);
 }
 
 void chime() {
   if (!gate()) return;
-  note(330, 110);
-  note(392, 110);
-  note(523, 160);
-  silence(20);
+  // Rising "ahoy" — minor-pentatonic pirate whistle.
+  note(294, 90, 0.45f);   // D4
+  note(349, 90, 0.48f);   // F4
+  note(440, 110, 0.52f);  // A4
+  note(523, 180, 0.55f);  // C5
+  silence(30);
 }
 
 void fanfare() {
   if (!gate()) return;
-  note(523, 100);
-  note(659, 100);
-  note(784, 100);
-  note(1047, 200);
+  // Level-up treasure jingle (bright major arpeggio + sparkle).
+  note(523, 80, 0.5f);
+  note(659, 80, 0.52f);
+  note(784, 80, 0.55f);
+  note(1047, 140, 0.58f);
+  silence(40);
+  note(784, 60, 0.4f);
+  note(1047, 60, 0.4f);
+  note(1319, 160, 0.5f);
   silence(20);
 }
 
