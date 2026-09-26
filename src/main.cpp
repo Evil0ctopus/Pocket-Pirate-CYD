@@ -206,7 +206,8 @@ void drawSpeechBubble(uint32_t now) {
   int x = 160 - w / 2;
   if (x + w > 206) x = 206 - w;  // keep clear of the DECK/SHIP tabs
   if (x < 4) x = 4;
-  int y = theme::kHeaderH + 4;
+  // Sit below the status strip so the bubble is never clipped.
+  int y = theme::kHeaderH + theme::kStatusH + 6;
   canvas.fillSmoothRoundRect(x, y, w, 22, 6, paper);
   canvas.drawRoundRect(x, y, w, 22, 6, ink);
   // soft triangular tail
