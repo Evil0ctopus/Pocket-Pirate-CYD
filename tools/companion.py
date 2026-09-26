@@ -190,14 +190,15 @@ WIGLE_FIELDS = [
 
 def _open_wigle(path: Path):
     """Yield dict rows from a Pocket Pirate / WiGLE 1.4 CSV."""
-    with path.open(newline="", encoding="utf-8", errors="replace") as f:
+    with path.open(newline="", encoding="utf-8-sig", errors="replace") as f:
         # Skip WiGLE meta line if present
         first = f.readline()
-        if not first.startswith("WigleWifi") and first.strip():
+        if not first.startswith("WigleWifi"):
             f.seek(0)
         reader = csv.DictReader(f)
         for row in reader:
-            yield row
+            # Normalize keys (strip BOM residue / whitespace)
+            yield { (k or "").lstrip("\ufeff").strip(): v for k, v in row.items() }
 
 
 def summarize_wigle(path: Path) -> dict:
