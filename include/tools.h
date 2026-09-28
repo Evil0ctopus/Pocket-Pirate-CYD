@@ -38,4 +38,14 @@ const Tool& at(int i);
 int lastWifiCount();
 int lastBleCount();
 
+// Global RF pump — call every loop (even on Menu/World) so leave-teardown
+// finishes and never blocks a tap. Stations only arm via onOpen/onClose.
+void rfService();
+// Companion / debug: phase, want, last scanComplete, last phase ms.
+int rfPhase();
+int rfWant();
+int rfScanStatus();
+uint32_t rfLastPhaseMs();
+bool rfPromiscReady();
+
 }  // namespace tools
