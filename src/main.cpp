@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.1"
+#define PP_VERSION "0.5.2"
 #endif
 
 using gfxu::blend565;
@@ -862,6 +862,7 @@ void handleTap(int16_t x, int16_t y) {
         tools::at(g_toolIndex).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
                                       theme::kScreenH - theme::kToolHeaderH);
         present();
+        g_lastDraw = millis();  // suppress loop double-present after tap
       }
       break;
   }
@@ -879,6 +880,7 @@ void companionStatusJson() {
       "{\"ver\":\"%s\",\"screen\":%d,\"sea\":%d,\"lvl\":%u,\"xp\":%lu,"
       "\"avatar\":%d,\"sd\":%s,\"art\":%s,\"heap\":%u,\"bri\":%u,"
       "\"bat_pct\":%d,\"bat_mv\":%lu,\"usb\":%s,\"wifi\":%d,\"ble\":%d,"
+      "\"rf\":%d,\"rfwant\":%d,\"scan\":%d,\"rfms\":%lu,"
       "\"gps\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"alt\":%.1f,\"sats\":%lu"
       "%s%s%s}\n",
 PP_VERSION, (int)g_screen, (int)g_seaView, game::profile.level,
@@ -887,7 +889,9 @@ PP_VERSION, (int)g_screen, (int)g_seaView, game::profile.level,
       (unsigned)ESP.getFreeHeap(), (unsigned)app::brightness(),
       power::batteryPct(), (unsigned long)power::batteryMv(),
       power::usbPowered() ? "true" : "false", tools::lastWifiCount(),
-      tools::lastBleCount(), gps::statusLabel(),
+      tools::lastBleCount(), tools::rfPhase(), tools::rfWant(),
+      tools::rfScanStatus(), (unsigned long)tools::rfLastPhaseMs(),
+      gps::statusLabel(),
       gps::hasFix() ? gps::latitude() : 0.0,
       gps::hasFix() ? gps::longitude() : 0.0,
       gps::hasFix() ? gps::altitudeM() : 0.0,
@@ -1135,19 +1139,17 @@ void loop() {
     now = millis();  // handleTap may have burned time painting
   }
 
-  // Heavy station enter (WiFi.mode / scan / promiscuous) runs AFTER chrome
-  // has already been pushed — navigation feels instant.
+  // Heavy station enter is arm-only; rfService below does one Wi-Fi opcode
+  // per tick (also on Menu/World so leave-teardown finishes off the tap path).
   if (g_pendingToolOpen >= 0) {
     int idx = g_pendingToolOpen;
     g_pendingToolOpen = -1;
     if (g_screen == Screen::Tool && g_toolIndex == idx) {
-      // onOpen is arm-only for Wi-Fi (no WiFi.mode here) — stays snappy.
-      tools::at(idx).onOpen();
-      // Allow a quick follow-up paint once RF phases start (not a double present
-      // in handleTap — chrome already pushed).
-      g_lastDraw = now - 280;
+      tools::at(idx).onOpen();  // arm only — no WiFi.mode here
     }
   }
+
+  tools::rfService();
 
   if (g_screen == Screen::Tool && g_toolIndex >= 0)
     tools::at(g_toolIndex).onTick(now);
@@ -1170,7 +1172,7 @@ void loop() {
     g_lastDraw = now;  // cursor blink
     drawName();
     present();
-  } else if (g_screen == Screen::Tool && now - g_lastDraw > 320) {
+  } else if (g_screen == Screen::Tool && now - g_lastDraw > 400) {
     g_lastDraw = now;
     tools::at(g_toolIndex).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
                                   theme::kScreenH - theme::kToolHeaderH);
