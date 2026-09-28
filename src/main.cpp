@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.4"
+#define PP_VERSION "0.5.5"
 #endif
 
 using gfxu::blend565;
@@ -100,10 +100,14 @@ uint32_t g_tapStamp = 0;
 // One SPI burst per frame. Split chrome/body presents caused a double freeze
 // (eye saw chrome, then the world hitch while body SPI ran) — feels like
 // "struggling to load." Build the full frame in PSRAM, then push once.
+// Touch is polled around the SPI burst so release/re-press edges during the
+// ~35ms push are latched into the tap queue instead of being dropped.
 static inline void present() {
+  touch::read();
   uint32_t t0 = millis();
   if (g_canvasOk) canvas.pushSprite(0, 0);
   g_lastPresentMs = millis() - t0;
+  touch::read();
   delay(0);  // yield so RF worker / WiFi can run between frames
 }
 
@@ -862,10 +866,7 @@ void handleTap(int16_t x, int16_t y) {
           present();
           g_lastTapMs = millis() - g_tapStamp;
           g_lastDraw = millis();
-          Serial.printf("[ui] open station=%d tap_ms=%lu present_ms=%lu draw_ms=%lu\n",
-                        i, (unsigned long)g_lastTapMs,
-                        (unsigned long)g_lastPresentMs,
-                        (unsigned long)g_lastDrawMs);
+          // No Serial on tap path — USB-CDC stall drops subsequent edges.
           return;
         }
       }
@@ -885,10 +886,7 @@ void handleTap(int16_t x, int16_t y) {
         g_lastTapMs = millis() - g_tapStamp;
         g_lastDraw = millis();
         if (closing >= 0) tools::at(closing).onClose();  // flags only
-        Serial.printf("[ui] back tap_ms=%lu present_ms=%lu draw_ms=%lu\n",
-                      (unsigned long)g_lastTapMs,
-                      (unsigned long)g_lastPresentMs,
-                      (unsigned long)g_lastDrawMs);
+        // No Serial on tap path — USB-CDC stall drops subsequent edges.
         return;
       }
       if (tools::at(g_toolIndex).onTouch(x, y)) {
@@ -900,10 +898,7 @@ void handleTap(int16_t x, int16_t y) {
         present();
         g_lastTapMs = millis() - g_tapStamp;
         g_lastDraw = millis();
-        Serial.printf("[ui] chip tap_ms=%lu present_ms=%lu draw_ms=%lu\n",
-                      (unsigned long)g_lastTapMs,
-                      (unsigned long)g_lastPresentMs,
-                      (unsigned long)g_lastDrawMs);
+        // No Serial on tap path — USB-CDC stall drops subsequent edges.
       }
       break;
   }
@@ -1178,9 +1173,13 @@ void loop() {
     present();
   }
 
-  touch::read();
-  int16_t tx, ty;
-  if (touch::wasTapped(tx, ty)) {
+  // Drain queued press-edges. present() inside handleTap also polls touch, so
+  // rapid taps during SPI land in the FIFO and are handled here without waiting
+  // for the next world/tool redraw cadence.
+  for (int n = 0; n < 4; n++) {
+    touch::read();
+    int16_t tx, ty;
+    if (!touch::wasTapped(tx, ty)) break;
     power::noteActivity(now);
     handleTap(tx, ty);
     now = millis();  // handleTap may have burned time painting
@@ -1193,7 +1192,7 @@ void loop() {
     tools::at(g_toolIndex).onTick(now);
 
   // Redraw cadence: world ~5 fps; menu dirty-flagged; tools ~3 fps.
-  // Touch is polled above so a mid-frame tap still lands next iteration.
+  // Touch FIFO is drained above; present() also polls around each SPI push.
   // Tool path redraws BODY only (header already on canvas) — no double header.
   if (g_screen == Screen::World && now - g_lastDraw > 200) {
     g_lastDraw = now;
