@@ -8,6 +8,10 @@
 #include <set>
 #include <strings.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 #include "app.h"
 #include "board_pins.h"
 #include "game_state.h"
@@ -21,7 +25,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.2"
+#define PP_VERSION "0.5.3"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -79,13 +83,13 @@ void rssiBars(int x, int y, int rssi) {
   }
 }
 
-// ---- serialized Wi-Fi RF pump (never block the tap/UI thread) -------------
-// Root cause of multi-tap hang (v0.5.1): WiFi.mode / scanDelete / promiscuous
-// ran on open/close or stacked while a prior async scan was still alive.
-// After ~3 Nest/Harbor/Lookout cycles the driver wedged (scanComplete==-1)
-// and the next mode/scan blocked for seconds.
-// Fix: one RF opcode per loop tick; cancel/replace on leave; no WiFi.* in
-// onOpen/onClose/onTouch except arming flags.
+// ---- FreeRTOS Wi-Fi RF worker (UI loop never waits on WiFi.*) -------------
+// v0.5.1 hang: stacked WiFi.mode/scanDelete/promiscuous while async scan alive.
+// v0.5.2: one opcode per UI loop tick — fixed multi-open wedge, but a single
+// EnsureSta/scanDelete can still block 1–3s and starve touch→present.
+// v0.5.3: RF state machine runs on a pinned FreeRTOS task (core 0). UI only
+// arms flags. Cached scanComplete so draws never call into the driver.
+// One Wi-Fi opcode per worker wake; StartScan no longer doubles scanDelete.
 
 enum class RfWant : uint8_t { Idle = 0, Scan, Promisc, Leave };
 enum class RfPhase : uint8_t {
@@ -108,6 +112,58 @@ uint32_t g_rfLastPhaseMs = 0;
 wifi_promiscuous_cb_t g_rfPromiscCb = nullptr;
 int g_rfPromiscChannel = 1;
 bool g_rfPromiscReady = false;
+volatile int g_rfScanCached = WIFI_SCAN_FAILED;  // mirror of scanComplete()
+
+// Snapshot of last completed scan — UI reads ONLY this, never WiFi.* from loop.
+struct RfNetSnap {
+  char ssid[33];
+  uint8_t bssid[6];
+  int32_t rssi;
+  uint8_t channel;
+  wifi_auth_mode_t auth;
+};
+RfNetSnap g_rfNets[48];
+volatile int g_rfNetCount = 0;
+uint32_t g_rfSnapGen = 0;
+int g_rfSnapSt = -999;  // scanComplete value we last snapped
+
+void rfPublishScanSnap(int st) {
+  if (st < 0) {
+    g_rfNetCount = 0;
+    g_rfSnapSt = st;
+    return;
+  }
+  if (st == g_rfSnapSt) return;
+  int n = st < 48 ? st : 48;
+  for (int i = 0; i < n; i++) {
+    RfNetSnap& e = g_rfNets[i];
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0)
+      strncpy(e.ssid, "<hidden>", sizeof(e.ssid) - 1);
+    else
+      strncpy(e.ssid, ssid.c_str(), sizeof(e.ssid) - 1);
+    e.ssid[sizeof(e.ssid) - 1] = 0;
+    const uint8_t* bs = WiFi.BSSID(i);
+    if (bs) memcpy(e.bssid, bs, 6);
+    else memset(e.bssid, 0, 6);
+    e.rssi = WiFi.RSSI(i);
+    e.channel = (uint8_t)WiFi.channel(i);
+    e.auth = WiFi.encryptionType(i);
+  }
+  g_rfNetCount = n;
+  g_rfSnapSt = st;
+  g_rfSnapGen++;
+}
+
+SemaphoreHandle_t g_wifiMu = nullptr;
+TaskHandle_t g_rfTask = nullptr;
+
+void wifiLock() {
+  if (g_wifiMu) xSemaphoreTake(g_wifiMu, portMAX_DELAY);
+}
+void wifiUnlock() {
+  if (g_wifiMu) xSemaphoreGive(g_wifiMu);
+}
 
 void wifiRfRequest(RfWant want) {
   g_rfWant = want;
@@ -115,9 +171,12 @@ void wifiRfRequest(RfWant want) {
   g_rfPromiscReady = false;
   // Always re-enter teardown so a new request replaces in-flight work.
   g_rfPhase = RfPhase::StopPromisc;
+  if (g_rfTask) xTaskNotifyGive(g_rfTask);
 }
 
 void wifiScanBegin() {
+  g_rfScanCached = WIFI_SCAN_RUNNING;
+  g_rfSnapSt = -999;
   wifiRfRequest(RfWant::Scan);
 }
 
@@ -132,9 +191,10 @@ void wifiRfLeave() {
   wifiRfRequest(RfWant::Leave);
 }
 
-int wifiScanState() { return WiFi.scanComplete(); }  // -1 run, -2 fail, >=0 n
+// UI-safe: never touches the driver (RF task publishes the mirror).
+int wifiScanState() { return g_rfScanCached; }
 
-void wifiRfService() {
+void wifiRfServiceOnce() {
   // Exactly one potentially-blocking Wi-Fi call per invocation.
   uint32_t t0 = millis();
   switch (g_rfPhase) {
@@ -149,15 +209,20 @@ void wifiRfService() {
 
     case RfPhase::AbortScan: {
       int st = WiFi.scanComplete();
+      g_rfScanCached = st;
       if (st == WIFI_SCAN_RUNNING || st >= 0) {
         // Abort in-flight or free prior results before mode/scan churn.
         WiFi.scanDelete();
+        g_rfScanCached = WIFI_SCAN_FAILED;
+        g_rfNetCount = 0;
+        g_rfSnapSt = -999;
       }
       g_rfPhase = RfPhase::EnsureSta;
       break;
     }
 
     case RfPhase::EnsureSta:
+      // Skip WiFi.mode when already STA — mode() is the multi-second stall.
       if (WiFi.getMode() != WIFI_STA) {
         WiFi.mode(WIFI_STA);
       }
@@ -173,8 +238,8 @@ void wifiRfService() {
       break;
 
     case RfPhase::StartScan:
-      // Fresh async scan; hidden SSIDs included. Never sync-scan.
-      WiFi.scanDelete();
+      // Async scan only. scanDelete already happened in AbortScan.
+      g_rfScanCached = WIFI_SCAN_RUNNING;
       WiFi.scanNetworks(true /*async*/, true /*show hidden*/);
       g_rfScanStartedAt = millis();
       g_rfPhase = RfPhase::Scanning;
@@ -182,27 +247,23 @@ void wifiRfService() {
 
     case RfPhase::Scanning: {
       if (g_rfWant != RfWant::Scan) {
-        // Replaced / cancelled mid-scan — tear down next tick.
         g_rfPhase = RfPhase::StopPromisc;
         break;
       }
       int st = WiFi.scanComplete();
+      g_rfScanCached = st;
       if (st == WIFI_SCAN_FAILED) {
-        // Recover: re-arm a clean scan path next request; stay Idle until
-        // station asks again (or auto-retry via station tick timeout).
         g_rfWant = RfWant::Idle;
         g_rfPhase = RfPhase::Idle;
         break;
       }
       if (st >= 0) {
-        // Results ready — stay Scanning so wifiScanState() keeps returning
-        // the count until the station copies them and calls wifiScanBegin()
-        // (replace) or wifiRfLeave().
+        rfPublishScanSnap(st);
         break;
       }
-      // Still running (-1). Watchdog: stuck scans wedge mode() after N opens.
       if (millis() - g_rfScanStartedAt > 12000) {
         WiFi.scanDelete();
+        g_rfScanCached = WIFI_SCAN_FAILED;
         g_rfWant = RfWant::Idle;
         g_rfPhase = RfPhase::Idle;
       }
@@ -231,7 +292,6 @@ void wifiRfService() {
       esp_wifi_set_promiscuous(true);
       esp_wifi_set_channel(g_rfPromiscChannel, WIFI_SECOND_CHAN_NONE);
       g_rfPromiscReady = true;
-      // Hold here while tool is open; leave() restarts teardown.
       break;
     }
 
@@ -245,8 +305,39 @@ void wifiRfService() {
   if (dt > g_rfLastPhaseMs) g_rfLastPhaseMs = dt;
 }
 
-// Legacy name used by station ticks — now a no-op alias; main pumps rfService.
-void wifiScanService() { /* pumped globally via tools::rfService() */ }
+void rfTaskFn(void*) {
+  for (;;) {
+    // Run while there is work; sleep longer when idle/steady.
+    wifiLock();
+    RfPhase before = g_rfPhase;
+    wifiRfServiceOnce();
+    RfPhase after = g_rfPhase;
+    wifiUnlock();
+
+    bool busy = (after != RfPhase::Idle && after != RfPhase::Scanning &&
+                 after != RfPhase::PromiscOn && after != before) ||
+                (after == RfPhase::StopPromisc || after == RfPhase::AbortScan ||
+                 after == RfPhase::EnsureSta || after == RfPhase::StartScan ||
+                 after == RfPhase::ArmPromisc || after == RfPhase::LeaveDone);
+    if (busy) {
+      vTaskDelay(pdMS_TO_TICKS(2));  // yield to UI between opcodes
+    } else if (after == RfPhase::Scanning || after == RfPhase::PromiscOn) {
+      // Poll scanComplete / hold promisc without starving UI.
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30));
+    } else {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+    }
+  }
+}
+
+void wifiRfStartWorker() {
+  if (g_rfTask) return;
+  g_wifiMu = xSemaphoreCreateMutex();
+  // Core 0, low-ish priority so Arduino loop (UI) on core 1 stays responsive.
+  xTaskCreatePinnedToCore(rfTaskFn, "pp_rf", 4096, nullptr, 1, &g_rfTask, 0);
+}
+
+void wifiScanService() { /* RF worker pumps itself */ }
 
 const char* encLabel(wifi_auth_mode_t m) {
   switch (m) {
@@ -545,25 +636,19 @@ void cnRebuildVisible() {
 }
 
 void cnCapture(int st) {
-  cnCount = 0;
-  for (int i = 0; i < st && cnCount < 48; i++) {
-    CnNet& n = cnNets[cnCount];
-    // Copy into fixed buffer without retaining Arduino String temporaries.
-    {
-      String ssid = WiFi.SSID(i);
-      if (ssid.length() == 0)
-        strncpy(n.ssid, "<hidden>", sizeof(n.ssid) - 1);
-      else
-        strncpy(n.ssid, ssid.c_str(), sizeof(n.ssid) - 1);
-      n.ssid[sizeof(n.ssid) - 1] = 0;
-    }
-    const uint8_t* bs = WiFi.BSSID(i);
-    if (bs) memcpy(n.bssid, bs, 6);
-    else memset(n.bssid, 0, 6);
-    n.rssi = WiFi.RSSI(i);
-    n.channel = (uint8_t)WiFi.channel(i);
-    n.auth = WiFi.encryptionType(i);
-    cnCount++;
+  (void)st;
+  int n = g_rfNetCount;
+  if (n < 0) n = 0;
+  if (n > 48) n = 48;
+  cnCount = n;
+  for (int i = 0; i < n; i++) {
+    CnNet& dst = cnNets[i];
+    const RfNetSnap& s = g_rfNets[i];
+    memcpy(dst.ssid, s.ssid, sizeof(dst.ssid));
+    memcpy(dst.bssid, s.bssid, 6);
+    dst.rssi = s.rssi;
+    dst.channel = s.channel;
+    dst.auth = s.auth;
   }
   g_lastWifiCount = cnCount;
   cnRebuildVisible();
@@ -583,8 +668,8 @@ void cnTick(uint32_t now) {
   if (st >= 0 && st != cnProcessed) {
     cnProcessed = st;
     cnCapture(st);
-    for (int i = 0; i < st; i++) {
-      uint64_t k = bssidKey(WiFi.BSSID(i));
+    for (int i = 0; i < cnCount; i++) {
+      uint64_t k = bssidKey(cnNets[i].bssid);
       if (g_seenAp.insert(k).second) {
         game::profile.apSeen++;
         game::addLoot(game::Loot::ChartFragment, 1);
@@ -887,7 +972,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.2,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.3,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -918,18 +1003,24 @@ void crTick(uint32_t now) {
         double lon = fix ? gps::longitude() : 0.0;
         double alt = fix ? gps::altitudeM() : 0.0;
         double acc = fix ? gps::hdop() * 5.0 : 0.0;  // rough meters from HDOP
-        for (int i = 0; i < st; i++) {
-          String ssid = WiFi.SSID(i);
-          ssid.replace(",", " ");
+        for (int i = 0; i < g_rfNetCount && i < st; i++) {
+          const RfNetSnap& s = g_rfNets[i];
+          char bssid[18];
+          snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                   s.bssid[0], s.bssid[1], s.bssid[2], s.bssid[3], s.bssid[4],
+                   s.bssid[5]);
+          char ssid[33];
+          strncpy(ssid, s.ssid, sizeof(ssid) - 1);
+          ssid[sizeof(ssid) - 1] = 0;
+          for (char* p = ssid; *p; ++p)
+            if (*p == ',') *p = ' ';
           if (fix) {
-            f.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%.1f,WIFI\n",
-                     WiFi.BSSIDstr(i).c_str(), ssid.c_str(),
-                     wigleAuth(WiFi.encryptionType(i)), ts, WiFi.channel(i),
-                     WiFi.RSSI(i), lat, lon, alt, acc);
+            f.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%.1f,WIFI\n", bssid, ssid,
+                     wigleAuth(s.auth), ts, (int)s.channel, (int)s.rssi, lat,
+                     lon, alt, acc);
           } else {
-            f.printf("%s,%s,%s,%s,%d,%d,,,,,WIFI\n", WiFi.BSSIDstr(i).c_str(),
-                     ssid.c_str(), wigleAuth(WiFi.encryptionType(i)), ts,
-                     WiFi.channel(i), WiFi.RSSI(i));
+            f.printf("%s,%s,%s,%s,%d,%d,,,,,WIFI\n", bssid, ssid,
+                     wigleAuth(s.auth), ts, (int)s.channel, (int)s.rssi);
           }
           crLoggedSession++;
         }
@@ -998,11 +1089,13 @@ void lkTick(uint32_t now) {
       lkHist[c] = 0;
       lkOpenHist[c] = 0;
     }
-    for (int i = 0; i < st; i++) {
-      int c = WiFi.channel(i);
+    int n = g_rfNetCount;
+    if (n > st) n = st;
+    for (int i = 0; i < n; i++) {
+      int c = g_rfNets[i].channel;
       if (c >= 1 && c <= 13) {
         lkHist[c]++;
-        if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) lkOpenHist[c]++;
+        if (g_rfNets[i].auth == WIFI_AUTH_OPEN) lkOpenHist[c]++;
       }
     }
     wifiScanBegin();
@@ -1113,9 +1206,14 @@ void sgTick(uint32_t now) {
   if (st >= 0 && st != sgProcessed) {
     sgProcessed = st;
     sgHitCount = 0;
-    for (int i = 0; i < st && sgHitCount < 12; i++) {
-      String ssid = WiFi.SSID(i);
-      String bssid = WiFi.BSSIDstr(i);
+    for (int i = 0; i < g_rfNetCount && i < st && sgHitCount < 12; i++) {
+      const RfNetSnap& net = g_rfNets[i];
+      String ssid = String(net.ssid);
+      char bssidBuf[18];
+      snprintf(bssidBuf, sizeof(bssidBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+               net.bssid[0], net.bssid[1], net.bssid[2], net.bssid[3],
+               net.bssid[4], net.bssid[5]);
+      String bssid = String(bssidBuf);
       for (int s = 0; s < spyglass::kSignatureCount; s++) {
         const auto& sig = spyglass::kSignatures[s];
         if (ouiMatch(bssid, sig.ouiPrefix) || ssidMatch(ssid, sig.ssidSubstr)) {
@@ -1123,11 +1221,11 @@ void sgTick(uint32_t now) {
           hh.ssid = ssid.length() ? ssid : String("<hidden>");
           hh.bssid = bssid;
           hh.label = sig.label;
-          hh.rssi = WiFi.RSSI(i);
+          hh.rssi = net.rssi;
           break;
         }
       }
-    }
+        }
     wifiScanBegin();
   }
 }
@@ -1290,6 +1388,8 @@ bool rwTouch(int16_t, int16_t) { return false; }
 namespace {
 int hiProcessed = -1;
 int hiOpen_ = 0, hiWeak = 0, hiStrong = 0, hiTotal = 0;
+struct HiRow { char ssid[20]; wifi_auth_mode_t auth; };
+HiRow hiRows[16];
 void hiOpen() {
   hiProcessed = -1;
   wifiScanBegin();
@@ -1300,9 +1400,15 @@ void hiTick(uint32_t now) {
   if (st >= 0 && st != hiProcessed) {
     hiProcessed = st;
     hiOpen_ = hiWeak = hiStrong = 0;
-    hiTotal = st;
-    for (int i = 0; i < st; i++) {
-      int r = encRisk(WiFi.encryptionType(i));
+    int n = g_rfNetCount;
+    if (n > st) n = st;
+    if (n > 16) n = 16;
+    hiTotal = n;
+    for (int i = 0; i < n; i++) {
+      hiRows[i].auth = g_rfNets[i].auth;
+      strncpy(hiRows[i].ssid, g_rfNets[i].ssid, sizeof(hiRows[i].ssid) - 1);
+      hiRows[i].ssid[sizeof(hiRows[i].ssid) - 1] = 0;
+      int r = encRisk(g_rfNets[i].auth);
       if (r == 3) hiOpen_++;
       else if (r == 2) hiWeak++;
       else if (r == 0) hiStrong++;
@@ -1330,11 +1436,12 @@ void hiDraw(int x, int y, int w, int h) {
   for (int i = 0; i < rows; i++) {
     int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    wifi_auth_mode_t m = WiFi.encryptionType(i);
-    String ssid = WiFi.SSID(i);
-    if (ssid.length() == 0) ssid = "<hidden>";
-    if (ssid.length() > 18) ssid = ssid.substring(0, 18);
-    txt(x + 10, ry + 4, theme::kInk, 1, "%s", ssid.c_str());
+    wifi_auth_mode_t m = hiRows[i].auth;
+    char ssid[20];
+    strncpy(ssid, hiRows[i].ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = 0;
+    if (strlen(ssid) > 18) ssid[18] = 0;
+    txt(x + 10, ry + 4, theme::kInk, 1, "%s", ssid);
     txt(x + 230, ry + 4, riskColor(encRisk(m)), 1, "%s", encLabel(m));
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
@@ -2121,10 +2228,11 @@ const Tool& at(int i) {
 int lastWifiCount() { return g_lastWifiCount; }
 int lastBleCount() { return g_bleCount; }
 
-void rfService() { wifiRfService(); }
+void rfBegin() { wifiRfStartWorker(); }
+void rfService() { /* worker task owns the radio */ }
 int rfPhase() { return (int)g_rfPhase; }
 int rfWant() { return (int)g_rfWant; }
-int rfScanStatus() { return WiFi.scanComplete(); }
+int rfScanStatus() { return g_rfScanCached; }
 uint32_t rfLastPhaseMs() { return g_rfLastPhaseMs; }
 bool rfPromiscReady() { return g_rfPromiscReady; }
 
