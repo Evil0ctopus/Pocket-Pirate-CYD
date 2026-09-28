@@ -238,76 +238,153 @@ inline void drawToolbar(lgfx::LGFXBase& g, int x, int y, int w, int h) {
   g.drawRoundRect(x, y, w, h, 4, theme::kBorder);
 }
 
-// Tiny station glyph inside a circle (vector fallbacks — no SD art needed).
+// Station glyph — detailed finished vectors (pirate / Ship OS 2026).
+// Solid fills only (no fillSmooth*). Designed for ~9–12px radius tiles.
 inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
                       uint16_t accent) {
-  g.fillCircle(cx, cy, r, theme::kPanelSoft);
+  uint16_t ink = theme::kInk;
+  uint16_t dim = theme::kInkDim;
+  uint16_t gold = theme::kGold;
+  uint16_t deep = theme::kBgDeep;
+  uint16_t elev = theme::kPanelElev;
+  // Disc + dual-ring bezel
+  g.fillCircle(cx, cy, r, elev);
   g.drawCircle(cx, cy, r, accent);
+  g.drawCircle(cx, cy, r - 1, darken(accent, 80));
+  // Tiny accent pip at 1-o'clock
+  g.fillCircle(cx + r - 2, cy - r + 3, 1, gold);
+
   uint16_t c = accent;
-  switch (kind % 14) {
-    case 0:  // Crow's Nest — eye
-      g.drawEllipse(cx, cy, r - 3, r / 2, c);
-      g.fillCircle(cx, cy, 2, c);
+  switch (kind % 15) {
+    case 0: {  // Crow's Nest — spyglass + crow eye
+      g.fillCircle(cx - 1, cy, r - 4, theme::kPanelSoft);
+      g.drawEllipse(cx - 1, cy, r - 4, r / 2 - 1, c);
+      g.fillCircle(cx - 1, cy, 2, gold);
+      g.fillCircle(cx - 1, cy, 1, deep);
+      g.fillRect(cx + 3, cy - 1, r - 3, 3, c);
+      g.drawRect(cx + 3, cy - 1, r - 3, 3, lighten(c, 60));
+      g.fillTriangle(cx + r - 3, cy - 2, cx + r - 1, cy, cx + r - 3, cy + 2, gold);
       break;
-    case 1:  // Harbor — bottle waves
-      g.drawFastHLine(cx - 5, cy - 2, 10, c);
-      g.drawFastHLine(cx - 4, cy + 1, 8, c);
-      g.drawFastHLine(cx - 5, cy + 4, 10, c);
+    }
+    case 1: {  // Harbor — bottle on waves
+      g.fillRoundRect(cx - 3, cy - 5, 6, 9, 1, c);
+      g.fillTriangle(cx - 2, cy - 7, cx + 2, cy - 7, cx, cy - 5, gold);
+      g.drawFastHLine(cx - 6, cy + 4, 12, lighten(c, 40));
+      g.drawFastHLine(cx - 5, cy + 6, 10, c);
+      g.fillCircle(cx + 1, cy - 2, 1, theme::kCyan);
       break;
-    case 2:  // Chart Room — map folds
-      g.drawRect(cx - 5, cy - 4, 10, 8, c);
-      g.drawFastVLine(cx - 1, cy - 4, 8, c);
-      g.drawFastHLine(cx - 5, cy, 10, c);
+    }
+    case 2: {  // Chart Room — folded chart + X
+      g.fillRoundRect(cx - 6, cy - 5, 12, 10, 1, theme::kPanelSoft);
+      g.drawRoundRect(cx - 6, cy - 5, 12, 10, 1, c);
+      g.drawFastVLine(cx - 1, cy - 5, 10, dim);
+      g.drawFastHLine(cx - 6, cy, 12, dim);
+      g.drawLine(cx - 4, cy - 3, cx + 4, cy + 3, gold);
+      g.drawLine(cx + 4, cy - 3, cx - 4, cy + 3, gold);
       break;
-    case 3:  // Lookout — bars
-      for (int i = 0; i < 4; i++)
-        g.fillRect(cx - 5 + i * 3, cy + 3 - i * 2, 2, 2 + i * 2, c);
+    }
+    case 3: {  // Lookout — signal bars + crow perch
+      for (int i = 0; i < 4; i++) {
+        int bh = 3 + i * 2;
+        g.fillRoundRect(cx - 6 + i * 3, cy + 5 - bh, 2, bh, 1,
+                        i >= 2 ? gold : c);
+      }
+      g.fillCircle(cx + 5, cy - 4, 2, c);
+      g.fillTriangle(cx + 5, cy - 2, cx + 3, cy + 1, cx + 7, cy + 1, dim);
       break;
-    case 4:  // Spyglass — circle + tube
-      g.drawCircle(cx - 2, cy, 4, c);
-      g.drawFastHLine(cx + 2, cy, 5, c);
+    }
+    case 4: {  // Spyglass — telescope with lens flare
+      g.fillCircle(cx - 3, cy, 5, theme::kPanelSoft);
+      g.drawCircle(cx - 3, cy, 5, c);
+      g.drawCircle(cx - 3, cy, 3, gold);
+      g.fillCircle(cx - 3, cy, 1, ink);
+      g.fillRoundRect(cx + 1, cy - 2, 7, 4, 1, c);
+      g.fillRect(cx + 7, cy - 3, 2, 6, gold);
       break;
-    case 5:  // Tracker — radar blip
-      g.drawCircle(cx, cy, 5, c);
-      g.drawCircle(cx, cy, 2, c);
-      g.fillCircle(cx + 4, cy - 3, 1, c);
+    }
+    case 5: {  // Tracker — radar rings + blip
+      g.drawCircle(cx, cy, 6, c);
+      g.drawCircle(cx, cy, 3, dim);
+      g.drawFastHLine(cx - 6, cy, 12, dim);
+      g.drawFastVLine(cx, cy - 6, 12, dim);
+      g.fillCircle(cx + 4, cy - 3, 2, theme::kBad);
+      g.fillCircle(cx + 4, cy - 3, 1, gold);
       break;
-    case 6:  // Rigging — shield
-      g.fillTriangle(cx, cy - 5, cx - 5, cy - 1, cx + 5, cy - 1, c);
-      g.fillTriangle(cx - 5, cy - 1, cx + 5, cy - 1, cx, cy + 5, c);
+    }
+    case 6: {  // Rigging — shield + bolt
+      g.fillTriangle(cx, cy - 6, cx - 6, cy - 1, cx + 6, cy - 1, c);
+      g.fillTriangle(cx - 6, cy - 1, cx + 6, cy - 1, cx, cy + 6, darken(c, 40));
+      g.drawLine(cx - 2, cy - 1, cx + 1, cy + 1, gold);
+      g.drawLine(cx + 1, cy + 1, cx - 1, cy + 4, gold);
       break;
-    case 7:  // Probe — antenna
-      g.drawFastVLine(cx, cy - 5, 10, c);
-      g.drawCircle(cx, cy - 5, 2, c);
-      g.drawFastHLine(cx - 4, cy + 4, 8, c);
+    }
+    case 7: {  // Probe — antenna dish
+      g.fillCircle(cx, cy + 1, 4, theme::kPanelSoft);
+      g.drawCircle(cx, cy + 1, 4, c);
+      g.drawFastVLine(cx, cy - 6, 5, c);
+      g.fillCircle(cx, cy - 6, 2, gold);
+      g.drawFastHLine(cx - 5, cy + 6, 10, dim);
       break;
-    case 8:  // Log — book
-      g.drawRoundRect(cx - 5, cy - 5, 10, 10, 1, c);
-      g.drawFastVLine(cx, cy - 4, 8, c);
+    }
+    case 8: {  // Log — open book + quill
+      g.fillRoundRect(cx - 6, cy - 5, 6, 10, 1, theme::kPanelSoft);
+      g.fillRoundRect(cx, cy - 5, 6, 10, 1, elev);
+      g.drawRoundRect(cx - 6, cy - 5, 12, 10, 1, c);
+      g.drawFastVLine(cx, cy - 4, 8, gold);
+      g.drawLine(cx + 4, cy - 6, cx + 6, cy + 2, dim);
+      g.fillCircle(cx + 6, cy + 3, 1, c);
       break;
-    case 9:  // Systems — gear-ish
-      g.drawCircle(cx, cy, 4, c);
-      g.fillCircle(cx, cy, 1, c);
-      g.drawFastHLine(cx - 6, cy, 12, c);
-      g.drawFastVLine(cx, cy - 6, 12, c);
+    }
+    case 9: {  // Systems — gear
+      g.fillCircle(cx, cy, 4, c);
+      g.fillCircle(cx, cy, 2, deep);
+      for (int a = 0; a < 6; a++) {
+        // 6 teeth via offsets
+        static const int8_t ox[6] = {0, 5, 5, 0, -5, -5};
+        static const int8_t oy[6] = {-6, -3, 3, 6, 3, -3};
+        g.fillRect(cx + ox[a] - 1, cy + oy[a] - 1, 3, 3, c);
+      }
+      g.fillCircle(cx, cy, 1, gold);
       break;
-    case 10:  // Lantern — bulb
-      g.fillCircle(cx, cy - 1, 4, c);
-      g.fillRect(cx - 2, cy + 3, 4, 3, c);
+    }
+    case 10: {  // Lantern — glowing lamp
+      g.fillRoundRect(cx - 4, cy - 6, 8, 3, 1, gold);
+      g.fillCircle(cx, cy + 1, 5, c);
+      g.fillCircle(cx - 1, cy, 2, lighten(c, 100));
+      g.fillRect(cx - 2, cy + 5, 4, 3, dim);
+      g.drawFastVLine(cx, cy - 8, 2, dim);
       break;
-    case 11:  // Settings — sliders
+    }
+    case 11: {  // Settings — sliders + knobs
       g.drawFastHLine(cx - 6, cy - 3, 12, c);
       g.drawFastHLine(cx - 6, cy + 3, 12, c);
-      g.fillCircle(cx - 2, cy - 3, 2, c);
-      g.fillCircle(cx + 3, cy + 3, 2, c);
+      g.fillCircle(cx - 2, cy - 3, 2, gold);
+      g.fillCircle(cx + 3, cy + 3, 2, theme::kCyan);
+      g.drawCircle(cx - 2, cy - 3, 2, ink);
+      g.drawCircle(cx + 3, cy + 3, 2, ink);
       break;
-    case 12:  // Instruments
+    }
+    case 12: {  // Instruments — compass rose
       g.drawCircle(cx, cy, 6, c);
-      g.fillTriangle(cx, cy, cx + 1, cy - 5, cx - 1, cy - 5, c);
+      g.fillTriangle(cx, cy - 5, cx + 2, cy, cx - 2, cy, gold);
+      g.fillTriangle(cx, cy + 5, cx + 2, cy, cx - 2, cy, dim);
+      g.fillTriangle(cx - 5, cy, cx, cy - 2, cx, cy + 2, c);
+      g.fillTriangle(cx + 5, cy, cx, cy - 2, cx, cy + 2, c);
+      g.fillCircle(cx, cy, 1, ink);
       break;
-    default:  // Gallery / fallback star
-      g.fillTriangle(cx, cy - 5, cx - 3, cy + 3, cx + 3, cy + 3, c);
+    }
+    case 13: {  // Gallery / Art — framed skull-lite
+      g.drawRoundRect(cx - 6, cy - 6, 12, 12, 1, c);
+      g.fillCircle(cx - 2, cy - 1, 1, gold);
+      g.fillCircle(cx + 2, cy - 1, 1, gold);
+      g.fillTriangle(cx - 3, cy + 3, cx + 3, cy + 3, cx, cy + 5, dim);
       break;
+    }
+    default: {  // Star / loot
+      g.fillTriangle(cx, cy - 6, cx - 4, cy + 2, cx + 4, cy + 2, gold);
+      g.fillTriangle(cx, cy + 5, cx - 4, cy - 1, cx + 4, cy - 1, c);
+      break;
+    }
   }
 }
 

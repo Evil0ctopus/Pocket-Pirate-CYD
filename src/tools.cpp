@@ -21,7 +21,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.0"
+#define PP_VERSION "0.5.1"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -79,14 +79,31 @@ void rssiBars(int x, int y, int rssi) {
   }
 }
 
-// ---- shared Wi-Fi scan ----------------------------------------------------
+// ---- shared Wi-Fi scan (deferred so chrome paints before RF) --------------
+// Arm-only from onOpen; wifiScanService() runs one phase per tick so
+// WiFi.mode() never freezes the tap that opened the station.
+int g_wifiArm = 0;  // 0 idle, 1 need mode/promiscuous-off, 2 need scan start
+
 void wifiScanBegin() {
-  // Keep this cheap: callers paint station chrome first, then open.
-  // Avoid disconnect() on every enter — it stalls the UI thread ~50-150ms.
-  if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
-  WiFi.scanDelete();
-  WiFi.scanNetworks(true /*async*/, true /*show hidden*/);
+  // Cheap: only arm. Real RF work happens in wifiScanService().
+  g_wifiArm = 1;
 }
+
+void wifiScanService() {
+  if (g_wifiArm == 1) {
+    // Leave promiscuous (Rigging/Probe) before STA scan or scan never completes.
+    esp_wifi_set_promiscuous(false);
+    if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
+    g_wifiArm = 2;
+    return;  // yield one frame — avoids 3–5s tap hang
+  }
+  if (g_wifiArm == 2) {
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true /*async*/, true /*show hidden*/);
+    g_wifiArm = 0;
+  }
+}
+
 int wifiScanState() { return WiFi.scanComplete(); }  // -1 run, -2 fail, >=0 n
 
 const char* encLabel(wifi_auth_mode_t m) {
@@ -364,7 +381,7 @@ void cnRebuildVisible() {
     }
     cnVisibleIdx[j] = v;
   }
-  int maxScroll = max(0, cnVisibleCount - 6);
+  int maxScroll = max(0, cnVisibleCount - 7);  // draw computes exact fit
   if (cnScroll > maxScroll) cnScroll = maxScroll;
 }
 
@@ -397,10 +414,13 @@ void cnOpen() {
   cnProcessed = -1;
   cnDetail = -1;
   cnScroll = 0;
-  wifiScanBegin();
+  cnFilter = 0;  // never open into a filter that hides every row
+  cnSort = 0;
+  wifiScanBegin();  // arm only — RF deferred
   cnLast = millis();
 }
 void cnTick(uint32_t now) {
+  wifiScanService();
   int st = wifiScanState();
   if (st >= 0 && st != cnProcessed) {
     cnProcessed = st;
@@ -459,20 +479,24 @@ void cnDrawDetail(int x, int y, int w, int h) {
 void cnDrawList(int x, int y, int w, int h) {
   body(x, y, w, h);
   int st = wifiScanState();
-  if (st < 0 && cnCount == 0) {
-    txt(x + 12, y + 10, theme::kInkDim, 1, "Sweeping the horizon...");
-    return;
-  }
-  // Bridge Console KPIs before dense list
+
+  // Bridge Console KPIs — always draw so the body is never an empty green void
+  // while scanning (v0.5.0 early-return made Crow's Nest look blank).
   int openN = 0, best = -999;
   for (int i = 0; i < cnCount; i++) {
     if (cnNets[i].auth == WIFI_AUTH_OPEN) openN++;
     if (cnNets[i].rssi > best) best = cnNets[i].rssi;
   }
   char vNets[8], vOpen[8], vBest[8];
-  snprintf(vNets, sizeof(vNets), "%d", cnCount);
-  snprintf(vOpen, sizeof(vOpen), "%d", openN);
-  snprintf(vBest, sizeof(vBest), "%d", cnCount ? best : 0);
+  if (st < 0 && cnCount == 0) {
+    snprintf(vNets, sizeof(vNets), "-");
+    snprintf(vOpen, sizeof(vOpen), "-");
+    snprintf(vBest, sizeof(vBest), "-");
+  } else {
+    snprintf(vNets, sizeof(vNets), "%d", cnCount);
+    snprintf(vOpen, sizeof(vOpen), "%d", openN);
+    snprintf(vBest, sizeof(vBest), "%d", cnCount ? best : 0);
+  }
   const char* vals[] = {vNets, vOpen, vBest};
   const char* labs[] = {"nets", "open", "best dB"};
   uint16_t cols[] = {theme::kTeal, openN ? theme::kWarn : theme::kGood,
@@ -493,9 +517,22 @@ void cnDrawList(int x, int y, int w, int h) {
          theme::kTeal);
   }
 
-  constexpr int kRows = 6;
   constexpr int kRh = theme::kRowH;
-  int listTop = below + 24;
+  const int listTop = below + 22;
+  const int listBot = y + h - 12;  // leave hint line
+  const int listH = max(0, listBot - listTop);
+  const int kRows = max(1, listH / kRh);  // fit remaining Y (KPI must not eat list)
+
+  if (st < 0 && cnCount == 0) {
+    txt(x + 12, listTop + 4, theme::kInkDim, 1, "Sweeping the horizon...");
+    txt(x + 12, listTop + 16, theme::kInkMuted, 1, "passive scan · no associate");
+    txt(x + 8, y + h - 10, theme::kInkMuted, 1, "Tap empty = rescan");
+    return;
+  }
+
+  // Clip list so rows never paint under the hint / past the panel.
+  if (listH > 0) G().setClipRect(x + 4, listTop, w - 36, listH);
+
   int rows = min(cnVisibleCount - cnScroll, kRows);
   for (int r = 0; r < rows; r++) {
     int idx = cnVisibleIdx[cnScroll + r];
@@ -518,6 +555,15 @@ void cnDrawList(int x, int y, int w, int h) {
     txt(x + 234, ry + 5, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 40, theme::kBorder);
   }
+  G().clearClipRect();
+
+  if (cnVisibleCount == 0) {
+    if (cnCount == 0)
+      txt(x + 12, listTop + 4, theme::kInkDim, 1, "No networks in sight");
+    else
+      txt(x + 12, listTop + 4, theme::kWarn, 1, "No nets match filter");
+  }
+
   if (cnScroll > 0)
     btn(x + w - 30, listTop, 26, 20, "^", false);
   if (cnScroll + kRows < cnVisibleCount)
@@ -529,14 +575,16 @@ void cnDraw(int x, int y, int w, int h) {
   else cnDrawList(x, y, w, h);
 }
 bool cnTouch(int16_t x, int16_t y) {
-  // Absolute screen coords. Layout: KPI(34) + gap + toolbar(20) + list.
+  // Absolute screen coords. Layout: KPI + gap + toolbar(20) + list.
+  // Must match cnDrawList: below = ct+2+kKpiH+2, listTop = below+22.
   int ly = y;
   int cx = x;
   const int ct = contentTop();
-  constexpr int kRows = 6;
   constexpr int kRh = theme::kRowH;
-  const int kToolbarY = ct + 2 + theme::kKpiH + 2;  // ~74
-  const int kListTop = kToolbarY + 24;              // ~98
+  const int kToolbarY = ct + 2 + theme::kKpiH + 2;
+  const int kListTop = kToolbarY + 22;
+  const int kListBot = theme::kScreenH - 12;
+  const int kRows = max(1, (kListBot - kListTop) / kRh);
   if (cnDetail >= 0) {
     if (ly >= 204 && ly <= 240) {
       if (cx >= 8 && cx <= 100) {
@@ -681,7 +729,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.0,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.1,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -698,6 +746,7 @@ void crOpen() {
 }
 void crTick(uint32_t now) {
   (void)now;
+  wifiScanService();
   int st = wifiScanState();
   if (st >= 0 && st != crProcessed) {
     crProcessed = st;
@@ -782,6 +831,7 @@ void lkOpen() {
   wifiScanBegin();
 }
 void lkTick(uint32_t now) {
+  wifiScanService();
   (void)now;
   int st = wifiScanState();
   if (st >= 0 && st != lkProcessed) {
@@ -902,6 +952,7 @@ void sgOpen() {
   wifiScanBegin();
 }
 void sgTick(uint32_t now) {
+  wifiScanService();
   int st = wifiScanState();
   if (st >= 0 && st != sgProcessed) {
     sgProcessed = st;
@@ -1098,6 +1149,7 @@ void hiOpen() {
   wifiScanBegin();
 }
 void hiTick(uint32_t now) {
+  wifiScanService();
   int st = wifiScanState();
   if (st >= 0 && st != hiProcessed) {
     hiProcessed = st;
