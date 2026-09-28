@@ -7,15 +7,15 @@
 
 #include "pirate_theme.h"
 
-// Small shared color / drawing helpers so every screen shades consistently.
+// Small shared color / drawing helpers — Ship OS 2026.
+// Opaque elevated panels, hairline cyber-teal borders, KPI cards, dense rows.
+// No fillSmooth* spam; solid fills only.
 namespace gfxu {
 
-// Compile-time RGB888 -> RGB565 so palettes can be written as plain numbers.
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-// Blend two RGB565 colors. t = 0..255 is the amount of `b`.
 inline uint16_t blend565(uint16_t a, uint16_t b, uint8_t t) {
   int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
   int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
@@ -32,8 +32,6 @@ inline uint16_t darken(uint16_t c, uint8_t amt) {
   return blend565(c, 0x0000, amt);
 }
 
-// Vertical gradient fill from top color to bottom color.
-// step>1 trades smoothness for speed (world/HUD chrome uses 2).
 inline void vGradient(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       uint16_t top, uint16_t bot, int step = 1) {
   if (h <= 0 || w <= 0) return;
@@ -47,7 +45,6 @@ inline void vGradient(lgfx::LGFXBase& g, int x, int y, int w, int h,
   }
 }
 
-// Clip/ellipsis print so labels never spill past `maxW` pixels (6px/glyph @ size 1).
 inline void printFit(lgfx::LGFXBase& g, int x, int y, int maxW, uint16_t fg,
                      uint8_t size, const char* s) {
   if (!s) return;
@@ -76,7 +73,6 @@ inline void printFit(lgfx::LGFXBase& g, int x, int y, int maxW, uint16_t fg,
   g.print(buf);
 }
 
-// Center a label inside a box (uses 6px glyph width at size 1).
 inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
                           uint16_t fg, uint8_t size, const char* s) {
   if (!s) return;
@@ -88,24 +84,30 @@ inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
   g.print(s);
 }
 
-// Soft rounded card with optional left accent bar and subtle edge.
+// Soft rounded card with optional left accent bar (hairline, not crayon).
 inline void drawCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      uint16_t fill = theme::kPanel, uint16_t accent = 0,
                      int radius = theme::kRadiusCard) {
   g.fillRoundRect(x, y, w, h, radius, fill);
   g.drawRoundRect(x, y, w, h, radius, theme::kBorder);
   if (accent) {
-    int aw = 4;
-    g.fillRoundRect(x, y, aw + 2, h, radius, accent);
-    g.fillRect(x + aw, y + 1, 2, h - 2, fill);  // clean inner edge
+    int aw = theme::kAccentW;
+    g.fillRect(x + 1, y + 2, aw, h - 4, accent);
   }
 }
 
-// Content body panel (station screens). Solid fill (fast); thin top highlight.
+// Content body panel (station screens). Solid fill; hairline top edge.
 inline void drawBody(lgfx::LGFXBase& g, int x, int y, int w, int h) {
   g.fillRect(x, y, w, h, theme::kBg);
-  g.fillRect(x, y, w, 3, theme::kPanel);
   g.drawFastHLine(x, y, w, theme::kBorderHi);
+  g.drawFastHLine(x, y + 1, w, theme::kBorder);
+}
+
+// Elevated opaque panel (Material 3 Expressive — no blur).
+inline void drawElevated(lgfx::LGFXBase& g, int x, int y, int w, int h,
+                         int radius = theme::kRadiusCard) {
+  g.fillRoundRect(x, y, w, h, radius, theme::kPanelElev);
+  g.drawRoundRect(x, y, w, h, radius, theme::kBorderHi);
 }
 
 // Primary CTA / secondary button.
@@ -121,13 +123,14 @@ inline void drawButton(lgfx::LGFXBase& g, int x, int y, int w, int h,
   printCentered(g, x, y, w, h, fg, 1, label);
 }
 
-// Sort / filter chip (pill).
+// Sort / filter chip (pill) — cyber-teal hairline when off.
 inline void drawChip(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      const char* label, bool on, uint16_t onColor = theme::kGold) {
   uint16_t fill = on ? onColor : theme::kPanelSoft;
   uint16_t fg = on ? theme::kOnGold : theme::kInkDim;
   g.fillRoundRect(x, y, w, h, theme::kRadiusChip, fill);
-  if (!on) g.drawRoundRect(x, y, w, h, theme::kRadiusChip, theme::kBorder);
+  g.drawRoundRect(x, y, w, h, theme::kRadiusChip,
+                  on ? lighten(onColor, 40) : theme::kBorderHi);
   printCentered(g, x, y, w, h, fg, 1, label);
 }
 
@@ -136,7 +139,58 @@ inline void drawSeparator(lgfx::LGFXBase& g, int x, int y, int w) {
   g.drawFastHLine(x, y + 1, w, darken(theme::kBgDeep, 40));
 }
 
-// Structured list row: optional zebra, primary + secondary labels, right meta.
+// Status badge pill (Ship OS chrome: BAT / GPS / SD).
+inline void drawBadge(lgfx::LGFXBase& g, int x, int y, int w, int h,
+                      const char* label, uint16_t fg,
+                      uint16_t fill = theme::kPanelSoft) {
+  g.fillRoundRect(x, y, w, h, 3, fill);
+  g.drawRoundRect(x, y, w, h, 3, theme::kBorder);
+  printCentered(g, x, y, w, h, fg, 1, label);
+}
+
+// MiniDash-style KPI card: large value + tiny label.
+inline void drawKpiCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
+                        const char* value, const char* label,
+                        uint16_t valueColor = theme::kTeal,
+                        uint16_t accent = 0) {
+  g.fillRoundRect(x, y, w, h, 5, theme::kPanelElev);
+  g.drawRoundRect(x, y, w, h, 5, theme::kBorder);
+  if (accent) g.fillRect(x + 1, y + 2, theme::kAccentW, h - 4, accent);
+  int inset = accent ? 6 : 4;
+  g.setTextSize(2);
+  g.setTextColor(valueColor);
+  int vw = (int)strlen(value) * 12;
+  g.setCursor(x + inset + (w - inset - 4 - vw) / 2, y + 4);
+  g.print(value);
+  g.setTextSize(1);
+  g.setTextColor(theme::kInkMuted);
+  int lw = (int)strlen(label) * 6;
+  g.setCursor(x + inset + (w - inset - 4 - lw) / 2, y + h - 11);
+  g.print(label);
+}
+
+// Bridge Console KPI strip: N equal cards across content width.
+// values/labels arrays of length n (2..4). Returns strip bottom y.
+inline int drawKpiStrip(lgfx::LGFXBase& g, int x, int y, int w, int n,
+                        const char* const* values, const char* const* labels,
+                        const uint16_t* colors = nullptr,
+                        const uint16_t* accents = nullptr) {
+  if (n < 1) n = 1;
+  if (n > 4) n = 4;
+  const int gap = theme::kKpiCardGap;
+  const int h = theme::kKpiH;
+  const int cw = (w - gap * (n - 1)) / n;
+  for (int i = 0; i < n; i++) {
+    int cx = x + i * (cw + gap);
+    uint16_t vc = (colors && colors[i]) ? colors[i] : theme::kTeal;
+    uint16_t ac = (accents) ? accents[i] : 0;
+    drawKpiCard(g, cx, y, cw, h, values[i] ? values[i] : "-",
+                labels[i] ? labels[i] : "", vc, ac);
+  }
+  return y + h;
+}
+
+// Field Tablet dense list row: zebra, primary + secondary, right meta + optional bars area.
 inline void drawListRow(lgfx::LGFXBase& g, int x, int y, int w, int h, int index,
                         const char* primary, const char* secondary,
                         const char* meta, uint16_t primaryColor = theme::kInk,
@@ -164,7 +218,8 @@ inline void drawListRow(lgfx::LGFXBase& g, int x, int y, int w, int h, int index
 inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       const char* label, const char* value,
                       uint16_t valueColor = theme::kInk) {
-  g.fillRoundRect(x, y, w, h, 5, theme::kPanelSoft);
+  g.fillRoundRect(x, y, w, h, 4, theme::kPanelSoft);
+  g.drawRoundRect(x, y, w, h, 4, theme::kBorder);
   g.setTextSize(1);
   g.setTextColor(theme::kInkDim);
   g.setCursor(x + 8, y + (h - 8) / 2);
@@ -175,6 +230,12 @@ inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
     g.setCursor(x + w - vw - 8, y + (h - 8) / 2);
     g.print(value);
   }
+}
+
+// Toolbar well for chips / filters.
+inline void drawToolbar(lgfx::LGFXBase& g, int x, int y, int w, int h) {
+  g.fillRoundRect(x, y, w, h, 4, theme::kPanelSoft);
+  g.drawRoundRect(x, y, w, h, 4, theme::kBorder);
 }
 
 // Tiny station glyph inside a circle (vector fallbacks — no SD art needed).
@@ -250,7 +311,6 @@ inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
   }
 }
 
-// printf-style text with transparent background (modern overlay-friendly).
 inline void textAt(lgfx::LGFXBase& g, int x, int y, uint16_t fg, uint8_t size,
                    const char* fmt, ...) {
   char b[96];

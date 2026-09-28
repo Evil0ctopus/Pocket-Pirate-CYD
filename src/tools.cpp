@@ -21,7 +21,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.4.2"
+#define PP_VERSION "0.5.0"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -57,6 +57,14 @@ void chip(int x, int y, int w, int h, const char* label, bool on,
           uint16_t onColor = theme::kGold) {
   gfxu::drawChip(G(), x, y, w, h, label, on, onColor);
 }
+
+// Bridge Console: pack KPI values into fixed buffers and draw strip.
+int kpiStrip(int x, int y, int w, int n, const char* const* values,
+             const char* const* labels, const uint16_t* colors = nullptr) {
+  return gfxu::drawKpiStrip(G(), x, y, w, n, values, labels, colors, nullptr);
+}
+
+int contentTop() { return theme::kToolHeaderH; }
 
 // Signal-strength pips from an RSSI value.
 void rssiBars(int x, int y, int rssi) {
@@ -356,7 +364,7 @@ void cnRebuildVisible() {
     }
     cnVisibleIdx[j] = v;
   }
-  int maxScroll = max(0, cnVisibleCount - 8);
+  int maxScroll = max(0, cnVisibleCount - 6);
   if (cnScroll > maxScroll) cnScroll = maxScroll;
 }
 
@@ -427,22 +435,25 @@ void cnDrawDetail(int x, int y, int w, int h) {
   snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", n.bssid[0],
            n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5]);
   const char* ven = oui::vendor(n.bssid);
-  txt(x + 10, y + 6, theme::kGold, 2, "Look closer");
+  // Detail sheet hero KPIs
+  char vRssi[8], vCh[8], vRisk[8];
+  snprintf(vRssi, sizeof(vRssi), "%d", (int)n.rssi);
+  snprintf(vCh, sizeof(vCh), "%u", (unsigned)n.channel);
+  snprintf(vRisk, sizeof(vRisk), "%s", encLabel(n.auth));
+  const char* vals[] = {vRssi, vCh, vRisk};
+  const char* labs[] = {"dBm", "channel", "auth"};
+  uint16_t cols[] = {theme::kTeal, theme::kCyan, riskColor(encRisk(n.auth))};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
   char buf[48];
   snprintf(buf, sizeof(buf), "%s", n.ssid);
-  gfxu::drawKVRow(G(), x + 8, y + 28, w - 16, 20, "SSID", buf, theme::kInk);
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "SSID", buf, theme::kInk);
   snprintf(buf, sizeof(buf), "%s", mac);
-  gfxu::drawKVRow(G(), x + 8, y + 52, w - 16, 20, "BSSID", buf, theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "BSSID", buf, theme::kCyan);
   snprintf(buf, sizeof(buf), "%s", ven[0] ? ven : "unknown");
-  gfxu::drawKVRow(G(), x + 8, y + 76, w - 16, 20, "Vendor", buf, theme::kTeal);
-  snprintf(buf, sizeof(buf), "%s", encLabel(n.auth));
-  gfxu::drawKVRow(G(), x + 8, y + 100, w - 16, 20, "Auth", buf,
-                  riskColor(encRisk(n.auth)));
-  snprintf(buf, sizeof(buf), "%d dBm  CH %u", (int)n.rssi, (unsigned)n.channel);
-  gfxu::drawKVRow(G(), x + 8, y + 124, w - 16, 20, "Signal", buf, theme::kInk);
-  rssiBars(x + w - 36, y + 130, n.rssi);
-  btn(x + 8, y + h - 34, 90, 28, "BACK", false);
-  btn(x + 110, y + h - 34, 100, 28, "RESCAN", true);
+  gfxu::drawKVRow(G(), x + 6, below + 44, w - 12, 18, "Vendor", buf, theme::kTeal);
+  rssiBars(x + w - 36, below + 70, n.rssi);
+  btn(x + 8, y + h - 30, 90, 24, "BACK", false);
+  btn(x + 110, y + h - 30, 100, 24, "RESCAN", true);
 }
 
 void cnDrawList(int x, int y, int w, int h) {
@@ -452,23 +463,39 @@ void cnDrawList(int x, int y, int w, int h) {
     txt(x + 12, y + 10, theme::kInkDim, 1, "Sweeping the horizon...");
     return;
   }
-  // Toolbar card
-  G().fillRoundRect(x + 4, y + 2, w - 8, 22, 5, theme::kPanelSoft);
-  txt(x + 10, y + 8, theme::kGold, 1, "%d nets", cnCount);
+  // Bridge Console KPIs before dense list
+  int openN = 0, best = -999;
+  for (int i = 0; i < cnCount; i++) {
+    if (cnNets[i].auth == WIFI_AUTH_OPEN) openN++;
+    if (cnNets[i].rssi > best) best = cnNets[i].rssi;
+  }
+  char vNets[8], vOpen[8], vBest[8];
+  snprintf(vNets, sizeof(vNets), "%d", cnCount);
+  snprintf(vOpen, sizeof(vOpen), "%d", openN);
+  snprintf(vBest, sizeof(vBest), "%d", cnCount ? best : 0);
+  const char* vals[] = {vNets, vOpen, vBest};
+  const char* labs[] = {"nets", "open", "best dB"};
+  uint16_t cols[] = {theme::kTeal, openN ? theme::kWarn : theme::kGood,
+                     theme::kCyan};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+
+  // Field Tablet chip toolbar
+  gfxu::drawToolbar(G(), x + 4, below, w - 8, 20);
   const char* sorts[] = {"RSSI", "CH", "SSID"};
   for (int i = 0; i < 3; i++) {
-    int bx = x + 68 + i * 40;
-    chip(bx, y + 5, 38, theme::kChipH, sorts[i], cnSort == i, theme::kGold);
+    int bx = x + 8 + i * 40;
+    chip(bx, below + 2, 38, theme::kChipH, sorts[i], cnSort == i, theme::kGold);
   }
   const char* filters[] = {"All", "Open", "Sec"};
   for (int i = 0; i < 3; i++) {
-    int bx = x + 196 + i * 36;
-    chip(bx, y + 5, 34, theme::kChipH, filters[i], cnFilter == i, theme::kTeal);
+    int bx = x + 136 + i * 36;
+    chip(bx, below + 2, 34, theme::kChipH, filters[i], cnFilter == i,
+         theme::kTeal);
   }
 
-  constexpr int kRows = 8;
+  constexpr int kRows = 6;
   constexpr int kRh = theme::kRowH;
-  int listTop = y + 28;
+  int listTop = below + 24;
   int rows = min(cnVisibleCount - cnScroll, kRows);
   for (int r = 0; r < rows; r++) {
     int idx = cnVisibleIdx[cnScroll + r];
@@ -491,24 +518,25 @@ void cnDrawList(int x, int y, int w, int h) {
     txt(x + 234, ry + 5, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 40, theme::kBorder);
   }
-  // Scroll affordances (larger targets)
   if (cnScroll > 0)
-    btn(x + w - 30, listTop, 26, 22, "^", false);
+    btn(x + w - 30, listTop, 26, 20, "^", false);
   if (cnScroll + kRows < cnVisibleCount)
-    btn(x + w - 30, y + h - 36, 26, 22, "v", false);
-  txt(x + 8, y + h - 12, theme::kInkMuted, 1, "Tap row = detail   empty = rescan");
+    btn(x + w - 30, y + h - 28, 26, 20, "v", false);
+  txt(x + 8, y + h - 10, theme::kInkMuted, 1, "Tap row = detail · empty = rescan");
 }
 void cnDraw(int x, int y, int w, int h) {
   if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
   else cnDrawList(x, y, w, h);
 }
 bool cnTouch(int16_t x, int16_t y) {
-  // Absolute screen coords; content region starts at y≈44.
+  // Absolute screen coords. Layout: KPI(34) + gap + toolbar(20) + list.
   int ly = y;
   int cx = x;
-  constexpr int kRows = 8;
+  const int ct = contentTop();
+  constexpr int kRows = 6;
   constexpr int kRh = theme::kRowH;
-  constexpr int kListTop = 44 + 28;  // content y + toolbar
+  const int kToolbarY = ct + 2 + theme::kKpiH + 2;  // ~74
+  const int kListTop = kToolbarY + 24;              // ~98
   if (cnDetail >= 0) {
     if (ly >= 204 && ly <= 240) {
       if (cx >= 8 && cx <= 100) {
@@ -527,9 +555,9 @@ bool cnTouch(int16_t x, int16_t y) {
     return true;
   }
   // Sort / filter chips in toolbar
-  if (ly >= 44 && ly <= 70) {
+  if (ly >= kToolbarY && ly <= kToolbarY + 22) {
     for (int i = 0; i < 3; i++) {
-      int bx = 68 + i * 40;
+      int bx = 8 + i * 40;
       if (cx >= bx && cx <= bx + 38) {
         cnSort = i;
         cnRebuildVisible();
@@ -537,7 +565,7 @@ bool cnTouch(int16_t x, int16_t y) {
       }
     }
     for (int i = 0; i < 3; i++) {
-      int bx = 196 + i * 36;
+      int bx = 136 + i * 36;
       if (cx >= bx && cx <= bx + 34) {
         cnFilter = i;
         cnScroll = 0;
@@ -546,18 +574,16 @@ bool cnTouch(int16_t x, int16_t y) {
       }
     }
   }
-  // Scroll buttons (right edge)
   if (cx >= 290) {
-    if (ly < 120) {
+    if (ly < kListTop + 40) {
       if (cnScroll > 0) cnScroll--;
       return true;
     }
-    if (ly > 160) {
+    if (ly > 180) {
       if (cnScroll + kRows < cnVisibleCount) cnScroll++;
       return true;
     }
   }
-  // Row tap -> detail
   if (ly >= kListTop && ly < kListTop + kRows * kRh) {
     int r = (ly - kListTop) / kRh;
     if (r >= 0 && cnScroll + r < cnVisibleCount) {
@@ -581,13 +607,24 @@ void hlTick(uint32_t now) { bleTick(now); }
 void hlClose() {}
 void hlDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
-  txt(x + 10, y + 7, theme::kGold, 1, "%d bottles adrift", g_bleCount);
-  txt(x + 160, y + 7, theme::kInkMuted, 1, "passive BLE");
+  int trackers = 0;
+  for (int i = 0; i < g_bleCount; i++)
+    if (g_ble[i].kind == 1) trackers++;
+  char vBottles[8], vTrack[8], vSeen[8];
+  snprintf(vBottles, sizeof(vBottles), "%d", g_bleCount);
+  snprintf(vTrack, sizeof(vTrack), "%d", trackers);
+  snprintf(vSeen, sizeof(vSeen), "%lu", (unsigned long)g_seenBle.size());
+  const char* vals[] = {vBottles, vTrack, vSeen};
+  const char* labs[] = {"adrift", "trackers", "session"};
+  uint16_t cols[] = {theme::kCyan, trackers ? theme::kWarn : theme::kGood,
+                     theme::kTeal};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkMuted, 1, "passive BLE · Field Tablet");
+  below += 12;
   constexpr int kRh = theme::kRowHCompact;
-  int rows = min(g_bleCount, 11);
+  int rows = min(g_bleCount, 9);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 24 + i * kRh;
+    int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     rssiBars(x + 8, ry + 3, g_ble[i].rssi);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
@@ -644,7 +681,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.4.2,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.0,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -701,30 +738,30 @@ void crTick(uint32_t now) {
 void crClose() { WiFi.scanDelete(); }
 void crDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
-  txt(x + 12, y + 8, theme::kGold, 1, "Chart Room");
-  txt(x + 12, y + 22, theme::kInkMuted, 1, "WiGLE 1.4 wardrive → %s",
-      kWigleFile);
-  char v[40];
-  gfxu::drawKVRow(G(), x + 6, y + 46, w - 12, 20, "SD card",
-                  app::sdReady() ? "mounted" : "not found",
-                  app::sdReady() ? theme::kGood : theme::kBad);
-  snprintf(v, sizeof(v), "%lu", (unsigned long)crLoggedSession);
-  gfxu::drawKVRow(G(), x + 6, y + 70, w - 12, 20, "Rows this voyage", v,
-                  theme::kGold);
   bool fix = gps::hasFix();
-  gfxu::drawKVRow(G(), x + 6, y + 94, w - 12, 20, "GPS", gps::statusLabel(),
-                  fix ? theme::kGood : theme::kWarn);
+  char vRows[10], vGps[8], vSd[8];
+  snprintf(vRows, sizeof(vRows), "%lu", (unsigned long)crLoggedSession);
+  snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
+  snprintf(vSd, sizeof(vSd), "%s", app::sdReady() ? "OK" : "--");
+  const char* vals[] = {vRows, vGps, vSd};
+  const char* labs[] = {"logged", "GPS", "SD"};
+  uint16_t cols[] = {theme::kGold, fix ? theme::kGood : theme::kWarn,
+                     app::sdReady() ? theme::kGood : theme::kBad};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 6;
+  char v[48];
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "WiGLE file", kWigleFile,
+                  theme::kCyan);
   if (fix) {
     snprintf(v, sizeof(v), "%.5f, %.5f  %.0fm", gps::latitude(),
              gps::longitude(), gps::altitudeM());
-    gfxu::drawKVRow(G(), x + 6, y + 118, w - 12, 20, "Fix", v, theme::kCyan);
+    gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Fix", v, theme::kCyan);
   } else {
-    gfxu::drawKVRow(G(), x + 6, y + 118, w - 12, 20, "Fix",
+    gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Fix",
                     "lat/lon blank until fix", theme::kInkMuted);
   }
-  txt(x + 12, y + 150, theme::kInkMuted, 1, "UART GPS GPIO43 RX / 44 TX");
-  txt(x + 12, y + 166, theme::kInkMuted, 1, "Passive survey — no association.");
+  txt(x + 10, below + 50, theme::kInkMuted, 1, "UART GPS GPIO43 RX / 44 TX");
+  txt(x + 10, below + 64, theme::kInkMuted, 1, "Passive survey — no association.");
+  txt(x + 10, below + 80, theme::kTeal, 1, "Bridge Console · Chart Room");
 }
 bool crTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -768,17 +805,25 @@ void lkTick(uint32_t now) {
 void lkClose() { WiFi.scanDelete(); }
 void lkDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 18, 4, theme::kPanelSoft);
-  txt(x + 10, y + 7, theme::kGold, 1, "Channel occupancy");
-  txt(x + 160, y + 7, theme::kInkMuted, 1, "tap a bar · n=%d", lkTotal);
-  int maxv = 1;
-  for (int c = 1; c <= 13; c++) maxv = max(maxv, lkHist[c]);
-  int baseY = y + h - 40;
-  int plotH = h - 68;
-  int bw = 18;
-  int gap = 3;
-  // plot well
-  G().fillRoundRect(x + 6, y + 24, w - 12, plotH + 18, 6, theme::kPanelSoft);
+  int maxv = 1, openSum = 0, peakCh = 1;
+  for (int c = 1; c <= 13; c++) {
+    if (lkHist[c] > maxv) { maxv = lkHist[c]; peakCh = c; }
+    openSum += lkOpenHist[c];
+  }
+  char vTot[8], vPeak[8], vOpen[8];
+  snprintf(vTot, sizeof(vTot), "%d", lkTotal);
+  snprintf(vPeak, sizeof(vPeak), "%d", peakCh);
+  snprintf(vOpen, sizeof(vOpen), "%d", openSum);
+  const char* vals[] = {vTot, vPeak, vOpen};
+  const char* labs[] = {"APs", "peak CH", "open"};
+  uint16_t cols[] = {theme::kTeal, theme::kGold, openSum ? theme::kWarn
+                                                          : theme::kGood};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  int baseY = y + h - 36;
+  int plotH = baseY - below - 14;
+  if (plotH < 40) plotH = 40;
+  int bw = 18, gap = 3;
+  gfxu::drawElevated(G(), x + 4, below, w - 8, plotH + 16);
   for (int c = 1; c <= 13; c++) {
     int bx = x + 12 + (c - 1) * (bw + gap);
     int bh = maxv ? (lkHist[c] * plotH) / maxv : 0;
@@ -786,40 +831,36 @@ void lkDraw(int x, int y, int w, int h) {
     uint16_t col = sel ? theme::kGold
                        : (lkHist[c] >= maxv && maxv > 1 ? theme::kWarn
                                                         : theme::kTeal);
-    if (bh > 0)
-      G().fillRoundRect(bx, baseY - bh, bw, bh, 3, col);
+    if (bh > 0) G().fillRoundRect(bx, baseY - bh, bw, bh, 2, col);
     if (lkOpenHist[c] > 0 && bh > 0) {
       int oh = max(2, (lkOpenHist[c] * plotH) / maxv);
       if (oh > bh) oh = bh;
       G().fillRoundRect(bx, baseY - oh, bw, oh, 2, theme::kBad);
     }
-    if (sel) G().drawRoundRect(bx - 1, baseY - max(bh, 4) - 1, bw + 2,
-                               max(bh, 4) + 2, 3, theme::kInk);
-    txt(bx + (c >= 10 ? 1 : 5), baseY + 4, theme::kInkDim, 1, "%d", c);
+    if (sel)
+      G().drawRoundRect(bx - 1, baseY - max(bh, 4) - 1, bw + 2, max(bh, 4) + 2,
+                        2, theme::kInk);
+    txt(bx + (c >= 10 ? 1 : 5), baseY + 3, theme::kInkDim, 1, "%d", c);
     if (lkHist[c])
-      txt(bx + 2, baseY - bh - 10, theme::kInk, 1, "%d", lkHist[c]);
+      txt(bx + 2, baseY - bh - 9, theme::kInk, 1, "%d", lkHist[c]);
   }
-  // legend strip
-  G().fillRoundRect(x + 4, y + h - 22, w - 8, 18, 4, theme::kBgDeep);
-  G().fillRoundRect(x + 10, y + h - 16, 8, 8, 2, theme::kTeal);
-  txt(x + 22, y + h - 16, theme::kInkDim, 1, "sec");
-  G().fillRoundRect(x + 52, y + h - 16, 8, 8, 2, theme::kBad);
-  txt(x + 64, y + h - 16, theme::kInkDim, 1, "open");
-  if (lkSelected >= 1 && lkSelected <= 13) {
-    txt(x + 110, y + h - 16, theme::kGold, 1, "CH%d: %d AP (%d open)",
-        lkSelected, lkHist[lkSelected], lkOpenHist[lkSelected]);
-  } else {
-    txt(x + 110, y + h - 16, theme::kInkMuted, 1, "crowded = gold tip");
-  }
+  G().fillRoundRect(x + 4, y + h - 20, w - 8, 16, 3, theme::kBgDeep);
+  G().fillRoundRect(x + 10, y + h - 15, 7, 7, 1, theme::kTeal);
+  txt(x + 20, y + h - 14, theme::kInkDim, 1, "sec");
+  G().fillRoundRect(x + 48, y + h - 15, 7, 7, 1, theme::kBad);
+  txt(x + 58, y + h - 14, theme::kInkDim, 1, "open");
+  if (lkSelected >= 1 && lkSelected <= 13)
+    txt(x + 100, y + h - 14, theme::kGold, 1, "CH%d: %d (%d open)", lkSelected,
+        lkHist[lkSelected], lkOpenHist[lkSelected]);
+  else
+    txt(x + 100, y + h - 14, theme::kInkMuted, 1, "tap a bar");
 }
 bool lkTouch(int16_t x, int16_t y) {
-  int baseY = 44 + 196 - 36;  // approximate content bottom
-  (void)baseY;
   int bw = 18, gap = 3;
-  // Content region y starts at 44; bars roughly from y+16 to y+h-36
+  // Absolute coords; bars sit under KPI strip (contentTop + ~40).
   for (int c = 1; c <= 13; c++) {
     int bx = 10 + (c - 1) * (bw + gap);
-    if (x >= bx && x <= bx + bw && y >= 60 && y <= 220) {
+    if (x >= bx && x <= bx + bw && y >= 70 && y <= 220) {
       lkSelected = (lkSelected == c) ? 0 : c;
       return true;
     }
@@ -886,19 +927,23 @@ void sgTick(uint32_t now) {
 void sgClose() { WiFi.scanDelete(); }
 void sgDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 40, 5, theme::kPanelSoft);
-  txt(x + 10, y + 8, theme::kGold, 1, "Watchtowers spotted: %d", sgHitCount);
-  if (spyglass::hasVerifiedSignature()) {
-    txt(x + 10, y + 22, theme::kGood, 1, "Verified field OUIs armed (DeFlock).");
-    txt(x + 10, y + 32, theme::kInkMuted, 1, "OUI hit = strong; keyword = candidate.");
-  } else {
-    txt(x + 10, y + 22, theme::kWarn, 1, "Keyword heuristics only — candidates.");
-    txt(x + 10, y + 32, theme::kInkMuted, 1, "Verify against DeFlock.");
-  }
+  bool armed = spyglass::hasVerifiedSignature();
+  char vHits[8], vMode[8], vSig[8];
+  snprintf(vHits, sizeof(vHits), "%d", sgHitCount);
+  snprintf(vMode, sizeof(vMode), "%s", armed ? "OUI" : "KW");
+  snprintf(vSig, sizeof(vSig), "%d", spyglass::kSignatureCount);
+  const char* vals[] = {vHits, vMode, vSig};
+  const char* labs[] = {"hits", "mode", "sigs"};
+  uint16_t cols[] = {sgHitCount ? theme::kBad : theme::kGood,
+                     armed ? theme::kGood : theme::kWarn, theme::kTeal};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkMuted, 1,
+      armed ? "DeFlock OUIs armed · OUI=strong" : "Keyword heuristics only");
+  below += 12;
   constexpr int kRh = theme::kRowH;
-  int rows = min(sgHitCount, 7);
+  int rows = min(sgHitCount, 6);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 48 + i * kRh;
+    int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     String lab = sgHits[i].label;
     if (lab.length() > 28) lab = lab.substring(0, 28);
@@ -925,15 +970,22 @@ void twDraw(int x, int y, int w, int h) {
   int n = 0;
   for (int i = 0; i < g_bleCount; i++)
     if (g_ble[i].kind == 1) n++;
-  G().fillRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
-  txt(x + 10, y + 8, n ? theme::kWarn : theme::kGood, 1,
-      "Possible trackers nearby: %d", n);
-  txt(x + 10, y + 20, theme::kInkMuted, 1, "AirTag / Tile / SmartTag signatures");
+  char vTrack[8], vBle[8], vStat[8];
+  snprintf(vTrack, sizeof(vTrack), "%d", n);
+  snprintf(vBle, sizeof(vBle), "%d", g_bleCount);
+  snprintf(vStat, sizeof(vStat), "%s", n ? "ALERT" : "CLEAR");
+  const char* vals[] = {vTrack, vBle, vStat};
+  const char* labs[] = {"trackers", "BLE", "status"};
+  uint16_t cols[] = {n ? theme::kWarn : theme::kGood, theme::kCyan,
+                     n ? theme::kWarn : theme::kGood};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkMuted, 1, "AirTag / Tile / SmartTag · detect only");
+  below += 12;
   int shown = 0;
   constexpr int kRh = theme::kRowH;
-  for (int i = 0; i < g_bleCount && shown < 8; i++) {
+  for (int i = 0; i < g_bleCount && shown < 6; i++) {
     if (g_ble[i].kind != 1) continue;
-    int ry = y + 36 + shown * kRh;
+    int ry = below + shown * kRh;
     if (shown & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     rssiBars(x + 8, ry + 4, g_ble[i].rssi);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
@@ -946,7 +998,7 @@ void twDraw(int x, int y, int w, int h) {
     shown++;
   }
   if (n == 0)
-    txt(x + 12, y + 48, theme::kInkMuted, 1, "All clear — no trackers seen.");
+    txt(x + 12, below + 8, theme::kInkMuted, 1, "All clear — no trackers seen.");
 }
 bool twTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1007,29 +1059,30 @@ void rwClose() {
 void rwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   bool recent = (millis() - rwLastHit) < 4000 && (rwDeauth + rwDisassoc) > 0;
-  G().fillRoundRect(x + 4, y + 2, w - 8, 36, 6, theme::kPanelSoft);
-  txt(x + 12, y + 8, theme::kGold, 1, "Rigging Watch");
-  txt(x + 12, y + 22, theme::kInkMuted, 1, "Listening for deauth storms · ch %d",
-      rwChannel);
+  char vDe[10], vDi[10], vCh[8];
+  snprintf(vDe, sizeof(vDe), "%lu", (unsigned long)rwDeauth);
+  snprintf(vDi, sizeof(vDi), "%lu", (unsigned long)rwDisassoc);
+  snprintf(vCh, sizeof(vCh), "%d", rwChannel);
+  const char* vals[] = {vDe, vDi, vCh};
+  const char* labs[] = {"deauth", "disassoc", "CH hop"};
+  uint16_t cols[] = {rwDeauth ? theme::kBad : theme::kGood,
+                     rwDisassoc ? theme::kWarn : theme::kGood, theme::kCyan};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 6;
   char v[24];
-  snprintf(v, sizeof(v), "%lu", (unsigned long)rwDeauth);
-  gfxu::drawKVRow(G(), x + 6, y + 46, w - 12, 22, "Deauth frames", v, theme::kBad);
-  snprintf(v, sizeof(v), "%lu", (unsigned long)rwDisassoc);
-  gfxu::drawKVRow(G(), x + 6, y + 72, w - 12, 22, "Disassoc frames", v,
-                  theme::kWarn);
-  gfxu::drawKVRow(G(), x + 6, y + 98, w - 12, 22, "Last source", rwLastSrc,
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 20, "Last source", rwLastSrc,
                   theme::kCyan);
   snprintf(v, sizeof(v), "%d dB", rwLastRssi);
-  gfxu::drawKVRow(G(), x + 6, y + 124, w - 12, 22, "Last RSSI", v);
+  gfxu::drawKVRow(G(), x + 6, below + 24, w - 12, 20, "Last RSSI", v);
   if (recent) {
-    G().fillRoundRect(x + 6, y + 154, w - 12, 28, 6, theme::kBad);
+    G().fillRoundRect(x + 6, below + 52, w - 12, 28, 5, theme::kBad);
     G().setTextColor(theme::kInk);
     G().setTextSize(1);
-    G().setCursor(x + 14, y + 164);
+    G().setCursor(x + 14, below + 62);
     G().print("ALERT: attack frames nearby!");
   } else {
-    txt(x + 12, y + 160, theme::kGood, 1, "Calm seas — no attack detected.");
+    txt(x + 12, below + 58, theme::kGood, 1, "Calm seas — no attack detected.");
   }
+  txt(x + 12, below + 82, theme::kInkMuted, 1, "IDS only · passive MGMT listen");
 }
 bool rwTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1061,24 +1114,23 @@ void hiTick(uint32_t now) {
 void hiClose() { WiFi.scanDelete(); }
 void hiDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 28, 5, theme::kPanelSoft);
-  txt(x + 10, y + 6, theme::kGold, 1, "Hull Inspection");
-  txt(x + 10, y + 18, theme::kInkMuted, 1, "%d networks audited · passive",
-      hiTotal);
-  char v[12];
-  snprintf(v, sizeof(v), "%d", hiOpen_);
-  gfxu::drawKVRow(G(), x + 6, y + 36, w - 12, 18, "Open / WEP (risky)", v,
-                  theme::kBad);
-  snprintf(v, sizeof(v), "%d", hiWeak);
-  gfxu::drawKVRow(G(), x + 6, y + 56, w - 12, 18, "WPA (aging)", v, theme::kWarn);
-  snprintf(v, sizeof(v), "%d", hiStrong);
-  gfxu::drawKVRow(G(), x + 6, y + 76, w - 12, 18, "WPA3 (strong)", v,
-                  theme::kGood);
-  txt(x + 10, y + 100, theme::kInkMuted, 1, "Prefer WPA2/3 · disable WPS · enable PMF");
+  char vOpen[8], vWeak[8], vStrong[8], vTot[8];
+  snprintf(vOpen, sizeof(vOpen), "%d", hiOpen_);
+  snprintf(vWeak, sizeof(vWeak), "%d", hiWeak);
+  snprintf(vStrong, sizeof(vStrong), "%d", hiStrong);
+  snprintf(vTot, sizeof(vTot), "%d", hiTotal);
+  const char* vals[] = {vOpen, vWeak, vStrong, vTot};
+  const char* labs[] = {"risky", "aging", "WPA3", "total"};
+  uint16_t cols[] = {hiOpen_ ? theme::kBad : theme::kGood,
+                     hiWeak ? theme::kWarn : theme::kInkDim, theme::kGood,
+                     theme::kTeal};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 4;
+  txt(x + 8, below, theme::kInkMuted, 1, "Prefer WPA2/3 · disable WPS · PMF");
+  below += 12;
   constexpr int kRh = theme::kRowHCompact;
-  int rows = min(hiTotal, 5);
+  int rows = min(hiTotal, 7);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 116 + i * kRh;
+    int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     wifi_auth_mode_t m = WiFi.encryptionType(i);
     String ssid = WiFi.SSID(i);
@@ -1264,18 +1316,25 @@ void clDraw(int x, int y, int w, int h) {
     return;
   }
 
-  // List pane
-  G().fillRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
-  txt(x + 10, y + 6, theme::kGold, 1, "Captain's Log · %d items", clCount);
-  txt(x + 10, y + 16, theme::kInkMuted, 1, "Tap row = preview   empty = refresh");
-  const int visible = 8;
+  // List pane — KPI then Field Tablet rows
+  char vItems[8], vSd[8], vMode[8];
+  snprintf(vItems, sizeof(vItems), "%d", clCount);
+  snprintf(vSd, sizeof(vSd), "%s", app::sdReady() ? "OK" : "--");
+  snprintf(vMode, sizeof(vMode), "LOG");
+  const char* vals[] = {vItems, vSd, vMode};
+  const char* labs[] = {"items", "SD", "hold"};
+  uint16_t cols[] = {theme::kTeal, theme::kGood, theme::kGold};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkMuted, 1, "Tap row = preview · empty = refresh");
+  below += 12;
+  const int visible = 6;
   constexpr int kRh = theme::kRowH;
   if (clScroll > clCount - visible) clScroll = max(0, clCount - visible);
   if (clScroll < 0) clScroll = 0;
   int rows = min(visible, clCount - clScroll);
   for (int i = 0; i < rows; i++) {
     int idx = clScroll + i;
-    int ry = y + 32 + i * kRh;
+    int ry = below + i * kRh;
     bool wigle = false;
     String low = clFiles[idx];
     low.toLowerCase();
@@ -1295,13 +1354,13 @@ void clDraw(int x, int y, int w, int h) {
   }
   // Scroll affordances
   if (clCount > visible) {
-    btn(x + 280, y + 32, 28, 22, "^", false);
-    btn(x + 280, y + 160, 28, 22, "v", false);
+    btn(x + 280, below, 28, 20, "^", false);
+    btn(x + 280, y + h - 28, 28, 20, "v", false);
   }
 }
 
 bool clTouch(int16_t x, int16_t y) {
-  int ly = y - 44;  // content-local
+  int ly = y - contentTop();  // content-local
   if (clMode == 1) {
     if (ly >= 0 && ly <= 28 && x >= 8 && x <= 90) {
       clMode = 0;
@@ -1309,20 +1368,21 @@ bool clTouch(int16_t x, int16_t y) {
     }
     return true;
   }
-  // Scroll buttons
-  if (clCount > 8 && x >= 270) {
-    if (ly >= 28 && ly <= 60) {
+  // Scroll buttons — list starts after KPI(~36)+hint(~14) ≈ 50
+  const int listY = theme::kKpiH + 16;
+  if (clCount > 6 && x >= 270) {
+    if (ly >= listY && ly <= listY + 40) {
       clScroll = max(0, clScroll - 3);
       return true;
     }
-    if (ly >= 156 && ly <= 190) {
-      clScroll = min(max(0, clCount - 8), clScroll + 3);
+    if (ly >= 150) {
+      clScroll = min(max(0, clCount - 6), clScroll + 3);
       return true;
     }
   }
-  // Row tap (theme::kRowH = 18)
-  if (ly >= 28 && ly <= 190 && x < 270) {
-    int row = (ly - 28) / theme::kRowH;
+  // Row tap
+  if (ly >= listY && ly <= listY + 6 * theme::kRowH && x < 270) {
+    int row = (ly - listY) / theme::kRowH;
     int idx = clScroll + row;
     if (idx >= 0 && idx < clCount && clSizes[idx] >= 0) {
       if (clLooksText(clFiles[idx])) {
@@ -1349,35 +1409,43 @@ void ssTick(uint32_t) {}
 void ssClose() {}
 void ssDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 10, y + 6, theme::kGold, 1, "Ship's Systems");
+  int pct = power::batteryPct();
+  char vHeap[10], vBat[10], vGps[8];
+  snprintf(vHeap, sizeof(vHeap), "%u", (unsigned)(ESP.getFreeHeap() / 1024));
+  if (power::usbPowered())
+    snprintf(vBat, sizeof(vBat), "%s", power::powerLabel());
+  else
+    snprintf(vBat, sizeof(vBat), "%d%%", pct);
+  snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
+  const char* vals[] = {vHeap, vBat, vGps};
+  const char* labs[] = {"heap KB", "power", "GPS"};
+  uint16_t cols[] = {theme::kTeal,
+                     power::lowBattery() ? theme::kBad : theme::kGold,
+                     gps::hasFix() ? theme::kGood : theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
   char v[40];
   snprintf(v, sizeof(v), "%s x%d @ %dMHz", ESP.getChipModel(),
            ESP.getChipCores(), getCpuFrequencyMhz());
-  gfxu::drawKVRow(G(), x + 6, y + 24, w - 12, 18, "Chip", v, theme::kCyan);
-  snprintf(v, sizeof(v), "%u KB free", (unsigned)(ESP.getFreeHeap() / 1024));
-  gfxu::drawKVRow(G(), x + 6, y + 44, w - 12, 18, "Heap", v);
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 16, "Chip", v, theme::kCyan);
   snprintf(v, sizeof(v), "%u / %u KB", (unsigned)(ESP.getFreePsram() / 1024),
            (unsigned)(ESP.getPsramSize() / 1024));
-  gfxu::drawKVRow(G(), x + 6, y + 64, w - 12, 18, "PSRAM", v, theme::kTeal);
+  gfxu::drawKVRow(G(), x + 6, below + 18, w - 12, 16, "PSRAM", v, theme::kTeal);
   snprintf(v, sizeof(v), "%u MB",
            (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
-  gfxu::drawKVRow(G(), x + 6, y + 84, w - 12, 18, "Flash", v);
-  gfxu::drawKVRow(G(), x + 6, y + 104, w - 12, 18, "SD",
+  gfxu::drawKVRow(G(), x + 6, below + 36, w - 12, 16, "Flash", v);
+  gfxu::drawKVRow(G(), x + 6, below + 54, w - 12, 16, "SD",
                   app::sdReady() ? "mounted" : "absent",
                   app::sdReady() ? theme::kGood : theme::kBad);
   uint32_t up = millis() / 1000;
   snprintf(v, sizeof(v), "%lu:%02lu:%02lu", (unsigned long)(up / 3600),
            (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
-  gfxu::drawKVRow(G(), x + 6, y + 124, w - 12, 18, "Uptime", v);
-  gfxu::drawKVRow(G(), x + 6, y + 144, w - 12, 18, "GPS", gps::statusLabel(),
-                  gps::hasFix() ? theme::kGood : theme::kInkDim);
-  int pct = power::batteryPct();
+  gfxu::drawKVRow(G(), x + 6, below + 72, w - 12, 16, "Uptime", v);
   snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
            (unsigned long)power::batteryMv());
-  gfxu::drawKVRow(G(), x + 6, y + 164, w - 12, 18, "Power", v, theme::kGold);
-  G().drawRoundRect(x + 6, y + 186, 104, 10, 3, theme::kBorder);
-  G().fillRoundRect(x + 8, y + 188, max(1, pct), 6, 2,
-                          power::lowBattery() ? theme::kBad : theme::kGood);
+  gfxu::drawKVRow(G(), x + 6, below + 90, w - 12, 16, "Power", v, theme::kGold);
+  G().drawRoundRect(x + 6, below + 112, 104, 10, 3, theme::kBorder);
+  G().fillRoundRect(x + 8, below + 114, max(1, pct), 6, 2,
+                    power::lowBattery() ? theme::kBad : theme::kGood);
 }
 bool ssTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1391,43 +1459,50 @@ void slTick(uint32_t) {}   // the LED profile animates from the main loop
 void slClose() {}          // profile persists; do NOT switch the LED off
 void slDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 8, y + 6, theme::kInk, 2, "Signal Lantern");
+  char vMode[12], vGlow[8], vSnd[8];
+  snprintf(vMode, sizeof(vMode), "%s", led::modeName(led::mode()));
+  if (strlen(vMode) > 6) vMode[6] = 0;
+  snprintf(vGlow, sizeof(vGlow), "%d%%", led::brightness());
+  snprintf(vSnd, sizeof(vSnd), "%s", app::sound() ? "ON" : "off");
+  const char* vals[] = {vMode, vGlow, vSnd};
+  const char* labs[] = {"mode", "glow", "sound"};
+  uint16_t cols[] = {theme::kGold, theme::kTeal,
+                     app::sound() ? theme::kGood : theme::kInkMuted};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 6;
 
   char modeLab[24];
   snprintf(modeLab, sizeof(modeLab), "Mode: %s", led::modeName(led::mode()));
-  btn(x + 8, y + 32, 150, 30, modeLab, false);
-  txt(x + 168, y + 42, theme::kInkMuted, 1, "tap to cycle");
+  btn(x + 8, below, 150, 26, modeLab, false);
+  txt(x + 168, below + 8, theme::kInkMuted, 1, "tap to cycle");
 
-  // Color swatches
-  txt(x + 8, y + 72, theme::kInkDim, 1, "Color:");
+  txt(x + 8, below + 36, theme::kInkDim, 1, "Color:");
   for (int i = 0; i < led::kColorCount; i++) {
     uint32_t c = led::colorRgb(i);
     uint16_t col565 = G().color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     int sx = x + 52 + i * 32;
-    G().fillRoundRect(sx, y + 66, 26, 26, 5, col565);
+    G().fillRoundRect(sx, below + 30, 26, 24, 4, col565);
     if (i == led::colorIdx())
-      G().drawRoundRect(sx - 2, y + 64, 30, 30, 6, theme::kGold);
+      G().drawRoundRect(sx - 2, below + 28, 30, 28, 5, theme::kGold);
   }
 
-  // LED brightness row
-  txt(x + 8, y + 108, theme::kInk, 1, "Glow: %d%%", led::brightness());
-  btn(x + 150, y + 102, 30, 24, "-", false);
-  btn(x + 186, y + 102, 30, 24, "+", false);
+  txt(x + 8, below + 68, theme::kInk, 1, "Glow: %d%%", led::brightness());
+  btn(x + 150, below + 62, 30, 22, "-", false);
+  btn(x + 186, below + 62, 30, 22, "+", false);
 
-  // Sound row
-  btn(x + 8, y + 140, 150, 30, app::sound() ? "Sound: ON" : "Sound: off",
+  btn(x + 8, below + 92, 150, 26, app::sound() ? "Sound: ON" : "Sound: off",
       false, app::sound() ? theme::kGood : theme::kLocked);
 
-  txt(x + 8, y + 182, theme::kInkDim, 1,
-      "Profile persists & glows on every screen.");
+  txt(x + 8, below + 128, theme::kInkMuted, 1,
+      "Profile persists across every station.");
 }
 bool slTouch(int16_t x, int16_t y) {
-  int ly = y - 44;  // content-local
-  if (ly >= 26 && ly <= 68 && x <= 200) {  // mode row (generous)
+  int ly = y - contentTop();  // content-local
+  const int base = theme::kKpiH + 8;  // matches kpiStrip + 6
+  if (ly >= base && ly <= base + 30 && x <= 200) {
     led::setMode((led::mode() + 1) % led::ModeCount);
     return true;
   }
-  if (ly >= 58 && ly <= 98) {  // swatch band
+  if (ly >= base + 28 && ly <= base + 60) {
     for (int i = 0; i < led::kColorCount; i++) {
       int sx = 52 + i * 32;
       if (x >= sx - 3 && x <= sx + 29) {
@@ -1436,7 +1511,7 @@ bool slTouch(int16_t x, int16_t y) {
       }
     }
   }
-  if (ly >= 96 && ly <= 132) {  // glow +/- row
+  if (ly >= base + 58 && ly <= base + 90) {
     if (x >= 144 && x <= 182) {
       led::setBrightness(led::brightness() - 10);
       return true;
@@ -1446,7 +1521,7 @@ bool slTouch(int16_t x, int16_t y) {
       return true;
     }
   }
-  if (ly >= 134 && ly <= 176 && x >= 8 && x <= 170) {  // sound toggle
+  if (ly >= base + 88 && ly <= base + 124 && x >= 8 && x <= 170) {
     app::setSound(!app::sound());
     return true;
   }
@@ -1465,50 +1540,59 @@ void seTick(uint32_t) {}
 void seClose() {}
 void seDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  // Identity card
-  G().fillRoundRect(x + 4, y + 2, w - 8, 34, 6, theme::kPanelSoft);
-  txt(x + 12, y + 8, theme::kGold, 1, "Settings Cabin");
-  txt(x + 12, y + 22, theme::kInkDim, 1, "%s · %s Lv%d · fw %s",
-      game::profile.name, game::rankTitle(game::profile.level),
-      game::profile.level, PP_VERSION);
+  char vLv[8], vFw[8], vBri[8];
+  snprintf(vLv, sizeof(vLv), "%d", game::profile.level);
+  snprintf(vFw, sizeof(vFw), "%s", PP_VERSION);
+  snprintf(vBri, sizeof(vBri), "%d", app::brightness());
+  const char* vals[] = {vLv, vFw, vBri};
+  const char* labs[] = {"level", "fw", "bri"};
+  uint16_t cols[] = {theme::kGold, theme::kTeal, theme::kCyan};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkDim, 1, "%s · %s", game::profile.name,
+      game::rankTitle(game::profile.level));
+  below += 12;
 
-  // Row: Rename + Brightness
-  btn(x + 8, y + 42, 118, 26, "Rename…", false);
+  btn(x + 8, below, 118, 24, "Rename…", false);
   char bri[16];
   snprintf(bri, sizeof(bri), "Bri %d", app::brightness());
-  txt(x + 134, y + 50, theme::kInkDim, 1, "%s", bri);
-  btn(x + 232, y + 42, 28, 26, "-", false);
-  btn(x + 264, y + 42, 28, 26, "+", false);
+  txt(x + 134, below + 8, theme::kInkDim, 1, "%s", bri);
+  btn(x + 232, below, 28, 24, "-", false);
+  btn(x + 264, below, 28, 24, "+", false);
+  below += 28;
 
-  // Row: Sound + Idle sleep
-  btn(x + 8, y + 74, 120, 26, app::sound() ? "Sound: ON" : "Sound: off",
-      false, app::sound() ? theme::kGood : theme::kLocked);
-  btn(x + 136, y + 74, 160, 26,
+  btn(x + 8, below, 120, 24, app::sound() ? "Sound: ON" : "Sound: off", false,
+      app::sound() ? theme::kGood : theme::kLocked);
+  btn(x + 136, below, 160, 24,
       power::idleSleep() ? "Idle sleep: ON" : "Idle sleep: off", false,
       power::idleSleep() ? theme::kWarn : theme::kPanelHi);
+  below += 28;
 
-  // Row: Sleep / OTA
-  btn(x + 8, y + 106, 140, 26, "Sleep now", false, theme::kTeal);
+  btn(x + 8, below, 140, 24, "Sleep now", false, theme::kTeal);
   bool otaOk = ota::wifiConfigured() && ota::urlConfigured();
-  btn(x + 156, y + 106, 140, 26, seOtaBusy ? "OTA…" : "OTA Update", otaOk,
+  btn(x + 156, below, 140, 24, seOtaBusy ? "OTA…" : "OTA Update", otaOk,
       otaOk ? 0 : theme::kLocked);
+  below += 28;
 
-  // Status block
-  G().fillRoundRect(x + 4, y + 138, w - 8, 28, 5, theme::kBgDeep);
-  txt(x + 10, y + 144, theme::kInkMuted, 1, "OTA: %s", ota::status());
+  gfxu::drawElevated(G(), x + 4, below, w - 8, 26);
+  txt(x + 10, below + 4, theme::kInkMuted, 1, "OTA: %s", ota::status());
   if (ota::wifiConfigured())
-    txt(x + 10, y + 154, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
+    txt(x + 10, below + 14, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
         ota::wifiSsid(), ota::urlConfigured() ? "set" : "none");
   else
-    txt(x + 10, y + 154, theme::kInkMuted, 1,
+    txt(x + 10, below + 14, theme::kInkMuted, 1,
         "Set WiFi+URL via companion WIFICFG/OTAURL");
+  below += 30;
 
-  btn(x + 8, y + 172, 170, 24, "Reset progress", false, theme::kBad);
+  btn(x + 8, below, 170, 22, "Reset progress", false, theme::kBad);
 }
 
 bool seTouch(int16_t x, int16_t y) {
-  int ly = y - 44;
-  if (ly >= 38 && ly <= 70) {
+  int ly = y - contentTop();
+  const int row0 = theme::kKpiH + 14;  // rename / bri
+  const int row1 = row0 + 28;
+  const int row2 = row1 + 28;
+  const int row3 = row2 + 28 + 30;  // after OTA status block
+  if (ly >= row0 && ly <= row0 + 28) {
     if (x >= 8 && x <= 165) {
       app::requestRename();
       return false;
@@ -1522,7 +1606,7 @@ bool seTouch(int16_t x, int16_t y) {
       return true;
     }
   }
-  if (ly >= 68 && ly <= 100) {
+  if (ly >= row1 && ly <= row1 + 28) {
     if (x >= 8 && x <= 132) {
       app::setSound(!app::sound());
       return true;
@@ -1533,7 +1617,7 @@ bool seTouch(int16_t x, int16_t y) {
       return true;
     }
   }
-  if (ly >= 98 && ly <= 130) {
+  if (ly >= row2 && ly <= row2 + 28) {
     if (x >= 8 && x <= 152) {
       game::save();
       tools::toast("Sleeping — tap screen to wake");
@@ -1554,7 +1638,7 @@ bool seTouch(int16_t x, int16_t y) {
       return true;
     }
   }
-  if (ly >= 164 && ly <= 196 && x >= 8 && x <= 190) {
+  if (ly >= row3 && ly <= row3 + 28 && x >= 8 && x <= 190) {
     game::resetProgress();
     tools::toast("Progress reset");
     return true;
@@ -1653,15 +1737,20 @@ void pwClose() {
 }
 void pwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 26, 5, theme::kPanelSoft);
-  txt(x + 10, y + 6, theme::kGold, 1, "Clients probing: %d  (ch %d)", pwCount,
-      pwChannel);
-  txt(x + 10, y + 16, theme::kInkMuted, 1, "%lu probe frames · passive",
-      (unsigned long)pwTotal);
+  char vCli[8], vCh[8], vFrm[10];
+  snprintf(vCli, sizeof(vCli), "%d", pwCount);
+  snprintf(vCh, sizeof(vCh), "%d", pwChannel);
+  snprintf(vFrm, sizeof(vFrm), "%lu", (unsigned long)pwTotal);
+  const char* vals[] = {vCli, vCh, vFrm};
+  const char* labs[] = {"clients", "CH hop", "frames"};
+  uint16_t cols[] = {theme::kTeal, theme::kCyan, theme::kGold};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+  txt(x + 8, below, theme::kInkMuted, 1, "passive probe-request sniff");
+  below += 12;
   constexpr int kRh = theme::kRowHCompact;
-  int rows = min(pwCount, 10);
+  int rows = min(pwCount, 8);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 32 + i * kRh;
+    int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     rssiBars(x + 8, ry + 3, pwList[i].rssi);
     if (pwList[i].ssid[0]) {
@@ -1678,7 +1767,7 @@ void pwDraw(int x, int y, int w, int h) {
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
   if (pwCount == 0)
-    txt(x + 12, y + 48, theme::kInkMuted, 1, "Listening… hopping channels.");
+    txt(x + 12, below + 8, theme::kInkMuted, 1, "Listening… hopping channels.");
 }
 bool pwTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1692,12 +1781,23 @@ void dbTick(uint32_t now) { bleTick(now); }
 void dbClose() {}
 void dbDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  G().fillRoundRect(x + 4, y + 2, w - 8, 16, 4, theme::kPanelSoft);
-  txt(x + 10, y + 6, theme::kGold, 1, "Decoding %d advertisers", g_bleCount);
+  int named = 0, decoded = 0;
+  for (int i = 0; i < g_bleCount; i++) {
+    if (g_ble[i].name.length()) named++;
+    if (g_ble[i].detail[0] || g_ble[i].company) decoded++;
+  }
+  char vAdv[8], vDec[8], vNam[8];
+  snprintf(vAdv, sizeof(vAdv), "%d", g_bleCount);
+  snprintf(vDec, sizeof(vDec), "%d", decoded);
+  snprintf(vNam, sizeof(vNam), "%d", named);
+  const char* vals[] = {vAdv, vDec, vNam};
+  const char* labs[] = {"adverts", "decoded", "named"};
+  uint16_t cols[] = {theme::kCyan, theme::kTeal, theme::kGold};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
   constexpr int kRh = theme::kRowH;
-  int rows = min(g_bleCount, 9);
+  int rows = min(g_bleCount, 7);
   for (int i = 0; i < rows; i++) {
-    int ry = y + 22 + i * kRh;
+    int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
     if (label.length() > 20) label = label.substring(0, 20);
@@ -1716,7 +1816,7 @@ void dbDraw(int x, int y, int w, int h) {
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
   if (g_bleCount == 0)
-    txt(x + 12, y + 28, theme::kInkMuted, 1, "Sampling the air...");
+    txt(x + 12, below + 8, theme::kInkMuted, 1, "Sampling the air...");
 }
 bool dbTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1737,35 +1837,48 @@ void siTick(uint32_t now) {
 void siClose() {}
 void siDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  txt(x + 10, y + 6, theme::kGold, 1, "Ship's Instruments");
+  int pct = power::batteryPct();
+  bool fix = gps::hasFix();
+  char vTemp[10], vBat[10], vGps[8];
+  snprintf(vTemp, sizeof(vTemp), "%.0fC", siTemp);
+  if (power::usbPowered())
+    snprintf(vBat, sizeof(vBat), "%s", power::powerLabel());
+  else
+    snprintf(vBat, sizeof(vBat), "%d%%", pct);
+  snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
+  const char* vals[] = {vTemp, vBat, vGps};
+  const char* labs[] = {"core", "power", "GPS"};
+  uint16_t cols[] = {theme::kGold,
+                     power::lowBattery() ? theme::kBad : theme::kTeal,
+                     fix ? theme::kGood : theme::kWarn};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
   char v[40];
   snprintf(v, sizeof(v), "%.1f C / %.0f F", siTemp,
            siTemp * 9.0f / 5.0f + 32.0f);
-  gfxu::drawKVRow(G(), x + 6, y + 24, w - 12, 20, "Core temp", v, theme::kGold);
-  int pct = power::batteryPct();
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "Core temp", v, theme::kGold);
   snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
            (unsigned long)power::batteryMv());
-  gfxu::drawKVRow(G(), x + 6, y + 48, w - 12, 20, "Power", v, theme::kGold);
-  G().drawRoundRect(x + 6, y + 72, 104, 10, 3, theme::kBorder);
-  G().fillRoundRect(x + 8, y + 74, max(1, pct), 6, 2,
-                          power::lowBattery() ? theme::kBad : theme::kGood);
-  bool fix = gps::hasFix();
-  gfxu::drawKVRow(G(), x + 6, y + 90, w - 12, 20, "GPS", gps::statusLabel(),
+  gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Power", v, theme::kGold);
+  G().drawRoundRect(x + 6, below + 46, 104, 10, 3, theme::kBorder);
+  G().fillRoundRect(x + 8, below + 48, max(1, pct), 6, 2,
+                    power::lowBattery() ? theme::kBad : theme::kGood);
+  gfxu::drawKVRow(G(), x + 6, below + 64, w - 12, 18, "GPS", gps::statusLabel(),
                   fix ? theme::kGood : theme::kWarn);
   if (fix) {
     snprintf(v, sizeof(v), "%.5f, %.5f", gps::latitude(), gps::longitude());
-    gfxu::drawKVRow(G(), x + 6, y + 114, w - 12, 20, "Lat/Lon", v, theme::kCyan);
+    gfxu::drawKVRow(G(), x + 6, below + 86, w - 12, 18, "Lat/Lon", v,
+                    theme::kCyan);
     snprintf(v, sizeof(v), "%.0fm  sats %lu  hdop %.1f", gps::altitudeM(),
              (unsigned long)gps::satellites(), gps::hdop());
-    gfxu::drawKVRow(G(), x + 6, y + 138, w - 12, 20, "Alt/HD", v);
+    gfxu::drawKVRow(G(), x + 6, below + 108, w - 12, 18, "Alt/HD", v);
   } else {
-    gfxu::drawKVRow(G(), x + 6, y + 114, w - 12, 20, "Wiring",
+    gfxu::drawKVRow(G(), x + 6, below + 86, w - 12, 18, "Wiring",
                     "TX->GPIO43 RX->GPIO44", theme::kInkMuted);
   }
   snprintf(v, sizeof(v), "%d%% / %s", app::brightness(),
            app::sdReady() ? "ok" : "no");
-  gfxu::drawKVRow(G(), x + 6, y + 162, w - 12, 20, "Bri / SD", v);
-  txt(x + 10, y + 188, theme::kInkMuted, 1, "Core temp is on-die (reads warm).");
+  gfxu::drawKVRow(G(), x + 6, below + 130, w - 12, 18, "Bri / SD", v);
+  txt(x + 10, below + 156, theme::kInkMuted, 1, "Core temp is on-die (reads warm).");
 }
 bool siTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -1778,12 +1891,12 @@ namespace tools {
 lgfx::LGFXBase* gfx = nullptr;
 
 static const Tool kTools[] = {
-    // title, subtitle, tile (short grid label), accent, handlers...
-    {"Crow's Nest", "Wi-Fi survey", "Nest", theme::kSail, cnOpen, cnTick, cnClose,
+    // title, subtitle, tile, accent (cyber-teal stripe — Pirate Cabin), handlers
+    {"Crow's Nest", "Wi-Fi survey", "Nest", theme::kTeal, cnOpen, cnTick, cnClose,
      cnDraw, cnTouch},
-    {"Harbor Ledger", "BLE discovery", "Harbor", theme::kSeaFoam, hlOpen, hlTick,
+    {"Harbor Ledger", "BLE discovery", "Harbor", theme::kCyan, hlOpen, hlTick,
      hlClose, hlDraw, hlTouch},
-    {"Chart Room", "Wardrive log", "Charts", theme::kWood, crOpen, crTick, crClose,
+    {"Chart Room", "Wardrive log", "Charts", theme::kGold, crOpen, crTick, crClose,
      crDraw, crTouch},
     {"Lookout", "Channel analyzer", "Lookout", theme::kGood, lkOpen, lkTick,
      lkClose, lkDraw, lkTouch},
@@ -1795,19 +1908,19 @@ static const Tool kTools[] = {
      rwClose, rwDraw, rwTouch},
     {"Hull Inspection", "Network audit", "Hull", theme::kGold, hiOpen, hiTick,
      hiClose, hiDraw, hiTouch},
-    {"Captain's Log", "SD + WiGLE", "Log", theme::kSail, clOpen, clTick, clClose,
-     clDraw, clTouch},
-    {"Ship's Systems", "Diagnostics", "Systems", theme::kSeaFoam, ssOpen, ssTick,
+    {"Captain's Log", "SD + WiGLE", "Log", theme::kBorderHi, clOpen, clTick,
+     clClose, clDraw, clTouch},
+    {"Ship's Systems", "Diagnostics", "Systems", theme::kCyan, ssOpen, ssTick,
      ssClose, ssDraw, ssTouch},
-    {"Signal Lantern", "RGB LED / FX", "Lantern", theme::kSun, slOpen, slTick,
+    {"Signal Lantern", "RGB LED / FX", "Lantern", theme::kGold, slOpen, slTick,
      slClose, slDraw, slTouch},
-    {"Probe Watch", "Client sniffer", "Probe", theme::kSail, pwOpen, pwTick,
+    {"Probe Watch", "Client sniffer", "Probe", theme::kTeal, pwOpen, pwTick,
      pwClose, pwDraw, pwTouch},
-    {"Deep BLE ID", "Adv decoder", "BLE ID", theme::kSeaFoam, dbOpen, dbTick,
+    {"Deep BLE ID", "Adv decoder", "BLE ID", theme::kCyan, dbOpen, dbTick,
      dbClose, dbDraw, dbTouch},
     {"Instruments", "Onboard sensors", "Sensors", theme::kGold, siOpen, siTick,
      siClose, siDraw, siTouch},
-    {"Settings Cabin", "Options", "Settings", theme::kInkDim, seOpen, seTick,
+    {"Settings Cabin", "Options", "Settings", theme::kBorderHi, seOpen, seTick,
      seClose, seDraw, seTouch},
 };
 

@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.4.2"
+#define PP_VERSION "0.5.0"
 #endif
 
 using gfxu::blend565;
@@ -593,10 +593,11 @@ void drawMenu() {
 
   const int stripY = theme::kHeaderH + 2;
   canvas.fillRect(0, stripY, theme::kScreenW, 14, theme::kPanelSoft);
-  canvas.setTextColor(theme::kInkDim);
+  canvas.drawFastHLine(0, stripY + 13, theme::kScreenW, theme::kBorderHi);
+  canvas.setTextColor(theme::kTeal);
   canvas.setTextSize(1);
   canvas.setCursor(6, stripY + 3);
-  canvas.print("Choose a station");
+  canvas.print("Ship OS · Stations");
   canvas.setTextColor(theme::kInkMuted);
   canvas.setCursor(theme::kScreenW - 34, stripY + 3);
   canvas.printf("%d/%d", g_menuPage + 1, pages);
@@ -616,14 +617,14 @@ void drawMenu() {
     int tx = x0 + col * (tileW + gap);
     int ty = y0 + row * (tileH + gap);
     const tools::Tool& t = tools::at(i);
-    canvas.fillRoundRect(tx, ty, tileW, tileH, 7, theme::kPanel);
-    canvas.drawRoundRect(tx, ty, tileW, tileH, 7, theme::kBorder);
-    canvas.fillRect(tx, ty + 2, 3, tileH - 4, t.accent);
-    gfxu::drawGlyph(canvas, tx + 16, ty + tileH / 2, 10, i, t.accent);
-    // Short tile label only — full title/subtitle live in the tool header.
+    // Elevated opaque tile + hairline accent (Pirate Cabin, not crayon).
+    canvas.fillRoundRect(tx, ty, tileW, tileH, 6, theme::kPanelElev);
+    canvas.drawRoundRect(tx, ty, tileW, tileH, 6, theme::kBorder);
+    canvas.fillRect(tx + 1, ty + 3, theme::kAccentW, tileH - 6, t.accent);
+    gfxu::drawGlyph(canvas, tx + 18, ty + tileH / 2 - 4, 9, i, t.accent);
     const char* label = (t.tile && t.tile[0]) ? t.tile : t.title;
-    gfxu::printCentered(canvas, tx + 28, ty, tileW - 32, tileH, theme::kInk, 1,
-                        label);
+    gfxu::printCentered(canvas, tx + 4, ty + tileH / 2 + 2, tileW - 8, 12,
+                        theme::kInk, 1, label);
   }
 
   // bottom bar: back + pager, full width
@@ -649,18 +650,51 @@ void drawMenu() {
 }
 
 void drawToolHeader() {
+  // Ship OS 2026 shared chrome: back + glyph + title + BAT% + GPS badges.
   const tools::Tool& t = tools::at(g_toolIndex);
   const int hh = theme::kToolHeaderH;
   canvas.fillRect(0, 0, theme::kScreenW, hh, theme::kBgDeep);
-  canvas.fillRect(0, 0, 4, hh, t.accent);
-  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kBorder);
-  canvas.fillRoundRect(8, 6, 52, hh - 12, 6, theme::kPanelSoft);
-  canvas.drawRoundRect(8, 6, 52, hh - 12, 6, theme::kBorder);
-  gfxu::printCentered(canvas, 8, 6, 52, hh - 12, theme::kInk, 1, "< Back");
-  gfxu::drawGlyph(canvas, 78, hh / 2, 9, g_toolIndex, t.accent);
-  gfxu::printFit(canvas, 92, 6, theme::kScreenW - 98, theme::kInk, 2, t.title);
-  gfxu::printFit(canvas, 92, 24, theme::kScreenW - 98, theme::kInkDim, 1,
-                 t.subtitle);
+  canvas.fillRect(0, 0, theme::kAccentW, hh, t.accent);  // hairline stripe
+  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kBorderHi);
+  canvas.drawFastHLine(0, hh, theme::kScreenW, theme::kBorder);
+
+  // Back chip (hit zone x<64 in handleTap)
+  canvas.fillRoundRect(6, 5, 48, hh - 10, 5, theme::kPanelSoft);
+  canvas.drawRoundRect(6, 5, 48, hh - 10, 5, theme::kBorderHi);
+  gfxu::printCentered(canvas, 6, 5, 48, hh - 10, theme::kInk, 1, "< Back");
+
+  gfxu::drawGlyph(canvas, 68, hh / 2, 8, g_toolIndex, t.accent);
+
+  // Title / subtitle — leave room for status badges on the right
+  const int titleMax = theme::kScreenW - 168;
+  gfxu::printFit(canvas, 82, 5, titleMax, theme::kInk, 1, t.title);
+  gfxu::printFit(canvas, 82, 17, titleMax, theme::kInkMuted, 1, t.subtitle);
+
+  // Status badges: battery + GPS (Ship OS persistent chrome)
+  char bat[10];
+  int pct = power::batteryPct();
+  if (power::usbPowered())
+    snprintf(bat, sizeof(bat), "%s", power::powerLabel());
+  else
+    snprintf(bat, sizeof(bat), "%d%%", pct);
+  uint16_t batFg = power::lowBattery() ? theme::kBad
+                                       : (power::usbPowered() ? theme::kGood
+                                                              : theme::kTeal);
+  gfxu::drawBadge(canvas, 214, 6, 48, 12, bat, batFg);
+  bool fix = gps::hasFix();
+  char gpsLab[10];
+  snprintf(gpsLab, sizeof(gpsLab), "GPS:%s", gps::statusLabel());
+  if ((int)strlen(gpsLab) > 9) {
+    snprintf(gpsLab, sizeof(gpsLab), "%s", gps::statusLabel());
+  }
+  gfxu::drawBadge(canvas, 266, 6, 50, 12, gpsLab,
+                  fix ? theme::kGood : theme::kInkMuted);
+  // Second row micro-status under badges
+  canvas.setTextSize(1);
+  canvas.setTextColor(theme::kInkMuted);
+  canvas.setCursor(214, 22);
+  canvas.printf("SD:%s B%d", app::sdReady() ? "ok" : "--",
+                (int)app::brightness());
 }
 
 // ---------------------------------------------------------------------------
