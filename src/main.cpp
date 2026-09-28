@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.5"
+#define PP_VERSION "0.5.6"
 #endif
 
 using gfxu::blend565;
