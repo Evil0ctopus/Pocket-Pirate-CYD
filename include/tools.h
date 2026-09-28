@@ -38,8 +38,10 @@ const Tool& at(int i);
 int lastWifiCount();
 int lastBleCount();
 
-// Global RF pump — call every loop (even on Menu/World) so leave-teardown
-// finishes and never blocks a tap. Stations only arm via onOpen/onClose.
+// Start FreeRTOS RF worker (call once from setup). UI loop must never call
+// WiFi.* directly — the worker owns the radio and yields between opcodes.
+void rfBegin();
+// Legacy no-op kept so older call sites compile; worker pumps itself.
 void rfService();
 // Companion / debug: phase, want, last scanComplete, last phase ms.
 int rfPhase();
