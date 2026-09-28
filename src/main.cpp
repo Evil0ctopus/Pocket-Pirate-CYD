@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.0"
+#define PP_VERSION "0.5.1"
 #endif
 
 using gfxu::blend565;
@@ -621,9 +621,9 @@ void drawMenu() {
     canvas.fillRoundRect(tx, ty, tileW, tileH, 6, theme::kPanelElev);
     canvas.drawRoundRect(tx, ty, tileW, tileH, 6, theme::kBorder);
     canvas.fillRect(tx + 1, ty + 3, theme::kAccentW, tileH - 6, t.accent);
-    gfxu::drawGlyph(canvas, tx + 18, ty + tileH / 2 - 4, 9, i, t.accent);
+    gfxu::drawGlyph(canvas, tx + tileW / 2, ty + 16, 11, i, t.accent);
     const char* label = (t.tile && t.tile[0]) ? t.tile : t.title;
-    gfxu::printCentered(canvas, tx + 4, ty + tileH / 2 + 2, tileW - 8, 12,
+    gfxu::printCentered(canvas, tx + 4, ty + tileH - 16, tileW - 8, 12,
                         theme::kInk, 1, label);
   }
 
@@ -663,7 +663,7 @@ void drawToolHeader() {
   canvas.drawRoundRect(6, 5, 48, hh - 10, 5, theme::kBorderHi);
   gfxu::printCentered(canvas, 6, 5, 48, hh - 10, theme::kInk, 1, "< Back");
 
-  gfxu::drawGlyph(canvas, 68, hh / 2, 8, g_toolIndex, t.accent);
+  gfxu::drawGlyph(canvas, 70, hh / 2, 10, g_toolIndex, t.accent);
 
   // Title / subtitle — leave room for status badges on the right
   const int titleMax = theme::kScreenW - 168;
@@ -1141,15 +1141,20 @@ void loop() {
     int idx = g_pendingToolOpen;
     g_pendingToolOpen = -1;
     if (g_screen == Screen::Tool && g_toolIndex == idx) {
+      // onOpen is arm-only for Wi-Fi (no WiFi.mode here) — stays snappy.
       tools::at(idx).onOpen();
+      // Allow a quick follow-up paint once RF phases start (not a double present
+      // in handleTap — chrome already pushed).
+      g_lastDraw = now - 280;
     }
   }
 
   if (g_screen == Screen::Tool && g_toolIndex >= 0)
     tools::at(g_toolIndex).onTick(now);
 
-  // Redraw cadence: world ~5 fps; menu dirty-flagged; tools slower.
+  // Redraw cadence: world ~5 fps; menu dirty-flagged; tools ~3 fps.
   // Touch is polled above so a mid-frame tap still lands next iteration.
+  // Tool path redraws BODY only (header already on canvas) — no double header.
   if (g_screen == Screen::World && now - g_lastDraw > 200) {
     g_lastDraw = now;
     g_anim = (g_anim + 1) % 8;
