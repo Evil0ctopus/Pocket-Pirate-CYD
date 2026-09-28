@@ -25,7 +25,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.4"
+#define PP_VERSION "0.5.6"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -373,6 +373,7 @@ void wifiRfStartWorker() {
 
 void wifiScanService() { /* RF worker pumps itself */ }
 
+// Short chip label (list rows / KPIs) — from ESP32 wifi_auth_mode_t.
 const char* encLabel(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN: return "OPEN";
@@ -383,8 +384,40 @@ const char* encLabel(wifi_auth_mode_t m) {
     case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
     case WIFI_AUTH_WPA3_PSK: return "WPA3";
     case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/3";
+#ifdef WIFI_AUTH_WAPI_PSK
+    case WIFI_AUTH_WAPI_PSK: return "WAPI";
+#endif
+#ifdef WIFI_AUTH_OWE
+    case WIFI_AUTH_OWE: return "OWE";
+#endif
     default: return "?";
   }
+}
+// Longer detail-sheet auth string (still ESP32 scan enum).
+const char* encLabelLong(wifi_auth_mode_t m) {
+  switch (m) {
+    case WIFI_AUTH_OPEN: return "Open (no auth)";
+    case WIFI_AUTH_WEP: return "WEP (weak)";
+    case WIFI_AUTH_WPA_PSK: return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2-PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Enterprise";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3-SAE";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+#ifdef WIFI_AUTH_WAPI_PSK
+    case WIFI_AUTH_WAPI_PSK: return "WAPI-PSK";
+#endif
+#ifdef WIFI_AUTH_OWE
+    case WIFI_AUTH_OWE: return "OWE (opp.)";
+#endif
+    default: return "Unknown auth";
+  }
+}
+// Band hint from channel number (ESP32 scan channel field).
+const char* bandFromChannel(uint8_t ch) {
+  if (ch >= 1 && ch <= 14) return "2.4 GHz";
+  if (ch >= 36 && ch <= 177) return "5 GHz";
+  return "RF ?";
 }
 // 0 great, 1 ok, 2 warn, 3 danger
 int encRisk(wifi_auth_mode_t m) {
@@ -615,7 +648,7 @@ void bleTick(uint32_t now) {
 }  // namespace
 
 // ===========================================================================
-//  1. Crow's Nest -- Wi-Fi survey (sort / filter / detail / scroll)
+//  1. Crow's Nest -- Wi-Fi survey (sort / filter / detail / watch / save)
 // ===========================================================================
 namespace {
 struct CnNet {
@@ -633,9 +666,90 @@ int cnScroll = 0;          // first visible row
 int cnSort = 0;            // 0=RSSI 1=CH 2=SSID
 int cnFilter = 0;          // 0=All 1=Open 2=Secure
 int cnDetail = -1;         // index into cnNets, or -1
+uint8_t cnDetailBssid[6] = {0};
 
 int cnVisibleIdx[48];
 int cnVisibleCount = 0;
+
+// Pin/Watch — passive RSSI time series for one BSSID (no associate / TX).
+bool cnWatching = false;
+uint8_t cnWatchBssid[6] = {0};
+static constexpr int kCnHist = 48;
+int8_t cnRssiHist[kCnHist];
+uint8_t cnRssiHistCount = 0;
+uint8_t cnRssiHistHead = 0;
+int32_t cnWatchLastRssi = -127;
+bool cnWatchHaveSample = false;
+
+void cnPushRssi(int32_t rssi) {
+  int v = rssi;
+  if (v < -127) v = -127;
+  if (v > 0) v = 0;
+  cnRssiHist[cnRssiHistHead] = (int8_t)v;
+  cnRssiHistHead = (uint8_t)((cnRssiHistHead + 1) % kCnHist);
+  if (cnRssiHistCount < kCnHist) cnRssiHistCount++;
+  cnWatchLastRssi = rssi;
+  cnWatchHaveSample = true;
+}
+
+void cnClearWatchHist() {
+  cnRssiHistCount = 0;
+  cnRssiHistHead = 0;
+  cnWatchHaveSample = false;
+  cnWatchLastRssi = -127;
+}
+
+int cnFindBssid(const uint8_t* b) {
+  for (int i = 0; i < cnCount; i++) {
+    if (memcmp(cnNets[i].bssid, b, 6) == 0) return i;
+  }
+  return -1;
+}
+
+bool cnBssidEq(const uint8_t* a, const uint8_t* b) {
+  return memcmp(a, b, 6) == 0;
+}
+
+void cnFmtMac(char* out, size_t n, const uint8_t* b) {
+  snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3],
+           b[4], b[5]);
+}
+
+void cnDrawSparkline(int x, int y, int w, int h) {
+  auto& g = G();
+  g.fillRect(x, y, w, h, theme::kPanelSoft);
+  g.drawRect(x, y, w, h, theme::kBorder);
+  if (cnRssiHistCount < 2) {
+    txt(x + 4, y + (h / 2) - 4, theme::kInkMuted, 1, "watching…");
+    return;
+  }
+  // Map RSSI -90..-30 dBm into sparkline height.
+  const int n = cnRssiHistCount;
+  int start = ((int)cnRssiHistHead - n + kCnHist) % kCnHist;
+  auto sampleY = [&](int8_t rssi) -> int {
+    int r = (int)rssi;
+    if (r < -90) r = -90;
+    if (r > -30) r = -30;
+    int t = r - (-90);           // 0..60
+    int py = h - 3 - (t * (h - 6)) / 60;
+    if (py < 2) py = 2;
+    if (py > h - 3) py = h - 3;
+    return y + py;
+  };
+  int x0 = x + 2;
+  int prevX = x0;
+  int prevY = sampleY(cnRssiHist[start]);
+  for (int i = 1; i < n; i++) {
+    int idx = (start + i) % kCnHist;
+    int xi = x0 + (i * (w - 4)) / (n - 1);
+    int yi = sampleY(cnRssiHist[idx]);
+    g.drawLine(prevX, prevY, xi, yi, theme::kTeal);
+    prevX = xi;
+    prevY = yi;
+  }
+  // Latest pip
+  g.fillRect(prevX - 1, prevY - 1, 3, 3, theme::kGold);
+}
 
 void cnRebuildVisible() {
   cnVisibleCount = 0;
@@ -688,6 +802,94 @@ void cnCapture(int st) {
   }
   g_lastWifiCount = cnCount;
   cnRebuildVisible();
+  // Re-bind detail / watch by BSSID — scan order changes each sweep.
+  if (cnDetail >= 0) {
+    int i = cnFindBssid(cnDetailBssid);
+    cnDetail = i;
+  }
+  if (cnWatching) {
+    int i = cnFindBssid(cnWatchBssid);
+    if (i >= 0) cnPushRssi(cnNets[i].rssi);
+  }
+}
+
+// Snapshot current Nest buffer → /log/nest_*.csv (Chart Room / Captain's Log style).
+bool cnSaveSurvey(char* pathOut, size_t pathN) {
+  if (pathOut && pathN) pathOut[0] = 0;
+  if (!app::sdReady()) {
+    tools::toast("Save fail — no SD");
+    return false;
+  }
+  if (cnCount <= 0) {
+    tools::toast("Save fail — empty Nest");
+    return false;
+  }
+  if (!SD_MMC.exists("/log")) {
+    if (!SD_MMC.mkdir("/log")) {
+      tools::toast("Save fail — mkdir /log");
+      return false;
+    }
+  }
+  char ts[24];
+  char name[48];
+  if (gps::formatTimestamp(ts, sizeof(ts))) {
+    // YYYY-MM-DD HH:MM:SS → nest_YYYYMMDD_HHMMSS.csv
+    char compact[20];
+    int p = 0;
+    for (const char* c = ts; *c && p < (int)sizeof(compact) - 1; ++c) {
+      if (*c >= '0' && *c <= '9') compact[p++] = *c;
+    }
+    compact[p] = 0;
+    if (p >= 14)
+      snprintf(name, sizeof(name), "nest_%.8s_%.6s.csv", compact, compact + 8);
+    else
+      snprintf(name, sizeof(name), "nest_%lu.csv", (unsigned long)(millis() / 1000));
+  } else {
+    snprintf(name, sizeof(name), "nest_%lu.csv", (unsigned long)(millis() / 1000));
+    snprintf(ts, sizeof(ts), "uptime-%lu", (unsigned long)(millis() / 1000));
+  }
+  char path[64];
+  snprintf(path, sizeof(path), "/log/%s", name);
+  if (pathOut && pathN) snprintf(pathOut, pathN, "%s", path);
+
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (!f) {
+    tools::toast("Save fail — open");
+    return false;
+  }
+  f.println(
+      "timestamp,SSID,BSSID,RSSI,channel,auth,vendor,lat,lon,alt");
+  bool fix = gps::hasFix();
+  double lat = fix ? gps::latitude() : 0.0;
+  double lon = fix ? gps::longitude() : 0.0;
+  double alt = fix ? gps::altitudeM() : 0.0;
+  for (int i = 0; i < cnCount; i++) {
+    const CnNet& n = cnNets[i];
+    char bssid[18];
+    cnFmtMac(bssid, sizeof(bssid), n.bssid);
+    char ssid[33];
+    strncpy(ssid, n.ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = 0;
+    for (char* p = ssid; *p; ++p)
+      if (*p == ',' || *p == '\n' || *p == '\r') *p = ' ';
+    const char* ven = oui::vendor(n.bssid);
+    char vendor[24];
+    strncpy(vendor, ven[0] ? ven : "unknown", sizeof(vendor) - 1);
+    vendor[sizeof(vendor) - 1] = 0;
+    for (char* p = vendor; *p; ++p)
+      if (*p == ',') *p = ' ';
+    if (fix) {
+      f.printf("%s,%s,%s,%d,%u,%s,%s,%.6f,%.6f,%.1f\n", ts, ssid, bssid,
+               (int)n.rssi, (unsigned)n.channel, encLabel(n.auth), vendor, lat,
+               lon, alt);
+    } else {
+      f.printf("%s,%s,%s,%d,%u,%s,%s,,,\n", ts, ssid, bssid, (int)n.rssi,
+               (unsigned)n.channel, encLabel(n.auth), vendor);
+    }
+  }
+  f.close();
+  tools::toast("Saved %d → %s", cnCount, name);
+  return true;
 }
 
 void cnOpen() {
@@ -696,6 +898,7 @@ void cnOpen() {
   cnScroll = 0;
   cnFilter = 0;  // never open into a filter that hides every row
   cnSort = 0;
+  // Keep an active watch across reopen so Pin survives Back→Nest.
   wifiScanBegin();  // arm only — RF deferred
   cnLast = millis();
 }
@@ -712,9 +915,16 @@ void cnTick(uint32_t now) {
         if (game::awardXp(3)) tools::toast("Level up!");
       }
     }
-    tools::toast("Charted %d networks", st);
+    if (!cnWatching) tools::toast("Charted %d networks", st);
   }
-  if (st < 0 && now - cnLast > 8000) {
+  // Passive refresh while watching or viewing detail (RSSI updates / sparkline).
+  const bool wantRefresh = cnWatching || cnDetail >= 0;
+  const uint32_t refreshMs = cnWatching ? 3500u : 5000u;
+  if (wantRefresh && st >= 0 && st == cnProcessed && now - cnLast > refreshMs) {
+    wifiScanBegin();
+    cnLast = now;
+    cnProcessed = -1;
+  } else if (st < 0 && now - cnLast > 8000) {
     wifiScanBegin();
     cnLast = now;
   }
@@ -722,37 +932,71 @@ void cnTick(uint32_t now) {
 void cnClose() {
   wifiRfLeave();
   cnDetail = -1;
+  // Watch state intentionally kept so reopening Nest resumes the pin.
 }
 void cnDrawDetail(int x, int y, int w, int h) {
   body(x, y, w, h);
   if (cnDetail < 0 || cnDetail >= cnCount) {
     txt(x + 8, y + 8, theme::kInkDim, 1, "No network selected.");
+    btn(x + 8, y + h - 30, 90, 24, "BACK", false);
     return;
   }
   const CnNet& n = cnNets[cnDetail];
   char mac[18];
-  snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", n.bssid[0],
-           n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5]);
+  cnFmtMac(mac, sizeof(mac), n.bssid);
   const char* ven = oui::vendor(n.bssid);
-  // Detail sheet hero KPIs
-  char vRssi[8], vCh[8], vRisk[8];
+  const char* band = bandFromChannel(n.channel);
+  int risk = encRisk(n.auth);
+  uint16_t rc = riskColor(risk);
+
+  // Detail sheet hero KPIs — RSSI / channel+band / auth (risk-colored)
+  char vRssi[8], vCh[12], vAuth[10];
   snprintf(vRssi, sizeof(vRssi), "%d", (int)n.rssi);
   snprintf(vCh, sizeof(vCh), "%u", (unsigned)n.channel);
-  snprintf(vRisk, sizeof(vRisk), "%s", encLabel(n.auth));
-  const char* vals[] = {vRssi, vCh, vRisk};
-  const char* labs[] = {"dBm", "channel", "auth"};
-  uint16_t cols[] = {theme::kTeal, theme::kCyan, riskColor(encRisk(n.auth))};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
+  snprintf(vAuth, sizeof(vAuth), "%s", encLabel(n.auth));
+  const char* vals[] = {vRssi, vCh, vAuth};
+  char labCh[12];
+  snprintf(labCh, sizeof(labCh), "%s", band);  // e.g. "2.4 GHz"
+  const char* labs[] = {"dBm", labCh, "auth"};
+  uint16_t cols[] = {theme::kTeal, theme::kCyan, rc};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
+
   char buf[48];
   snprintf(buf, sizeof(buf), "%s", n.ssid);
-  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "SSID", buf, theme::kInk);
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 16, "SSID", buf, theme::kInk);
   snprintf(buf, sizeof(buf), "%s", mac);
-  gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "BSSID", buf, theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 18, w - 12, 16, "BSSID", buf, theme::kCyan);
   snprintf(buf, sizeof(buf), "%s", ven[0] ? ven : "unknown");
-  gfxu::drawKVRow(G(), x + 6, below + 44, w - 12, 18, "Vendor", buf, theme::kTeal);
-  rssiBars(x + w - 36, below + 70, n.rssi);
-  btn(x + 8, y + h - 30, 90, 24, "BACK", false);
-  btn(x + 110, y + h - 30, 100, 24, "RESCAN", true);
+  gfxu::drawKVRow(G(), x + 6, below + 36, w - 12, 16, "Vendor", buf, theme::kTeal);
+  snprintf(buf, sizeof(buf), "ch%u · %s", (unsigned)n.channel, band);
+  gfxu::drawKVRow(G(), x + 6, below + 54, w - 12, 16, "Band", buf, theme::kCyan);
+  snprintf(buf, sizeof(buf), "%s", encLabelLong(n.auth));
+  gfxu::drawKVRow(G(), x + 6, below + 72, w - 12, 16, "Auth", buf, rc);
+
+  bool watchingThis = cnWatching && cnBssidEq(cnWatchBssid, n.bssid);
+  int sparkY = below + 92;
+  if (watchingThis) {
+    char wr[40];
+    if (cnWatchHaveSample)
+      snprintf(wr, sizeof(wr), "Watch %d dBm · %u samples", (int)cnWatchLastRssi,
+               (unsigned)cnRssiHistCount);
+    else
+      snprintf(wr, sizeof(wr), "Watch armed · waiting for sweep");
+    txt(x + 8, sparkY, theme::kGold, 1, "%s", wr);
+    cnDrawSparkline(x + 6, sparkY + 12, w - 48, 28);
+    rssiBars(x + w - 36, sparkY + 18, cnWatchHaveSample ? (int)cnWatchLastRssi
+                                                        : (int)n.rssi);
+  } else {
+    rssiBars(x + w - 36, sparkY, n.rssi);
+    txt(x + 8, sparkY + 4, theme::kInkMuted, 1, "Tap WATCH to pin RSSI");
+  }
+
+  // BACK | WATCH | SAVE
+  btn(x + 6, y + h - 30, 70, 24, "BACK", false);
+  btn(x + 82, y + h - 30, 78, 24, watchingThis ? "UNPIN" : "WATCH",
+      watchingThis, watchingThis ? theme::kGold : 0);
+  btn(x + 166, y + h - 30, 70, 24, "SAVE", true);
+  btn(x + 242, y + h - 30, 70, 24, "SCAN", false);
 }
 
 void cnDrawList(int x, int y, int w, int h) {
@@ -782,7 +1026,7 @@ void cnDrawList(int x, int y, int w, int h) {
                      theme::kCyan};
   int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
 
-  // Field Tablet chip toolbar
+  // Field Tablet chip toolbar — sort / filter / SAVE
   gfxu::drawToolbar(G(), x + 4, below, w - 8, 20);
   const char* sorts[] = {"RSSI", "CH", "SSID"};
   for (int i = 0; i < 3; i++) {
@@ -791,10 +1035,13 @@ void cnDrawList(int x, int y, int w, int h) {
   }
   const char* filters[] = {"All", "Open", "Sec"};
   for (int i = 0; i < 3; i++) {
-    int bx = x + 136 + i * 36;
-    chip(bx, below + 2, 34, theme::kChipH, filters[i], cnFilter == i,
+    int bx = x + 130 + i * 34;
+    chip(bx, below + 2, 32, theme::kChipH, filters[i], cnFilter == i,
          theme::kTeal);
   }
+  chip(x + 236, below + 2, 44, theme::kChipH, "SAVE", false, theme::kGold);
+  if (cnWatching)
+    chip(x + 284, below + 2, 28, theme::kChipH, "PIN", true, theme::kWarn);
 
   constexpr int kRh = theme::kRowH;
   const int listTop = below + 22;
@@ -805,7 +1052,7 @@ void cnDrawList(int x, int y, int w, int h) {
   if (st < 0 && cnCount == 0) {
     txt(x + 12, listTop + 4, theme::kInkDim, 1, "Sweeping the horizon...");
     txt(x + 12, listTop + 16, theme::kInkMuted, 1, "passive scan · no associate");
-    txt(x + 8, y + h - 10, theme::kInkMuted, 1, "Tap empty = rescan");
+    txt(x + 8, y + h - 10, theme::kInkMuted, 1, "SAVE=/log · tap empty=rescan");
     return;
   }
 
@@ -818,17 +1065,20 @@ void cnDrawList(int x, int y, int w, int h) {
     const CnNet& n = cnNets[idx];
     int ry = listTop + r * kRh;
     if (r & 1) G().fillRect(x + 4, ry, w - 32, kRh, theme::kPanelSoft);
+    bool pinned = cnWatching && cnBssidEq(cnWatchBssid, n.bssid);
+    if (pinned) G().fillRect(x + 4, ry, 3, kRh, theme::kGold);
     rssiBars(x + 8, ry + 4, n.rssi);
     char ssid[18];
     strncpy(ssid, n.ssid, 17);
     ssid[17] = 0;
-    txt(x + 28, ry + 2, theme::kInk, 1, "%s", ssid);
+    txt(x + 28, ry + 2, pinned ? theme::kGold : theme::kInk, 1, "%s", ssid);
     const char* ven = oui::vendor(n.bssid);
+    const char* band = bandFromChannel(n.channel);
     char sec[28];
     if (ven[0])
       snprintf(sec, sizeof(sec), "%s  ch%u", ven, (unsigned)n.channel);
     else
-      snprintf(sec, sizeof(sec), "ch%u", (unsigned)n.channel);
+      snprintf(sec, sizeof(sec), "%s ch%u", band, (unsigned)n.channel);
     if (strlen(sec) > 22) sec[22] = 0;
     txt(x + 28, ry + 10, theme::kInkMuted, 1, "%s", sec);
     txt(x + 234, ry + 5, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
@@ -847,7 +1097,9 @@ void cnDrawList(int x, int y, int w, int h) {
     btn(x + w - 30, listTop, 26, 20, "^", false);
   if (cnScroll + kRows < cnVisibleCount)
     btn(x + w - 30, y + h - 28, 26, 20, "v", false);
-  txt(x + 8, y + h - 10, theme::kInkMuted, 1, "Tap row = detail · empty = rescan");
+  txt(x + 8, y + h - 10, theme::kInkMuted, 1,
+      cnWatching ? "PIN active · row=detail · SAVE=/log"
+                 : "Tap row=detail · SAVE=/log · empty=rescan");
 }
 void cnDraw(int x, int y, int w, int h) {
   if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
@@ -866,22 +1118,46 @@ bool cnTouch(int16_t x, int16_t y) {
   const int kRows = max(1, (kListBot - kListTop) / kRh);
   if (cnDetail >= 0) {
     if (ly >= 204 && ly <= 240) {
-      if (cx >= 8 && cx <= 100) {
+      if (cx >= 6 && cx <= 76) {
         cnDetail = -1;
         return true;
       }
-      if (cx >= 110 && cx <= 220) {
-        cnDetail = -1;
+      if (cx >= 82 && cx <= 160) {
+        // WATCH / UNPIN
+        if (cnDetail >= 0 && cnDetail < cnCount) {
+          const CnNet& n = cnNets[cnDetail];
+          if (cnWatching && cnBssidEq(cnWatchBssid, n.bssid)) {
+            cnWatching = false;
+            cnClearWatchHist();
+            tools::toast("Watch cleared");
+          } else {
+            memcpy(cnWatchBssid, n.bssid, 6);
+            cnWatching = true;
+            cnClearWatchHist();
+            cnPushRssi(n.rssi);
+            tools::toast("Watching BSSID");
+            wifiScanBegin();
+            cnLast = millis();
+            cnProcessed = -1;
+          }
+        }
+        return true;
+      }
+      if (cx >= 166 && cx <= 236) {
+        cnSaveSurvey(nullptr, 0);
+        return true;
+      }
+      if (cx >= 242 && cx <= 312) {
         wifiScanBegin();
         cnLast = millis();
         cnProcessed = -1;
         return true;
       }
     }
-    cnDetail = -1;
+    // Tap elsewhere on detail keeps the sheet (don't dismiss accidentally).
     return true;
   }
-  // Sort / filter chips in toolbar
+  // Sort / filter / SAVE chips in toolbar
   if (ly >= kToolbarY && ly <= kToolbarY + 22) {
     for (int i = 0; i < 3; i++) {
       int bx = 8 + i * 40;
@@ -892,13 +1168,28 @@ bool cnTouch(int16_t x, int16_t y) {
       }
     }
     for (int i = 0; i < 3; i++) {
-      int bx = 136 + i * 36;
-      if (cx >= bx && cx <= bx + 34) {
+      int bx = 130 + i * 34;
+      if (cx >= bx && cx <= bx + 32) {
         cnFilter = i;
         cnScroll = 0;
         cnRebuildVisible();
         return true;
       }
+    }
+    if (cx >= 236 && cx <= 280) {
+      cnSaveSurvey(nullptr, 0);
+      return true;
+    }
+    if (cx >= 284 && cx <= 312 && cnWatching) {
+      // Jump to watched AP detail if still in buffer.
+      int i = cnFindBssid(cnWatchBssid);
+      if (i >= 0) {
+        cnDetail = i;
+        memcpy(cnDetailBssid, cnWatchBssid, 6);
+      } else {
+        tools::toast("Pin not in last sweep");
+      }
+      return true;
     }
   }
   if (cx >= 290) {
@@ -915,6 +1206,8 @@ bool cnTouch(int16_t x, int16_t y) {
     int r = (ly - kListTop) / kRh;
     if (r >= 0 && cnScroll + r < cnVisibleCount) {
       cnDetail = cnVisibleIdx[cnScroll + r];
+      if (cnDetail >= 0 && cnDetail < cnCount)
+        memcpy(cnDetailBssid, cnNets[cnDetail].bssid, 6);
       return true;
     }
   }
@@ -1008,7 +1301,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.4,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.6,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -1502,11 +1795,15 @@ bool clIsWigle = false;
 int clWigleRows = 0;
 int clWigleUnique = 0;
 
-void clRefresh() {
-  clCount = 0;
-  clScroll = 0;
-  if (!app::sdReady()) return;
-  File dir = SD_MMC.open("/");
+void clAddEntry(const String& displayName, long size) {
+  if (clCount >= 32) return;
+  clFiles[clCount] = displayName;
+  clSizes[clCount] = size;
+  clCount++;
+}
+
+void clScanDir(const char* dirPath, const char* prefix) {
+  File dir = SD_MMC.open(dirPath);
   if (!dir) return;
   File f = dir.openNextFile();
   while (f && clCount < 32) {
@@ -1514,16 +1811,27 @@ void clRefresh() {
     int slash = n.lastIndexOf('/');
     if (slash >= 0) n = n.substring(slash + 1);
     if (f.isDirectory()) {
-      clFiles[clCount] = String("[") + n + "]";
-      clSizes[clCount] = -1;
+      // Skip nested dirs in /log; skip [log] at root (expanded below).
+      if (prefix && prefix[0]) { /* ignore nested */ }
+      else if (n == "log") { /* expanded via clScanDir("/log") */ }
+      else
+        clAddEntry(String("[") + n + "]", -1);
     } else {
-      clFiles[clCount] = n;
-      clSizes[clCount] = (long)f.size();
+      String shown = prefix && prefix[0] ? (String(prefix) + n) : n;
+      clAddEntry(shown, (long)f.size());
     }
-    clCount++;
     f = dir.openNextFile();
   }
   dir.close();
+}
+
+void clRefresh() {
+  clCount = 0;
+  clScroll = 0;
+  if (!app::sdReady()) return;
+  clScanDir("/", "");
+  // Crow's Nest / Chart Room style logs under /log (skip if already listed as [log]).
+  if (SD_MMC.exists("/log")) clScanDir("/log", "log/");
 }
 
 bool clLooksText(const String& name) {
@@ -1542,7 +1850,8 @@ void clLoadPreview(const String& name) {
   clWigleUnique = 0;
   for (int i = 0; i < 14; i++) clLines[i] = "";
   if (!app::sdReady()) return;
-  String path = String("/") + name;
+  String path = name;
+  if (!path.startsWith("/")) path = String("/") + path;
   File f = SD_MMC.open(path, FILE_READ);
   if (!f) {
     clLines[0] = "(could not open)";

@@ -21,7 +21,7 @@ Pocket-Pirate-CYD comes packed with custom assets and modular features designed 
   * Built-in helper scripts and tools located in the `tools/` directory to assist with asset conversion, flashing workflows, and system debugging.
 * **📦 Modular Firmware Layout:**
   * Cleanly structured codebase utilizing PlatformIO for seamless expansion, custom hardware hooks, and easy deployment.
-* **📡 Passive stations (metadata only):** Crow's Nest Wi-Fi survey (sort/filter/detail), Lookout channel histogram, Chart Room WiGLE CSV logger — **no deauth / injection / handshake capture**.
+* **📡 Passive stations (metadata only):** Crow's Nest Wi-Fi survey (sort/filter/detail/Watch RSSI/Save `/log/nest_*.csv`), Lookout channel histogram, Chart Room WiGLE CSV logger — **no deauth / injection / handshake capture**.
 * **🧭 Optional UART GPS:** Chart Room + Instruments show fix status; WiGLE rows get real lat/lon/alt/UTC when a fix is available (`docs/GPS.md`).
 * **🔋 Power UX:** CHG/FULL/%/LOW labels, dim-on-idle, optional idle deep-sleep + Settings **Sleep now** (touch wake).
 * **📜 Captain's Log:** SD browser with text/CSV preview and on-device WiGLE viewer.
@@ -114,7 +114,7 @@ esptool.py --chip esp32s3 --port PORT write_flash 0x0 \
 
 The `…-app.bin` asset (when published) is for **OTA only** — see [`docs/OTA.md`](docs/OTA.md).
 
-Firmware version string: **0.5.5** (`PP_VERSION`).
+Firmware version string: **0.5.6** (`PP_VERSION`).
 
 ### CI status
 
