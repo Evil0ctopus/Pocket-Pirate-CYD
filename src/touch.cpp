@@ -68,8 +68,7 @@ Point read() {
     if (irq && !wasPressed && millis() > 1500) {
       toLandscape(rawX, rawY, tapX, tapY);
       freshTap = true;
-      Serial.printf("[touch] latched raw=(%u,%u) mapped=(%d,%d)\n", rawX, rawY,
-                    tapX, tapY);
+      // Avoid Serial on hot path — USB-CDC can stall when host isn't draining.
     }
     wasPressed = false;
     return p;
@@ -82,9 +81,7 @@ Point read() {
     freshTap = true;
     tapX = p.x;
     tapY = p.y;
-    // Diagnostic: raw controller coords + the landscape mapping, for verifying
-    // the panel's touch orientation against what the UI expects.
-    Serial.printf("[touch] raw=(%u,%u) mapped=(%d,%d)\n", rawX, rawY, p.x, p.y);
+    // Touch coords diagnostics removed from hot path (USB-CDC stall risk).
   }
   wasPressed = true;
   return p;

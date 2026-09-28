@@ -25,7 +25,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.3"
+#define PP_VERSION "0.5.4"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -87,9 +87,10 @@ void rssiBars(int x, int y, int rssi) {
 // v0.5.1 hang: stacked WiFi.mode/scanDelete/promiscuous while async scan alive.
 // v0.5.2: one opcode per UI loop tick — fixed multi-open wedge, but a single
 // EnsureSta/scanDelete can still block 1–3s and starve touch→present.
-// v0.5.3: RF state machine runs on a pinned FreeRTOS task (core 0). UI only
-// arms flags. Cached scanComplete so draws never call into the driver.
-// One Wi-Fi opcode per worker wake; StartScan no longer doubles scanDelete.
+// v0.5.3: RF state machine on pinned FreeRTOS task (core 0). UI only arms flags.
+// v0.5.4: channel hops go through the worker (no UI-core esp_wifi_*);
+//         BLE stops when WiFi RF arms; LeaveDone respects a newer want;
+//         UI does a single present per navigation (see main.cpp).
 
 enum class RfWant : uint8_t { Idle = 0, Scan, Promisc, Leave };
 enum class RfPhase : uint8_t {
@@ -112,6 +113,7 @@ uint32_t g_rfLastPhaseMs = 0;
 wifi_promiscuous_cb_t g_rfPromiscCb = nullptr;
 int g_rfPromiscChannel = 1;
 bool g_rfPromiscReady = false;
+volatile int g_rfHopTo = 0;  // >0: apply esp_wifi_set_channel on worker
 volatile int g_rfScanCached = WIFI_SCAN_FAILED;  // mirror of scanComplete()
 
 // Snapshot of last completed scan — UI reads ONLY this, never WiFi.* from loop.
@@ -174,21 +176,36 @@ void wifiRfRequest(RfWant want) {
   if (g_rfTask) xTaskNotifyGive(g_rfTask);
 }
 
+void bleStop();  // defined below — WiFi RF and BLE must not overlap
+
 void wifiScanBegin() {
+  bleStop();  // shared radio: kill BLE listen before WiFi scan
   g_rfScanCached = WIFI_SCAN_RUNNING;
   g_rfSnapSt = -999;
   wifiRfRequest(RfWant::Scan);
 }
 
 void wifiPromiscBegin(wifi_promiscuous_cb_t cb, int channel) {
+  bleStop();
   g_rfPromiscCb = cb;
   g_rfPromiscChannel = channel < 1 ? 1 : (channel > 13 ? 13 : channel);
+  g_rfHopTo = 0;
   wifiRfRequest(RfWant::Promisc);
 }
 
 void wifiRfLeave() {
   g_rfPromiscCb = nullptr;
+  g_rfHopTo = 0;
   wifiRfRequest(RfWant::Leave);
+}
+
+// UI-safe channel hop — worker applies under its own WiFi ops.
+void wifiPromiscHop(int channel) {
+  if (channel < 1) channel = 1;
+  if (channel > 13) channel = 13;
+  g_rfPromiscChannel = channel;
+  g_rfHopTo = channel;
+  if (g_rfTask) xTaskNotifyGive(g_rfTask);
 }
 
 // UI-safe: never touches the driver (RF task publishes the mirror).
@@ -253,8 +270,9 @@ void wifiRfServiceOnce() {
       int st = WiFi.scanComplete();
       g_rfScanCached = st;
       if (st == WIFI_SCAN_FAILED) {
-        g_rfWant = RfWant::Idle;
-        g_rfPhase = RfPhase::Idle;
+        if (g_rfWant == RfWant::Scan) g_rfWant = RfWant::Idle;
+        g_rfPhase = (g_rfWant == RfWant::Idle) ? RfPhase::Idle
+                                               : RfPhase::StopPromisc;
         break;
       }
       if (st >= 0) {
@@ -264,8 +282,9 @@ void wifiRfServiceOnce() {
       if (millis() - g_rfScanStartedAt > 12000) {
         WiFi.scanDelete();
         g_rfScanCached = WIFI_SCAN_FAILED;
-        g_rfWant = RfWant::Idle;
-        g_rfPhase = RfPhase::Idle;
+        if (g_rfWant == RfWant::Scan) g_rfWant = RfWant::Idle;
+        g_rfPhase = (g_rfWant == RfWant::Idle) ? RfPhase::Idle
+                                               : RfPhase::StopPromisc;
       }
       break;
     }
@@ -285,19 +304,34 @@ void wifiRfServiceOnce() {
         g_rfPhase = RfPhase::StopPromisc;
         break;
       }
-      wifi_promiscuous_filter_t filt;
-      filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
-      esp_wifi_set_promiscuous_filter(&filt);
-      esp_wifi_set_promiscuous_rx_cb(g_rfPromiscCb);
-      esp_wifi_set_promiscuous(true);
-      esp_wifi_set_channel(g_rfPromiscChannel, WIFI_SECOND_CHAN_NONE);
-      g_rfPromiscReady = true;
+      if (!g_rfPromiscReady) {
+        wifi_promiscuous_filter_t filt;
+        filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(g_rfPromiscCb);
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(g_rfPromiscChannel, WIFI_SECOND_CHAN_NONE);
+        g_rfPromiscReady = true;
+      } else {
+        // Apply UI-requested hop without touching the radio from the UI core.
+        int hop = g_rfHopTo;
+        if (hop > 0) {
+          g_rfHopTo = 0;
+          g_rfPromiscChannel = hop;
+          esp_wifi_set_channel(hop, WIFI_SECOND_CHAN_NONE);
+        }
+      }
       break;
     }
 
     case RfPhase::LeaveDone:
-      g_rfWant = RfWant::Idle;
-      g_rfPhase = RfPhase::Idle;
+      // A newer request may have arrived while Leave was in flight — honor it.
+      if (g_rfWant == RfWant::Leave) {
+        g_rfWant = RfWant::Idle;
+        g_rfPhase = RfPhase::Idle;
+      } else {
+        g_rfPhase = RfPhase::StopPromisc;
+      }
       g_rfPromiscReady = false;
       break;
   }
@@ -320,10 +354,10 @@ void rfTaskFn(void*) {
                  after == RfPhase::EnsureSta || after == RfPhase::StartScan ||
                  after == RfPhase::ArmPromisc || after == RfPhase::LeaveDone);
     if (busy) {
-      vTaskDelay(pdMS_TO_TICKS(2));  // yield to UI between opcodes
+      vTaskDelay(pdMS_TO_TICKS(5));  // yield hard after blocking WiFi.* opcodes
     } else if (after == RfPhase::Scanning || after == RfPhase::PromiscOn) {
-      // Poll scanComplete / hold promisc without starving UI.
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30));
+      // Poll scanComplete / apply hops without starving UI.
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(40));
     } else {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
     }
@@ -566,6 +600,8 @@ void bleStop() {
 }
 
 void bleTick(uint32_t now) {
+  // Shared 2.4 GHz radio — never start BLE while WiFi scan/promisc is armed.
+  if (g_rfWant != RfWant::Idle) return;
   bleEnsureInit();
   if (g_bleScanning) return;
   if (now - g_bleLastScan < 3000) return;
@@ -972,7 +1008,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.3,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.4,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -1347,7 +1383,7 @@ void rwTick(uint32_t now) {
   if (now - rwHopAt > 300) {  // sweep channels so we cover the band
     rwHopAt = now;
     rwChannel = rwChannel >= 13 ? 1 : rwChannel + 1;
-    esp_wifi_set_channel(rwChannel, WIFI_SECOND_CHAN_NONE);
+    wifiPromiscHop(rwChannel);
   }
 }
 void rwClose() { wifiRfLeave(); }
@@ -2021,7 +2057,7 @@ void pwTick(uint32_t now) {
   if (g_rfPromiscReady && now - pwHopAt > 350) {
     pwHopAt = now;
     pwChannel = pwChannel >= 13 ? 1 : pwChannel + 1;
-    esp_wifi_set_channel(pwChannel, WIFI_SECOND_CHAN_NONE);
+    wifiPromiscHop(pwChannel);
   }
   while (pwRewarded < pwCount) {  // xp for each new unique client seen
     pwRewarded++;
