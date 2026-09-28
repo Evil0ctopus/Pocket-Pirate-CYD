@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.3"
+#define PP_VERSION "0.5.4"
 #endif
 
 using gfxu::blend565;
@@ -97,37 +97,14 @@ uint32_t g_lastTapMs = 0;
 uint32_t g_lastDrawMs = 0;
 uint32_t g_tapStamp = 0;
 
+// One SPI burst per frame. Split chrome/body presents caused a double freeze
+// (eye saw chrome, then the world hitch while body SPI ran) — feels like
+// "struggling to load." Build the full frame in PSRAM, then push once.
 static inline void present() {
   uint32_t t0 = millis();
   if (g_canvasOk) canvas.pushSprite(0, 0);
   g_lastPresentMs = millis() - t0;
-}
-
-// Push header/chrome rows first so the eye sees new UI before the rest of the
-// 320×240 SPI burst finishes (~header/240 of total present time).
-static inline void presentChromeFirst(int chromeH) {
-  uint32_t t0 = millis();
-  if (g_canvasOk) {
-    const uint16_t* buf = (const uint16_t*)canvas.getBuffer();
-    if (buf && chromeH > 0 && chromeH < 240) {
-      display.pushImage(0, 0, 320, chromeH, buf);
-      display.pushImage(0, chromeH, 320, 240 - chromeH, buf + (size_t)320 * chromeH);
-    } else {
-      canvas.pushSprite(0, 0);
-    }
-  }
-  g_lastPresentMs = millis() - t0;
-}
-
-static void drawToolSkeleton() {
-  // Empty body under shared header — first paint must not run station onDraw.
-  const int y = theme::kToolHeaderH;
-  canvas.fillRect(0, y, theme::kScreenW, theme::kScreenH - y, theme::kBg);
-  canvas.fillRect(0, y, theme::kScreenW, theme::kKpiH + 4, theme::kPanelSoft);
-  canvas.setTextColor(theme::kInkMuted);
-  canvas.setTextSize(1);
-  canvas.setCursor(10, y + theme::kKpiH + 14);
-  canvas.print("Standing by…");
+  delay(0);  // yield so RF worker / WiFi can run between frames
 }
 
 // ===========================================================================
@@ -191,8 +168,8 @@ Screen g_screen = Screen::World;
 int g_toolIndex = -1;
 int g_menuPage = 0;  // paginated stations grid
 bool g_menuDirty = true;  // menu is static — only redraw when dirty / toast
-int g_pendingToolOpen = -1;  // defer onOpen until after chrome is painted
-int g_pendingToolPaint = -1; // defer station onDraw until after first present
+// Station open/draw happen in the tap handler with a single present — no
+// deferred second SPI push (that was the v0.5.3 hitch).
 constexpr int kMenuPerPage = 9;  // 3 cols x 3 rows
 int g_sel = 0;  // captain carousel index on the select screen
 
@@ -810,11 +787,11 @@ void handleTap(int16_t x, int16_t y) {
         g_lastDraw = millis();
       } else if (x >= theme::kScreenW - 100 && y >= theme::kContentBottom - 4) {
         g_screen = Screen::Menu;
-        g_menuDirty = true;
         uint32_t td0 = millis();
         drawMenu();
         g_lastDrawMs = millis() - td0;
-        presentChromeFirst(theme::kHeaderH);
+        present();
+        g_menuDirty = false;
         g_lastTapMs = millis() - g_tapStamp;
         g_lastDraw = millis();
       } else if (!g_seaView && y > theme::kHeaderH + 20 &&
@@ -822,8 +799,7 @@ void handleTap(int16_t x, int16_t y) {
         g_actClip = art::WAVE;  // tap: the captain waves back and quips
         g_actStart = millis();
         sayRandom();
-        // Chirp is blocking I2S (~64ms) — skip on nav; keep for deck flavor only.
-        audio::tapChirp();
+        // Chirp is blocking I2S — never on the tap path (starves animation).
       }
       break;
     }
@@ -838,24 +814,24 @@ void handleTap(int16_t x, int16_t y) {
           uint32_t td0 = millis();
           drawWorld();
           g_lastDrawMs = millis() - td0;
-          presentChromeFirst(theme::kHeaderH);
+          present();
           g_lastTapMs = millis() - g_tapStamp;
           g_lastDraw = millis();
           return;
         }
         if (pages > 1 && x >= 148 && x <= 184) {  // prev page
           g_menuPage = (g_menuPage + pages - 1) % pages;
-          g_menuDirty = true;
           drawMenu();
           present();
+          g_menuDirty = false;
           g_lastDraw = millis();
           return;
         }
         if (pages > 1 && x >= theme::kScreenW - 44) {  // next page
           g_menuPage = (g_menuPage + 1) % pages;
-          g_menuDirty = true;
           drawMenu();
           present();
+          g_menuDirty = false;
           g_lastDraw = millis();
           return;
         }
@@ -874,18 +850,18 @@ void handleTap(int16_t x, int16_t y) {
         int tx = x0 + col * (tileW + gap);
         int ty = y0 + row * (tileH + gap);
         if (x >= tx && x <= tx + tileW && y >= ty && y <= ty + tileH) {
-          // Paint-first: header + empty skeleton → present BEFORE onOpen/onDraw/RF.
+          // Full frame in RAM → one SPI present. onOpen only arms RF flags.
           uint32_t td0 = millis();
           g_toolIndex = i;
           g_screen = Screen::Tool;
+          tools::at(i).onOpen();
           drawToolHeader();
-          drawToolSkeleton();
+          tools::at(i).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
+                              theme::kScreenH - theme::kToolHeaderH);
           g_lastDrawMs = millis() - td0;
-          presentChromeFirst(theme::kToolHeaderH);
+          present();
           g_lastTapMs = millis() - g_tapStamp;
           g_lastDraw = millis();
-          g_pendingToolOpen = i;
-          g_pendingToolPaint = i;
           Serial.printf("[ui] open station=%d tap_ms=%lu present_ms=%lu draw_ms=%lu\n",
                         i, (unsigned long)g_lastTapMs,
                         (unsigned long)g_lastPresentMs,
@@ -898,16 +874,14 @@ void handleTap(int16_t x, int16_t y) {
 
     case Screen::Tool:
       if (y < theme::kToolHeaderH && x < 64) {
-        // Paint menu FIRST, then arm RF leave — Back must feel instant.
-        g_pendingToolOpen = -1;
-        g_pendingToolPaint = -1;
+        // Menu frame → one present, then arm RF leave (worker owns WiFi.*).
         int closing = g_toolIndex;
         g_screen = Screen::Menu;
-        g_menuDirty = true;
         uint32_t td0 = millis();
         drawMenu();
         g_lastDrawMs = millis() - td0;
-        presentChromeFirst(theme::kHeaderH);
+        present();
+        g_menuDirty = false;
         g_lastTapMs = millis() - g_tapStamp;
         g_lastDraw = millis();
         if (closing >= 0) tools::at(closing).onClose();  // flags only
@@ -1212,30 +1186,6 @@ void loop() {
     now = millis();  // handleTap may have burned time painting
   }
 
-  // Station enter: arm RF flags only (worker owns WiFi.*). Then paint body
-  // on the next slice so first chrome present already happened in handleTap.
-  if (g_pendingToolOpen >= 0) {
-    int idx = g_pendingToolOpen;
-    g_pendingToolOpen = -1;
-    if (g_screen == Screen::Tool && g_toolIndex == idx) {
-      tools::at(idx).onOpen();  // arm only — no WiFi.mode here
-    }
-  }
-
-  if (g_pendingToolPaint >= 0) {
-    int idx = g_pendingToolPaint;
-    g_pendingToolPaint = -1;
-    if (g_screen == Screen::Tool && g_toolIndex == idx) {
-      uint32_t td0 = millis();
-      drawToolHeader();
-      tools::at(idx).onDraw(0, theme::kToolHeaderH, theme::kScreenW,
-                            theme::kScreenH - theme::kToolHeaderH);
-      g_lastDrawMs = millis() - td0;
-      present();
-      g_lastDraw = millis();
-    }
-  }
-
   // RF worker pumps itself on core 0; keep call as documented no-op.
   tools::rfService();
 
@@ -1281,7 +1231,8 @@ void loop() {
   static uint8_t s_lastLevel = 255;
   if (s_lastLevel == 255) s_lastLevel = game::profile.level;
   if (game::profile.level > s_lastLevel) {
-    audio::fanfare();
+    // Fanfare is long blocking I2S — toast only; keep loop animating.
+    tools::toast("Level up! Rank %u", game::profile.level);
     sayRandom();
   }
   s_lastLevel = game::profile.level;
