@@ -6,8 +6,9 @@
 // Reports a single active touch point in *rotated* screen coordinates so the
 // rest of the UI can work in the same 320x240 landscape space it draws in.
 //
-// Edges are queued (not single-slot) and release clears pressed state from an
-// INT ISR so rapid taps during a long SPI present are not dropped.
+// Edges are queued (not single-slot) with a short coalesce window so one
+// physical press yields one action. Release clears pressed state from an INT
+// ISR so rapid re-taps during a long SPI present are not dropped.
 namespace touch {
 
 struct Point {
@@ -20,7 +21,7 @@ void begin();
 // Poll the controller. Returns the current point; `pressed` is false when the
 // panel is not being touched. Safe to call mid-frame / inside present().
 Point read();
-// True when a queued press-edge is available (FIFO, up to 4).
+// True when a coalesced press-edge is available (FIFO, up to 4).
 bool wasTapped(int16_t& x, int16_t& y);
 
 }  // namespace touch

@@ -15,14 +15,29 @@ namespace {
 // still count as a new tap (v0.5.4 missed those).
 volatile bool wasPressed = false;
 
-// Small ring so taps that arrive during present/draw are not overwritten.
+// Small ring so genuine taps that arrive during present/draw are not lost.
+// v0.5.5–0.5.7 flooded this: present()×2 + loop drain re-poll + ev==0 re-edge
+// with no coalesce → one finger → 4–6 actions (Idle cycle, keyboard spam).
 constexpr uint8_t kTapQ = 4;
 int16_t qX[kTapQ] = {};
 int16_t qY[kTapQ] = {};
 uint8_t qHead = 0;
 uint8_t qTail = 0;
 
+// Coalesce window: one logical press → one queued edge. Long enough to absorb
+// bounce / multi-poll during SPI+handleTap, short enough for intentional
+// re-taps (~8/s). Does not reintroduce sticky-wasPressed miss (ISR still
+// clears on release; cooldown only gates pushTap).
+constexpr uint32_t kTapCooldownMs = 120;
+uint32_t lastAcceptedTapMs = 0;
+
 void pushTap(int16_t x, int16_t y) {
+  uint32_t now = millis();
+  if (lastAcceptedTapMs != 0 && (now - lastAcceptedTapMs) < kTapCooldownMs) {
+    return;  // same physical press / bounce — drop
+  }
+  lastAcceptedTapMs = now;
+
   uint8_t next = static_cast<uint8_t>((qHead + 1) % kTapQ);
   if (next == qTail) {
     // Queue full — drop oldest so the newest edge still lands.
@@ -102,12 +117,10 @@ Point read() {
   uint8_t yl = Wire.read();
   uint16_t rawX = static_cast<uint16_t>(((xh & 0x0F) << 8) | xl);
   uint16_t rawY = static_cast<uint16_t>(((yh & 0x0F) << 8) | yl);
-  // P1_XH event: 0=Down, 1=Up, 2=Contact.
-  uint8_t ev = static_cast<uint8_t>((xh >> 6) & 0x03);
 
   if (touches == 0) {
     // Short tap entirely inside a long present: IRQ latched; regs may still
-    // hold the last point.
+    // hold the last point. Cooldown still applies via pushTap.
     if (irq && !wasPressed && millis() > 1500 && coordsPlausible(rawX, rawY)) {
       int16_t x = 0, y = 0;
       toLandscape(rawX, rawY, x, y);
@@ -128,9 +141,10 @@ Point read() {
   toLandscape(rawX, rawY, p.x, p.y);
   p.pressed = true;
 
-  // Rising edge, or controller Down after a missed release between polls.
-  bool newEdge = !wasPressed || (wasPressed && ev == 0);
-  if (newEdge && millis() > 1500) {
+  // Rising-edge only. Do NOT re-fire on FT6336 Down (ev==0) while already
+  // pressed — that was a major multi-fire source in v0.5.5–0.5.7. Missed
+  // releases are handled by ISR / soft-sync clearing wasPressed on INT rise.
+  if (!wasPressed && millis() > 1500) {
     pushTap(p.x, p.y);
   }
   wasPressed = true;

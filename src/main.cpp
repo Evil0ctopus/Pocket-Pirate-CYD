@@ -25,7 +25,7 @@
 using namespace CheapBlackDisplay;
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.7"
+#define PP_VERSION "0.5.8"
 #endif
 
 using gfxu::blend565;
@@ -1173,11 +1173,11 @@ void loop() {
     present();
   }
 
-  // Drain queued press-edges. present() inside handleTap also polls touch, so
-  // rapid taps during SPI land in the FIFO and are handled here without waiting
-  // for the next world/tool redraw cadence.
+  // Latch once, then drain the queue. Re-polling before every wasTapped (plus
+  // present() inside handleTap) used to refill the FIFO from the same press.
+  // touch::read still coalesces via cooldown; this avoids amplifying floods.
+  touch::read();
   for (int n = 0; n < 4; n++) {
-    touch::read();
     int16_t tx, ty;
     if (!touch::wasTapped(tx, ty)) break;
     power::noteActivity(now);
