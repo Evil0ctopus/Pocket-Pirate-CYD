@@ -13,7 +13,6 @@ namespace {
 
 constexpr uint32_t kSampleMs = 500;
 constexpr uint32_t kIdleDimMs = 45000;
-constexpr uint32_t kIdleSleepMs = 180000;  // 3 min after last activity
 constexpr uint32_t kLowToastMs = 30000;
 constexpr int kLowPct = 15;
 constexpr int kFullPct = 97;
@@ -24,7 +23,7 @@ uint32_t g_lastActivity = 0;
 uint32_t g_lastLowToast = 0;
 bool g_dimmed = false;
 uint8_t g_savedBri = 90;
-bool g_idleSleep = false;
+uint8_t g_idleSleepMin = 0;  // 0 / 1 / 3 / 5
 
 uint32_t readRawMv() {
   // Typical CYD battery path: ADC sees half of pack voltage via divider.
@@ -41,6 +40,19 @@ int pctFromMv(uint32_t mv) {
   return (int)((mv - 3300) * 100 / 900);
 }
 
+uint8_t clampIdleMinutes(uint8_t m) {
+  if (m == 1 || m == 3 || m == 5) return m;
+  return 0;
+}
+
+void persistIdleMinutes() {
+  Preferences p;
+  p.begin("set", false);
+  p.putUChar("idlesleep_m", g_idleSleepMin);
+  p.putBool("idlesleep", g_idleSleepMin != 0);  // keep legacy key in sync
+  p.end();
+}
+
 }  // namespace
 
 namespace power {
@@ -51,7 +63,12 @@ void begin() {
   g_lastActivity = millis();
   Preferences p;
   p.begin("set", true);
-  g_idleSleep = p.getBool("idlesleep", false);
+  // Prefer minutes key; migrate from legacy bool when absent.
+  if (p.isKey("idlesleep_m")) {
+    g_idleSleepMin = clampIdleMinutes(p.getUChar("idlesleep_m", 0));
+  } else {
+    g_idleSleepMin = p.getBool("idlesleep", false) ? 3 : 0;
+  }
   p.end();
 }
 
@@ -68,10 +85,14 @@ void tick(uint32_t nowMs) {
     tools::toast("Low battery ~%d%%", batteryPct());
   }
 
-  if (g_idleSleep && nowMs - g_lastActivity >= kIdleSleepMs) {
-    tools::toast("Idle sleep… tap to wake");
-    delay(400);
-    deepSleepNow();
+  if (g_idleSleepMin > 0) {
+    uint32_t timeoutMs = (uint32_t)g_idleSleepMin * 60UL * 1000UL;
+    if (nowMs - g_lastActivity >= timeoutMs) {
+      tools::toast("Idle sleep… tap to wake");
+      // Brief pause so the toast can flush; deep sleep follows immediately.
+      delay(250);
+      deepSleepNow();
+    }
   }
 }
 
@@ -124,15 +145,34 @@ uint8_t applyIdleDim(uint8_t userBrightness, uint32_t nowMs) {
                   : userBrightness;
 }
 
-void setIdleSleep(bool on) {
-  g_idleSleep = on;
-  Preferences p;
-  p.begin("set", false);
-  p.putBool("idlesleep", g_idleSleep);
-  p.end();
+void setIdleSleepMinutes(uint8_t minutes) {
+  g_idleSleepMin = clampIdleMinutes(minutes);
+  persistIdleMinutes();
 }
 
-bool idleSleep() { return g_idleSleep; }
+uint8_t idleSleepMinutes() { return g_idleSleepMin; }
+
+void cycleIdleSleep() {
+  // off → 1m → 3m → 5m → off
+  if (g_idleSleepMin == 0) g_idleSleepMin = 1;
+  else if (g_idleSleepMin == 1) g_idleSleepMin = 3;
+  else if (g_idleSleepMin == 3) g_idleSleepMin = 5;
+  else g_idleSleepMin = 0;
+  persistIdleMinutes();
+}
+
+bool idleSleep() { return g_idleSleepMin != 0; }
+
+const char* idleSleepLabel() {
+  switch (g_idleSleepMin) {
+    case 1: return "1m";
+    case 3: return "3m";
+    case 5: return "5m";
+    default: return "off";
+  }
+}
+
+void setIdleSleep(bool on) { setIdleSleepMinutes(on ? 3 : 0); }
 
 void deepSleepNow() {
   // Kill backlight + LED so sleep draws near-zero from the panel.

@@ -1,6 +1,7 @@
 #include "tools.h"
 
 #include <WiFi.h>
+#include <esp_mac.h>
 #include <esp_wifi.h>
 #include <BLEDevice.h>
 #include <SD_MMC.h>
@@ -25,7 +26,7 @@
 #include "spyglass_signatures.h"
 
 #ifndef PP_VERSION
-#define PP_VERSION "0.5.6"
+#define PP_VERSION "0.5.7"
 #endif
 
 using namespace CheapBlackDisplay;
@@ -1301,7 +1302,7 @@ void crEnsureHeader() {
     File f = SD_MMC.open(kWigleFile, FILE_WRITE);
     if (f) {
       f.println(
-          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.6,"
+          "WigleWifi-1.4,appRelease=pocketpirate,model=ESP32-S3,release=0.5.7,"
           "device=CYD28,display=ILI9341,board=ESP32S3,brand=Hosyond");
       f.println(
           "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
@@ -2180,102 +2181,278 @@ bool slTouch(int16_t x, int16_t y) {
 }  // namespace
 
 // ===========================================================================
-//  12. Settings Cabin
+//  12. Settings Cabin — Ship OS sections (Captain / Display / Power / System)
 // ===========================================================================
 namespace {
 bool seOtaBusy = false;
+int seScroll = 0;           // px into scrollable body (below sticky KPI+name)
+uint32_t seSleepAt = 0;     // millis deadline for deferred Sleep now (0=none)
 
-void seOpen() { seOtaBusy = false; }
-void seTick(uint32_t) {}
-void seClose() {}
+constexpr int kSeSecH = 13;
+constexpr int kSeBtnH = 22;
+constexpr int kSeGap = 4;
+constexpr int kSeKvH = 15;
+constexpr int kSeOtaH = 28;
+constexpr int kSeNameH = 12;
+constexpr int kSeStickyH = 2 + theme::kKpiH + 2 + kSeNameH;  // kpi y+2 + KPI + gap + name
+
+// Logical layout of the scrollable region (y=0 at top of scroll content).
+struct SeLayout {
+  int captainSec, rename;
+  int displaySec, bri, sound;
+  int powerSec, powerRow;
+  int systemSec, kv0;  // 4 KV rows
+  int otaCard, actionRow;
+  int contentH;
+};
+
+SeLayout seLayout() {
+  SeLayout L{};
+  int y = 0;
+  L.captainSec = y; y += kSeSecH;
+  L.rename = y; y += kSeBtnH + kSeGap;
+  L.displaySec = y; y += kSeSecH;
+  L.bri = y; y += kSeBtnH + 2;
+  L.sound = y; y += kSeBtnH + kSeGap;
+  L.powerSec = y; y += kSeSecH;
+  L.powerRow = y; y += kSeBtnH + kSeGap;
+  L.systemSec = y; y += kSeSecH;
+  L.kv0 = y; y += kSeKvH * 4 + 2;
+  L.otaCard = y; y += kSeOtaH + 2;
+  L.actionRow = y; y += kSeBtnH + 2;
+  L.contentH = y;
+  return L;
+}
+
+void seSection(int x, int y, int w, const char* title) {
+  txt(x + 8, y + 2, theme::kTeal, 1, "%s", title);
+  int tw = (int)strlen(title) * 6;
+  int lineX = x + 8 + tw + 6;
+  int lineW = w - (lineX - x) - 36;  // leave room for scroll chevrons
+  if (lineW > 8) G().drawFastHLine(lineX, y + 6, lineW, theme::kBorder);
+}
+
+void seFmtUptime(char* buf, size_t n) {
+  uint32_t up = millis() / 1000;
+  if (up < 3600)
+    snprintf(buf, n, "%lu:%02lu", (unsigned long)(up / 60),
+             (unsigned long)(up % 60));
+  else
+    snprintf(buf, n, "%luh%02lu", (unsigned long)(up / 3600),
+             (unsigned long)((up % 3600) / 60));
+}
+
+void seFmtMac(char* buf, size_t n) {
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(buf, n, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
+}
+
+void seFmtSd(char* buf, size_t n) {
+  if (!app::sdReady()) {
+    snprintf(buf, n, "absent");
+    return;
+  }
+  uint64_t total = SD_MMC.totalBytes();
+  uint64_t used = SD_MMC.usedBytes();
+  if (total == 0) {
+    snprintf(buf, n, "mounted");
+    return;
+  }
+  uint64_t freeMb = (total - used) / (1024ULL * 1024ULL);
+  uint64_t totMb = total / (1024ULL * 1024ULL);
+  snprintf(buf, n, "%llu/%llu MB", (unsigned long long)freeMb,
+           (unsigned long long)totMb);
+}
+
+void seOpen() {
+  seOtaBusy = false;
+  seScroll = 0;
+  seSleepAt = 0;
+}
+
+void seTick(uint32_t now) {
+  if (seSleepAt != 0 && (int32_t)(now - seSleepAt) >= 0) {
+    seSleepAt = 0;
+    game::save();
+    power::deepSleepNow();
+  }
+}
+
+void seClose() { seSleepAt = 0; }
+
 void seDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  char vLv[8], vFw[8], vBri[8];
-  snprintf(vLv, sizeof(vLv), "%d", game::profile.level);
-  snprintf(vFw, sizeof(vFw), "%s", PP_VERSION);
-  snprintf(vBri, sizeof(vBri), "%d", app::brightness());
-  const char* vals[] = {vLv, vFw, vBri};
-  const char* labs[] = {"level", "fw", "bri"};
-  uint16_t cols[] = {theme::kGold, theme::kTeal, theme::kCyan};
+  SeLayout L = seLayout();
+
+  // ---- Sticky KPI: heap free · power · uptime --------------------------------
+  char vHeap[10], vBat[10], vUp[10];
+  snprintf(vHeap, sizeof(vHeap), "%u",
+           (unsigned)(ESP.getFreeHeap() / 1024));
+  if (power::usbPowered())
+    snprintf(vBat, sizeof(vBat), "%s", power::powerLabel());
+  else
+    snprintf(vBat, sizeof(vBat), "%d%%", power::batteryPct());
+  seFmtUptime(vUp, sizeof(vUp));
+  const char* vals[] = {vHeap, vBat, vUp};
+  const char* labs[] = {"heap KB", "power", "up"};
+  uint16_t cols[] = {
+      theme::kTeal,
+      power::lowBattery() ? theme::kBad : theme::kGold,
+      theme::kCyan};
   int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkDim, 1, "%s · %s", game::profile.name,
-      game::rankTitle(game::profile.level));
-  below += 12;
+  txt(x + 8, below, theme::kInkDim, 1, "%s · %s · fw %s", game::profile.name,
+      game::rankTitle(game::profile.level), PP_VERSION);
+  below += kSeNameH;
 
-  btn(x + 8, below, 118, 24, "Rename…", false);
-  char bri[16];
+  const int viewTop = below;
+  const int viewH = (y + h) - viewTop - 2;
+  if (viewH < 40) return;
+
+  // Clamp scroll
+  int maxScroll = L.contentH - viewH;
+  if (maxScroll < 0) maxScroll = 0;
+  if (seScroll > maxScroll) seScroll = maxScroll;
+  if (seScroll < 0) seScroll = 0;
+
+  // Clip scrollable region
+  G().setClipRect(x, viewTop, w, viewH);
+
+  auto cy = [&](int logicalY) { return viewTop + logicalY - seScroll; };
+
+  // ---- Captain ---------------------------------------------------------------
+  seSection(x, cy(L.captainSec), w, "Captain");
+  btn(x + 8, cy(L.rename), 140, kSeBtnH, "Rename…", false);
+
+  // ---- Display ---------------------------------------------------------------
+  seSection(x, cy(L.displaySec), w, "Display");
+  char bri[20];
   snprintf(bri, sizeof(bri), "Bri %d", app::brightness());
-  txt(x + 134, below + 8, theme::kInkDim, 1, "%s", bri);
-  btn(x + 232, below, 28, 24, "-", false);
-  btn(x + 264, below, 28, 24, "+", false);
-  below += 28;
-
-  btn(x + 8, below, 120, 24, app::sound() ? "Sound: ON" : "Sound: off", false,
+  txt(x + 8, cy(L.bri) + 7, theme::kInkDim, 1, "%s", bri);
+  btn(x + 72, cy(L.bri), 28, kSeBtnH, "-", false);
+  btn(x + 104, cy(L.bri), 28, kSeBtnH, "+", false);
+  btn(x + 148, cy(L.sound), 140, kSeBtnH,
+      app::sound() ? "Sound: ON" : "Sound: off", false,
       app::sound() ? theme::kGood : theme::kLocked);
-  btn(x + 136, below, 160, 24,
-      power::idleSleep() ? "Idle sleep: ON" : "Idle sleep: off", false,
+
+  // ---- Power -----------------------------------------------------------------
+  seSection(x, cy(L.powerSec), w, "Power");
+  char idleLab[24];
+  snprintf(idleLab, sizeof(idleLab), "Idle: %s", power::idleSleepLabel());
+  btn(x + 8, cy(L.powerRow), 110, kSeBtnH, idleLab, false,
       power::idleSleep() ? theme::kWarn : theme::kPanelHi);
-  below += 28;
+  btn(x + 126, cy(L.powerRow), 110, kSeBtnH, "Sleep now", false, theme::kTeal);
 
-  btn(x + 8, below, 140, 24, "Sleep now", false, theme::kTeal);
-  bool otaOk = ota::wifiConfigured() && ota::urlConfigured();
-  btn(x + 156, below, 140, 24, seOtaBusy ? "OTA…" : "OTA Update", otaOk,
-      otaOk ? 0 : theme::kLocked);
-  below += 28;
+  // ---- System (device info + OTA + reset) ------------------------------------
+  seSection(x, cy(L.systemSec), w, "System");
+  char v[40];
+  snprintf(v, sizeof(v), "%u / %u KB",
+           (unsigned)(ESP.getFreeHeap() / 1024),
+           (unsigned)(ESP.getMinFreeHeap() / 1024));
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0), w - 40, kSeKvH - 1, "Heap free/min", v,
+                  theme::kTeal);
+  seFmtMac(v, sizeof(v));
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH), w - 40, kSeKvH - 1, "WiFi MAC",
+                  v, theme::kCyan);
+  snprintf(v, sizeof(v), "%u MB",
+           (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 2), w - 40, kSeKvH - 1,
+                  "Flash", v);
+  seFmtSd(v, sizeof(v));
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 3), w - 40, kSeKvH - 1, "SD free",
+                  v, app::sdReady() ? theme::kGood : theme::kBad);
 
-  gfxu::drawElevated(G(), x + 4, below, w - 8, 26);
-  txt(x + 10, below + 4, theme::kInkMuted, 1, "OTA: %s", ota::status());
+  gfxu::drawElevated(G(), x + 4, cy(L.otaCard), w - 36, kSeOtaH - 2);
+  txt(x + 10, cy(L.otaCard) + 3, theme::kInkMuted, 1, "OTA: %s", ota::status());
   if (ota::wifiConfigured())
-    txt(x + 10, below + 14, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
+    txt(x + 10, cy(L.otaCard) + 14, theme::kInkMuted, 1, "WiFi:%s  URL:%s",
         ota::wifiSsid(), ota::urlConfigured() ? "set" : "none");
   else
-    txt(x + 10, below + 14, theme::kInkMuted, 1,
-        "Set WiFi+URL via companion WIFICFG/OTAURL");
-  below += 30;
+    txt(x + 10, cy(L.otaCard) + 14, theme::kInkMuted, 1,
+        "Companion: WIFICFG + OTAURL");
 
-  btn(x + 8, below, 170, 22, "Reset progress", false, theme::kBad);
+  bool otaOk = ota::wifiConfigured() && ota::urlConfigured();
+  btn(x + 8, cy(L.actionRow), 130, kSeBtnH, seOtaBusy ? "OTA…" : "OTA Update",
+      otaOk, otaOk ? 0 : theme::kLocked);
+  btn(x + 146, cy(L.actionRow), 130, kSeBtnH, "Reset progress", false,
+      theme::kBad);
+
+  G().clearClipRect();
+
+  // Scroll chevrons (fixed, outside clip)
+  if (maxScroll > 0) {
+    btn(x + w - 30, viewTop, 26, 18, "^", false);
+    btn(x + w - 30, y + h - 22, 26, 18, "v", false);
+  }
 }
 
 bool seTouch(int16_t x, int16_t y) {
   int ly = y - contentTop();
-  const int row0 = theme::kKpiH + 14;  // rename / bri
-  const int row1 = row0 + 28;
-  const int row2 = row1 + 28;
-  const int row3 = row2 + 28 + 30;  // after OTA status block
-  if (ly >= row0 && ly <= row0 + 28) {
-    if (x >= 8 && x <= 165) {
-      app::requestRename();
-      return false;
+  SeLayout L = seLayout();
+  const int sticky = kSeStickyH;
+  const int viewTop = sticky;  // matches seDraw: KPI(30)+2+name(12)
+  // Body height ≈ theme::kToolBodyH; viewH derived the same way as draw.
+  const int bodyH = theme::kToolBodyH;
+  const int viewH = bodyH - viewTop - 2;
+  int maxScroll = L.contentH - viewH;
+  if (maxScroll < 0) maxScroll = 0;
+
+  // Scroll chevrons (screen-local within body; x is absolute ~0..320)
+  if (maxScroll > 0 && x >= 290) {
+    if (ly >= viewTop && ly <= viewTop + 20) {
+      seScroll = max(0, seScroll - 40);
+      return true;
     }
-    if (x >= 226 && x <= 262) {
+    if (ly >= bodyH - 24 && ly <= bodyH) {
+      seScroll = min(maxScroll, seScroll + 40);
+      return true;
+    }
+  }
+
+  if (ly < viewTop) return false;  // sticky KPI/name — no hits
+  int logicalY = (ly - viewTop) + seScroll;
+
+  auto inRow = [&](int rowY, int rowH = kSeBtnH) {
+    return logicalY >= rowY && logicalY <= rowY + rowH;
+  };
+
+  if (inRow(L.rename) && x >= 8 && x <= 152) {
+    app::requestRename();
+    return false;
+  }
+  if (inRow(L.bri)) {
+    if (x >= 72 && x <= 104) {
       app::setBrightness(app::brightness() - 10);
       return true;
     }
-    if (x >= 260 && x <= 300) {
+    if (x >= 104 && x <= 136) {
       app::setBrightness(app::brightness() + 10);
       return true;
     }
   }
-  if (ly >= row1 && ly <= row1 + 28) {
-    if (x >= 8 && x <= 132) {
-      app::setSound(!app::sound());
+  if (inRow(L.sound) && x >= 148 && x <= 292) {
+    app::setSound(!app::sound());
+    return true;
+  }
+  if (inRow(L.powerRow)) {
+    if (x >= 8 && x <= 122) {
+      power::cycleIdleSleep();
+      if (power::idleSleep())
+        tools::toast("Idle sleep %s", power::idleSleepLabel());
+      else
+        tools::toast("Idle sleep off");
       return true;
     }
-    if (x >= 136 && x <= 300) {
-      power::setIdleSleep(!power::idleSleep());
-      tools::toast(power::idleSleep() ? "Idle sleep ON (3m)" : "Idle sleep off");
+    if (x >= 126 && x <= 240) {
+      // Defer sleep so toast can paint; avoid long UI block.
+      tools::toast("Sleeping — tap screen to wake");
+      seSleepAt = millis() + 350;
       return true;
     }
   }
-  if (ly >= row2 && ly <= row2 + 28) {
-    if (x >= 8 && x <= 152) {
-      game::save();
-      tools::toast("Sleeping — tap screen to wake");
-      delay(500);
-      power::deepSleepNow();
-      return true;
-    }
-    if (x >= 156 && x <= 300) {
+  if (inRow(L.actionRow)) {
+    if (x >= 8 && x <= 142) {
       if (!ota::wifiConfigured() || !ota::urlConfigured()) {
         tools::toast("Need WIFICFG + OTAURL first");
         return true;
@@ -2287,11 +2464,11 @@ bool seTouch(int16_t x, int16_t y) {
       if (!ok) tools::toast("OTA: %s", ota::status());
       return true;
     }
-  }
-  if (ly >= row3 && ly <= row3 + 28 && x >= 8 && x <= 190) {
-    game::resetProgress();
-    tools::toast("Progress reset");
-    return true;
+    if (x >= 146 && x <= 280) {
+      game::resetProgress();
+      tools::toast("Progress reset");
+      return true;
+    }
   }
   return false;
 }

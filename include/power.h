@@ -22,9 +22,14 @@ void noteActivity(uint32_t nowMs);
 // Apply optional dim-on-idle; returns the brightness currently driven to BL.
 uint8_t applyIdleDim(uint8_t userBrightness, uint32_t nowMs);
 
-// Idle-sleep preference (deep sleep after long idle). Default off.
+// Idle-sleep after N minutes of inactivity. 0 = off. Supported: 0, 1, 3, 5.
+void setIdleSleepMinutes(uint8_t minutes);
+uint8_t idleSleepMinutes();
+void cycleIdleSleep();         // off → 1m → 3m → 5m → off
+bool idleSleep();              // true when minutes != 0
+const char* idleSleepLabel();  // "off" / "1m" / "3m" / "5m"
+// Legacy: maps true→3m, false→off. Prefer cycleIdleSleep / minutes helpers.
 void setIdleSleep(bool on);
-bool idleSleep();
 
 // Enter deep sleep now. Wake on touch INT (active-low) or reset button.
 // Saves game state is the caller's responsibility before invoking.
