@@ -3,260 +3,280 @@
 #include "captains.h"
 #include "gfx_util.h"
 
-using gfxu::blend565;
 using gfxu::darken;
 using gfxu::lighten;
 using gfxu::rgb;
 
 namespace chibi {
 
-void drawCaptain(lgfx::LGFXBase& g, int cx, int cy, int avatar, int tier) {
-  if (avatar < 0) avatar = 0;
-  if (avatar >= pc::kCaptainCount) avatar = pc::kCaptainCount - 1;
-  if (tier < 0) tier = 0;
-  if (tier > 4) tier = 4;
-  const pc::Captain& c = pc::kCaptains[avatar];
-  const bool beard = c.flags & pc::kBeard;
-  const bool patch = c.flags & pc::kPatch;
+namespace {
+constexpr int kPixelScale = 3;
 
-  const int R = 27;                 // head radius (chibi: big head)
-  const int torsoW = 76, torsoH = 66;
-  const int torsoX = cx - torsoW / 2;
-  const int torsoTop = cy + 30;
-  const int shoulderY = cy + 40;
-  const int beltY = cy + 74;
-
-  const uint16_t boot = rgb(70, 46, 28);
-  const uint16_t bootHi = rgb(110, 78, 50);
-  const uint16_t shirt = rgb(238, 232, 214);
-  const uint16_t leather = rgb(60, 40, 25);
-
-  // ---- boots / legs -------------------------------------------------------
-  g.fillSmoothRoundRect(cx - 22, beltY + 18, 18, 30, 8, boot);
-  g.fillSmoothRoundRect(cx + 4, beltY + 18, 18, 30, 8, boot);
-  g.fillSmoothRoundRect(cx - 22, beltY + 40, 20, 9, 5, darken(boot, 40));
-  g.fillSmoothRoundRect(cx + 4, beltY + 40, 20, 9, 5, darken(boot, 40));
-  g.fillSmoothCircle(cx - 15, beltY + 22, 3, bootHi);
-  g.fillSmoothCircle(cx + 11, beltY + 22, 3, bootHi);
-
-  // ---- coat torso ---------------------------------------------------------
-  g.fillSmoothRoundRect(torsoX, torsoTop, torsoW, torsoH, 20, c.coat);
-  g.fillSmoothRoundRect(cx + 6, torsoTop + 4, torsoW / 2 - 4, torsoH - 8, 16,
-                        blend565(c.coat, c.coatSh, 150));
-  g.fillSmoothRoundRect(torsoX + 4, torsoTop + 6, 14, torsoH - 18, 7,
-                        lighten(c.coat, 40));
-
-  // ---- arms + cuffs + hands ----------------------------------------------
-  g.fillSmoothRoundRect(torsoX - 6, shoulderY - 2, 20, 46, 10, c.coat);
-  g.fillSmoothRoundRect(torsoX + torsoW - 14, shoulderY - 2, 20, 46, 10,
-                        blend565(c.coat, c.coatSh, 90));
-  g.fillSmoothRoundRect(torsoX - 6, shoulderY + 36, 20, 9, 5, c.trim);
-  g.fillSmoothRoundRect(torsoX + torsoW - 14, shoulderY + 36, 20, 9, 5, c.trim);
-  g.fillSmoothCircle(torsoX + 3, shoulderY + 48, 6, c.skin);
-  g.fillSmoothCircle(torsoX + torsoW - 5, shoulderY + 48, 6, c.skin);
-
-  // ---- shirt chest + lapels + buttons ------------------------------------
-  g.fillSmoothRoundRect(cx - 14, torsoTop + 6, 28, 44, 10, shirt);
-  g.fillTriangle(cx - 15, torsoTop + 4, cx - 1, torsoTop + 4, cx - 15,
-                 torsoTop + 40, c.coat);
-  g.fillTriangle(cx + 15, torsoTop + 4, cx + 1, torsoTop + 4, cx + 15,
-                 torsoTop + 40, blend565(c.coat, c.coatSh, 90));
-  for (int i = 0; i < 3; i++)
-    g.fillSmoothCircle(cx, torsoTop + 16 + i * 10, 2, c.trim);
-
-  // ---- belt + buckle ------------------------------------------------------
-  g.fillSmoothRoundRect(torsoX, beltY, torsoW, 14, 4, leather);
-  g.fillSmoothRoundRect(cx - 10, beltY - 1, 20, 16, 4, c.trim);
-  g.drawRoundRect(cx - 6, beltY + 2, 12, 10, 2, darken(c.trim, 90));
-
-  // ---- rank flair ---------------------------------------------------------
-  if (tier >= 2) {  // epaulettes
-    g.fillSmoothCircle(torsoX + 8, shoulderY, 6, c.trim);
-    g.fillSmoothCircle(torsoX + torsoW - 8, shoulderY, 6, c.trim);
-    for (int i = -2; i <= 2; i++) {
-      g.drawWideLine(torsoX + 8 + i * 2, shoulderY + 4, torsoX + 8 + i * 2,
-                     shoulderY + 10, 1, darken(c.trim, 40));
-      g.drawWideLine(torsoX + torsoW - 8 + i * 2, shoulderY + 4,
-                     torsoX + torsoW - 8 + i * 2, shoulderY + 10, 1,
-                     darken(c.trim, 40));
-    }
-  }
-  if (tier >= 4) {  // captain's medal
-    g.fillSmoothRoundRect(cx - 10, torsoTop + 2, 6, 8, 2, rgb(200, 40, 50));
-    g.fillSmoothCircle(cx - 7, torsoTop + 12, 4, c.trim);
-  }
-
-  // ---- held cutlass (tier>=2) --------------------------------------------
-  if (tier >= 2) {
-    g.fillSmoothRoundRect(cx - 50, beltY - 12, 14, 6, 3, c.trim);      // guard
-    g.drawWideLine(cx - 43, beltY - 10, cx - 56, beltY - 54, 5,
-                   rgb(214, 220, 230));                                // blade
-    g.drawWideLine(cx - 44, beltY - 12, cx - 55, beltY - 50, 1,
-                   rgb(255, 255, 255));                                // shine
-    g.fillSmoothCircle(cx - 43, beltY - 4, 3, darken(c.trim, 40));     // pommel
-  }
-  // ---- held telescope (tier>=3) ------------------------------------------
-  if (tier >= 3) {
-    g.drawWideLine(cx + 18, beltY - 6, cx + 46, beltY - 20, 9,
-                   rgb(170, 120, 45));
-    g.drawWideLine(cx + 26, beltY - 10, cx + 34, beltY - 14, 9,
-                   darken(rgb(170, 120, 45), 40));
-    g.fillSmoothCircle(cx + 46, beltY - 20, 4, rgb(185, 222, 255));
-  }
-
-  // ---- neck ---------------------------------------------------------------
-  g.fillSmoothRoundRect(cx - 8, cy + 18, 16, 14, 5, c.skinSh);
-
-  // ---- head base + shading -----------------------------------------------
-  g.fillSmoothCircle(cx, cy, R, c.skin);
-  g.fillSmoothCircle(cx + R - 9, cy + 3, 9, blend565(c.skin, c.skinSh, 120));
-  g.fillSmoothCircle(cx - 8, cy - 9, R - 9, c.skinHi);
-  g.fillSmoothCircle(cx - 11, cy + 6, 7, lighten(c.skin, 30));
-
-  // ---- ears + earring -----------------------------------------------------
-  g.fillSmoothCircle(cx - R + 2, cy + 3, 5, c.skin);
-  g.fillSmoothCircle(cx + R - 2, cy + 3, 5, c.skin);
-  if (tier >= 1) {
-    g.fillSmoothCircle(cx + R - 1, cy + 10, 3, c.trim);
-    g.fillSmoothCircle(cx + R - 1, cy + 10, 1, c.skin);
-  }
-
-  // ---- hair sideburns / beard --------------------------------------------
-  if (beard) {
-    g.fillArc(cx, cy + 2, R - 10, R + 3, 18, 162, c.hair);      // jaw beard
-    g.fillSmoothCircle(cx - R + 3, cy + 2, 5, c.hair);          // sideburns
-    g.fillSmoothCircle(cx + R - 3, cy + 2, 5, c.hair);
-    g.fillSmoothCircle(cx - 6, cy + 12, 4, c.hair);             // mustache
-    g.fillSmoothCircle(cx + 6, cy + 12, 4, c.hair);
-    g.fillSmoothCircle(cx, cy + 20, 6, c.hair);                 // chin tuft
-  } else {
-    g.fillSmoothCircle(cx - R + 2, cy - 2, 5, c.hair);          // hair by ears
-    g.fillSmoothCircle(cx + R - 2, cy - 2, 5, c.hair);
-  }
-
-  // ---- cheeks -------------------------------------------------------------
-  g.fillSmoothCircle(cx - 14, cy + 8, 4, blend565(c.skin, rgb(255, 120, 120), 90));
-  g.fillSmoothCircle(cx + 14, cy + 8, 4, blend565(c.skin, rgb(255, 120, 120), 90));
-
-  // ---- eyes (big + glossy) ------------------------------------------------
-  const int ey = cy + 1;
-  auto eye = [&](int ex, bool covered) {
-    if (covered) return;
-    g.fillSmoothCircle(ex, ey, 9, darken(c.skin, 25));           // socket
-    g.fillSmoothCircle(ex, ey, 8, rgb(250, 250, 252));           // white
-    int ix = ex + (ex < cx ? 1 : -1);
-    g.fillSmoothCircle(ix, ey + 1, 5, c.eyes);                   // iris
-    g.fillSmoothCircle(ix, ey + 1, 3, rgb(22, 20, 28));          // pupil
-    g.fillSmoothCircle(ex - 2, ey - 2, 2, rgb(255, 255, 255));   // highlight
-    g.fillSmoothCircle(ex + 3, ey + 4, 1, rgb(255, 255, 255));
-    g.fillArc(ex, ey - 1, 7, 9, 200, 340, c.skin);              // upper lid
-  };
-  eye(cx - 10, false);
-  eye(cx + 10, patch);
-  // eyebrows
-  g.drawWideLine(cx - 16, cy - 8, cx - 5, cy - 10, 3, c.hair);
-  g.drawWideLine(cx + 5, cy - 10, cx + 16, cy - 8, 3, c.hair);
-
-  // ---- eyepatch -----------------------------------------------------------
-  if (patch) {
-    g.fillSmoothCircle(cx + 10, ey, 7, rgb(20, 20, 22));
-    g.drawWideLine(cx + 3, cy - 9, cx + R + 2, cy + 3, 3, rgb(20, 20, 22));
-    g.drawWideLine(cx + 10, cy - 9, cx - R, cy - 3, 2, rgb(28, 28, 30));
-  }
-
-  // ---- nose + mouth -------------------------------------------------------
-  g.fillSmoothCircle(cx, cy + 8, 3, blend565(c.skin, c.skinSh, 120));
-  g.fillSmoothCircle(cx - 1, cy + 7, 1, c.skinHi);
-  if (beard) {
-    g.fillArc(cx, cy + 13, 3, 5, 15, 165, rgb(120, 40, 40));
-  } else {
-    g.fillArc(cx, cy + 12, 5, 8, 12, 168, rgb(110, 40, 45));
-    g.fillArc(cx, cy + 12, 5, 6, 12, 168, rgb(252, 252, 252));  // teeth
-  }
-
-  // ---- bandana ------------------------------------------------------------
-  if (c.bandana) {
-    g.fillSmoothRoundRect(cx - R, cy - R + 6, 2 * R, 11, 5, c.bandana);
-    g.fillSmoothRoundRect(cx - R, cy - R + 12, 2 * R, 5, 3,
-                          darken(c.bandana, 40));
-    g.fillSmoothCircle(cx - R + 1, cy - R + 15, 5, c.bandana);          // knot
-    g.fillTriangle(cx - R + 1, cy - R + 15, cx - R - 10, cy - R + 20,
-                   cx - R - 2, cy - R + 26, c.bandana);                 // tail
-    for (int i = -2; i <= 2; i++)
-      g.fillSmoothCircle(cx + i * 9, cy - R + 11, 1, rgb(250, 250, 250));
-  }
-
-  // ---- tricorn hat --------------------------------------------------------
-  if (tier >= 1 || !c.bandana) {
-    int hw = 32 + tier * 3;
-    g.fillSmoothRoundRect(cx - hw, cy - R + 2, 2 * hw, 15, 7, c.hatSh);
-    g.fillTriangle(cx - hw, cy - R + 9, cx + hw, cy - R + 9, cx, cy - R - 18,
-                   c.hat);
-    g.fillTriangle(cx - hw, cy - R + 9, cx - hw + 6, cy - R - 8, cx - hw + 20,
-                   cy - R + 6, c.hat);
-    g.fillTriangle(cx + hw, cy - R + 9, cx + hw - 6, cy - R - 8, cx + hw - 20,
-                   cy - R + 6, c.hat);
-    g.fillSmoothRoundRect(cx - 18, cy - R - 12, 36, 18, 11, c.hat);
-    g.fillTriangle(cx - hw + 8, cy - R + 6, cx, cy - R - 12, cx + 4, cy - R + 4,
-                   lighten(c.hat, 24));  // brim highlight
-    g.drawWideLine(cx - hw + 5, cy - R + 8, cx, cy - R - 14, 2, c.trim);
-    g.drawWideLine(cx, cy - R - 14, cx + hw - 5, cy - R + 8, 2, c.trim);
-    if (tier >= 2) {  // skull emblem
-      int sx = cx, sy = cy - R - 3;
-      g.fillSmoothCircle(sx, sy, 5, rgb(238, 238, 232));
-      g.fillSmoothRoundRect(sx - 3, sy + 2, 6, 4, 2, rgb(238, 238, 232));
-      g.fillSmoothCircle(sx - 2, sy - 1, 1, rgb(20, 20, 20));
-      g.fillSmoothCircle(sx + 2, sy - 1, 1, rgb(20, 20, 20));
-      g.drawWideLine(sx - 7, sy + 4, sx + 7, sy - 5, 2, rgb(238, 238, 232));
-      g.drawWideLine(sx - 7, sy - 5, sx + 7, sy + 4, 2, rgb(238, 238, 232));
-    }
-    if (tier >= 3) {  // plume feather
-      uint16_t fc = c.bandana ? rgb(240, 240, 245) : rgb(214, 70, 70);
-      g.drawWideLine(cx - hw + 10, cy - R + 2, cx - hw + 2, cy - R - 24, 4, fc);
-      for (int i = 0; i < 4; i++)
-        g.fillSmoothCircle(cx - hw + 8 - i, cy - R - 4 - i * 5, 3,
-                           lighten(fc, 20));
-    }
-  }
-
-  // ---- parrot on shoulder (tier>=4) --------------------------------------
-  if (tier >= 4) {
-    int px = torsoX + 4, py = shoulderY + 2;
-    g.fillTriangle(px + 5, py, px + 18, py - 5, px + 16, py + 8, rgb(40, 90, 200));
-    g.fillSmoothCircle(px, py, 8, rgb(40, 170, 70));
-    g.fillSmoothCircle(px - 2, py + 2, 5, rgb(245, 210, 60));
-    g.fillArc(px, py, 3, 7, 250, 30, rgb(30, 140, 60));
-    g.fillSmoothCircle(px - 6, py - 6, 5, rgb(210, 50, 50));
-    g.fillTriangle(px - 10, py - 7, px - 15, py - 5, px - 10, py - 2,
-                   rgb(240, 190, 70));
-    g.fillSmoothCircle(px - 6, py - 7, 1, rgb(20, 20, 20));
-  }
+void pixelRect(lgfx::LGFXBase& g, int originX, int originY, int x, int y,
+               int width, int height, uint16_t color) {
+  if (width <= 0 || height <= 0) return;
+  g.fillRect(originX + x * kPixelScale, originY + y * kPixelScale,
+             width * kPixelScale, height * kPixelScale, color);
 }
+}  // namespace
 
-void drawShip(lgfx::LGFXBase& g, int cx, int cy, int tier) {
-  const uint16_t hull = rgb(96, 62, 36);
-  const uint16_t hullSh = rgb(66, 42, 24);
-  const uint16_t sail = rgb(242, 236, 220);
-  const uint16_t sailSh = rgb(206, 198, 178);
-  const uint16_t mast = rgb(74, 54, 36);
+void drawCaptain(lgfx::LGFXBase& g, int cx, int cy, int avatar, int tier,
+                 int motion, int frame) {
+    if (avatar < 0) avatar = 0;
+    if (avatar >= pc::kCaptainCount) avatar = pc::kCaptainCount - 1;
+    if (tier < 0) tier = 0;
+    if (tier > 4) tier = 4;
+    if (motion < 0 || motion > 4) motion = 0;
+    if (frame < 0) frame = 0;
+    frame %= 3;
 
-  int masts = tier >= 2 ? 2 : 1;
-  for (int m = 0; m < masts; m++) {
-    int mx = cx - 10 + m * 22;
-    g.fillRect(mx - 2, cy - 34, 4, 40, mast);
-    g.fillSmoothRoundRect(mx - 24, cy - 32, 24, 30, 5, sail);
-    g.fillSmoothRoundRect(mx - 24, cy - 18, 24, 16, 5, sailSh);
-    if (m == masts - 1) {  // pennant
-      g.fillTriangle(mx + 2, cy - 34, mx + 2, cy - 26, mx + 16, cy - 30,
-                     rgb(200, 50, 50));
+    const pc::Captain& captain = pc::kCaptains[avatar];
+    const bool beard = (captain.flags & pc::kBeard) != 0;
+    const bool patch = (captain.flags & pc::kPatch) != 0;
+    const bool longHair = (captain.flags & pc::kFemale) != 0;
+    const uint16_t outline = rgb(24, 18, 28);
+    const uint16_t shirt = rgb(226, 218, 198);
+    const uint16_t shirtShade = rgb(196, 186, 164);
+    int originX = cx - 72;
+    int originY = cy - 56;
+    if (motion == 3 && frame == 1) originY -= kPixelScale;
+
+    auto rect = [&](int x, int y, int width, int height, uint16_t color) {
+      pixelRect(g, originX, originY, x, y, width, height, color);
+    };
+
+    rect(14, 46, 8, 10, outline);
+    rect(26, 46, 8, 10, outline);
+    rect(15, 47, 6, 7, rgb(70, 48, 34));
+    rect(27, 47, 6, 7, rgb(70, 48, 34));
+    rect(13, 53, 11, 3, rgb(46, 32, 22));
+    rect(25, 53, 11, 3, rgb(46, 32, 22));
+    rect(16, 47, 2, 3, rgb(112, 80, 52));
+    rect(28, 47, 2, 3, rgb(112, 80, 52));
+
+    rect(10, 27, 28, 22, outline);
+    rect(12, 28, 24, 19, tier >= 1 ? captain.coat : shirt);
+    rect(33, 29, 3, 17, tier >= 1 ? captain.coatSh : shirtShade);
+    rect(13, 29, 2, 16, tier >= 1 ? lighten(captain.coat, 40) : shirt);
+    rect(21, 28, 7, 14, shirt);
+    rect(21, 28, 2, 7, captain.coat);
+    rect(27, 28, 2, 7, captain.coatSh);
+    rect(23, 30, 3, 10, shirtShade);
+    rect(24, 31, 1, 1, captain.trim);
+    rect(24, 34, 1, 1, captain.trim);
+    rect(24, 37, 1, 1, captain.trim);
+
+    if (motion == 3 && frame > 0) {
+      rect(8, 30, 6, 7, outline);
+      rect(9, 31, 4, 5, tier >= 1 ? captain.coat : shirt);
+      int armY = frame == 1 ? 24 : 18;
+      rect(7, armY, 6, 9, outline);
+      rect(8, armY + 1, 4, 7, tier >= 1 ? captain.coat : shirt);
+      rect(7, armY - 2, 6, 2, captain.trim);
+      rect(8, armY - 6, 5, 4, captain.skin);
+    } else {
+      rect(8, 30, 6, 15, outline);
+      rect(9, 31, 4, 11, tier >= 1 ? captain.coat : shirt);
+      rect(9, 42, 4, 2, captain.trim);
+      rect(9, 44, 4, 4, captain.skin);
+    }
+
+    int rightPose = 0;
+    if (motion == 1) rightPose = frame;
+    if (motion == 2 || motion == 3) rightPose = 2;
+    if (motion == 4) rightPose = 3;
+    if (rightPose == 0) {
+      rect(36, 30, 6, 15, outline);
+      rect(37, 31, 4, 11, tier >= 1 ? captain.coat : shirt);
+      rect(37, 42, 4, 2, captain.trim);
+      rect(37, 44, 4, 4, captain.skin);
+    } else if (rightPose == 1) {
+      rect(36, 30, 6, 7, outline);
+      rect(37, 31, 4, 5, tier >= 1 ? captain.coat : shirt);
+      rect(38, 24, 5, 9, outline);
+      rect(39, 25, 3, 7, tier >= 1 ? captain.coat : shirt);
+      rect(38, 22, 5, 2, captain.trim);
+      rect(39, 18, 5, 4, captain.skin);
+    } else if (rightPose == 2) {
+      rect(36, 30, 6, 7, outline);
+      rect(37, 31, 4, 5, tier >= 1 ? captain.coat : shirt);
+      rect(38, 19, 5, 13, outline);
+      rect(39, 20, 3, 11, tier >= 1 ? captain.coat : shirt);
+      rect(38, 18, 5, 2, captain.trim);
+      rect(39, 13, 5, 5, captain.skin);
+    } else {
+      rect(36, 30, 6, 7, outline);
+      rect(37, 31, 4, 5, captain.coat);
+      rect(38, 19, 5, 13, outline);
+      rect(39, 20, 3, 11, captain.coat);
+      rect(38, 18, 5, 2, captain.trim);
+      rect(31, 13, 9, 4, captain.skin);
+    }
+    if (motion == 2) {
+      rect(40, 13, 3, 2, captain.trim);
+      rect(41, 7, 2, 7, outline);
+      rect(42, 5, 2, 8, rgb(206, 214, 224));
+      rect(41, 5, 4, 1, rgb(206, 214, 224));
+    }
+
+    rect(12, 42, 24, 5, captain.bandana ? captain.bandana : captain.trim);
+    rect(12, 46, 24, 2, darken(captain.bandana ? captain.bandana : captain.trim, 40));
+    rect(32, 46, 3, 5, captain.bandana ? captain.bandana : captain.trim);
+    rect(22, 42, 5, 6, captain.trim);
+    rect(23, 43, 3, 4, outline);
+
+    if (tier >= 2) {
+      rect(11, 29, 7, 3, captain.trim);
+      rect(30, 29, 7, 3, captain.trim);
+      rect(13, 32, 2, 4, darken(captain.trim, 40));
+      rect(33, 32, 2, 4, darken(captain.trim, 40));
+    }
+    if (tier >= 4) {
+      rect(20, 30, 2, 4, rgb(200, 40, 50));
+      rect(21, 34, 3, 3, captain.trim);
+    }
+    if (tier >= 3) {
+      rect(8, 45, 5, 2, captain.trim);
+      rect(8, 47, 2, 2, rgb(206, 214, 224));
+      rect(7, 49, 2, 2, rgb(206, 214, 224));
+      rect(6, 51, 2, 2, rgb(206, 214, 224));
+    }
+
+    rect(21, 24, 7, 6, outline);
+    rect(22, 24, 5, 5, captain.skinSh);
+    rect(13, 9, 22, 19, outline);
+    rect(15, 11, 18, 15, captain.skin);
+    rect(30, 12, 3, 13, captain.skinSh);
+    rect(16, 12, 15, 2, captain.skinHi);
+    rect(13, 17, 2, 5, captain.skin);
+    rect(33, 17, 2, 5, captain.skin);
+    rect(16, 14, 6, 2, captain.hair);
+    rect(27, 14, 6, 2, captain.hair);
+    rect(17, 17, 5, 4, rgb(250, 250, 246));
+    rect(27, 17, 5, 4, rgb(250, 250, 246));
+    if (motion == 4) {
+      rect(20, 18, 2, 3, captain.eyes);
+      rect(28, 18, 2, 3, captain.eyes);
+    } else {
+      rect(19, 18, 2, 3, captain.eyes);
+      rect(29, 18, 2, 3, captain.eyes);
+    }
+    rect(20, 19, 1, 2, outline);
+    if (!patch) rect(30, 19, 1, 2, outline);
+    if (motion == 0 && frame == 2) {
+      rect(17, 18, 5, 3, captain.skin);
+      if (!patch) rect(27, 18, 5, 3, captain.skin);
+      rect(17, 20, 5, 1, outline);
+      if (!patch) rect(27, 20, 5, 1, outline);
+    }
+    rect(23, 21, 3, 2, captain.skinSh);
+    if (beard) {
+      rect(15, 21, 19, 7, captain.hair);
+      rect(17, 27, 15, 2, captain.hair);
+      rect(20, 22, 8, 2, outline);
+      rect(22, 22, 5, 1, rgb(240, 236, 222));
+    } else {
+      rect(22, 23, 5, 1, rgb(120, 44, 40));
+    }
+    if (patch) {
+      rect(27, 16, 6, 6, outline);
+      rect(14, 15, 18, 1, outline);
+    }
+    if (longHair) {
+      rect(13, 13, 2, 14, captain.hair);
+      rect(33, 13, 2, 14, captain.hair);
+    } else if (!beard) {
+      rect(14, 13, 2, 7, captain.hair);
+      rect(32, 13, 2, 7, captain.hair);
+    }
+    if (captain.bandana) {
+      rect(14, 9, 20, 4, captain.bandana);
+      rect(34, 11, 3, 4, captain.bandana);
+      rect(36, 14, 2, 3, captain.bandana);
+    } else if (tier < 2) {
+      rect(16, 8, 16, 4, captain.hair);
+    }
+    if (tier >= 2) {
+      rect(10, 5, 28, 6, outline);
+      rect(11, 4, 26, 5, captain.hat);
+      rect(33, 5, 4, 4, captain.hatSh);
+      rect(9, 9, 30, 3, captain.hatSh);
+      rect(10, 9, 28, 1, captain.trim);
+      rect(18, 3, 12, 2, captain.hat);
+      if (tier >= 3) {
+        uint16_t feather = captain.bandana ? rgb(240, 240, 245)
+                                           : rgb(214, 70, 70);
+        rect(36, 2, 2, 2, feather);
+        rect(37, 1, 2, 2, feather);
+        rect(38, 0, 2, 2, feather);
+      }
+      if (tier >= 4) {
+        rect(22, 5, 5, 3, rgb(238, 238, 232));
+        rect(23, 5, 1, 1, outline);
+        rect(25, 5, 1, 1, outline);
+        rect(23, 8, 3, 1, rgb(238, 238, 232));
+      }
+    }
+    if (tier >= 4) {
+      rect(10, 23, 6, 6, rgb(210, 60, 50));
+      rect(11, 20, 5, 4, rgb(210, 60, 50));
+      rect(12, 21, 1, 1, outline);
+      rect(15, 22, 3, 1, captain.trim);
+      rect(10, 25, 3, 3, rgb(44, 152, 82));
     }
   }
-  g.fillSmoothRoundRect(cx - 36, cy + 2, 72, 20, 8, hull);
-  g.fillSmoothRoundRect(cx - 36, cy + 12, 72, 10, 6, hullSh);
-  g.fillTriangle(cx - 30, cy + 20, cx + 30, cy + 20, cx, cy + 32, hullSh);
-  g.drawFastHLine(cx - 32, cy + 6, 64, rgb(214, 178, 90));
-  for (int i = -2; i <= 2; i++)
-    g.fillSmoothCircle(cx + i * 12, cy + 10, 1, rgb(30, 20, 12));  // portholes
-}
+
+void drawShip(lgfx::LGFXBase& g, int cx, int cy, int tier, int frame) {
+    if (tier < 0) tier = 0;
+    if (tier > 4) tier = 4;
+    int originX = cx - 64;
+    int originY = cy - 48;
+    auto rect = [&](int x, int y, int width, int height, uint16_t color) {
+      g.fillRect(originX + x * 4, originY + y * 4, width * 4, height * 4,
+                 color);
+    };
+
+    const uint16_t outline = rgb(24, 18, 28);
+    const uint16_t hull = rgb(122, 84, 48);
+    const uint16_t sail = rgb(240, 236, 222);
+    const uint16_t sailShade = rgb(208, 200, 180);
+    rect(8, 18, 32, 5, outline);
+    int halfWidth = 9 + tier * 2;
+    for (int row = 0; row < 6; row++) {
+      int shrink = row > 3 ? (row - 3) * 2 : 0;
+      int width = halfWidth * 2 - shrink * 2;
+      rect(24 - halfWidth + shrink, 17 + row, width, 1,
+           row == 0 ? rgb(156, 112, 66) : hull);
+    }
+    rect(11, 17, 26, 1, rgb(244, 202, 78));
+    rect(12, 23, 24, 2, rgb(84, 56, 32));
+    for (int port = 0; port < (tier >= 3 ? 5 : 3); port++)
+      rect(15 + port * 4, 19, 1, 1, outline);
+
+    int mastCount = tier >= 3 ? 3 : (tier >= 2 ? 2 : 1);
+    for (int mast = 0; mast < mastCount; mast++) {
+      int mastX = mastCount == 1 ? 24 :
+                  (mastCount == 2 ? 16 + mast * 16 : 10 + mast * 14);
+      int mastTop = tier >= 3 ? 1 : 3;
+      rect(mastX - 1, mastTop, 2, 17 - mastTop, rgb(84, 56, 32));
+      for (int row = 0; row < 8; row++) {
+        int sailWidth = 3 + row;
+        rect(mastX - sailWidth, mastTop + row, sailWidth + 1, 1,
+             row > 4 ? sailShade : sail);
+      }
+      if (tier >= 2) {
+        for (int row = 0; row < 5; row++) {
+          int sailWidth = 2 + row;
+          rect(mastX - sailWidth, mastTop + 9 + row, sailWidth + 1, 1,
+               row > 2 ? sailShade : sail);
+        }
+      }
+      if (mast == mastCount - 1) {
+        int wind = (frame % 3) - 1;
+        rect(mastX + 1 + wind, mastTop - 2, 4, 1, rgb(206, 56, 50));
+        rect(mastX + 1 + wind, mastTop - 1, 2, 1, rgb(206, 56, 50));
+      }
+    }
+  }
 
 }  // namespace chibi

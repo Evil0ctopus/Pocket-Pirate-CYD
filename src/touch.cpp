@@ -10,10 +10,13 @@ using namespace CheapBlackDisplay;
 namespace touch {
 
 namespace {
-// Edge state must be ISR-visible: release can happen while the UI core is
-// blocked in a ~35ms SPI present, and a re-press before the next poll must
-// still count as a new tap (v0.5.4 missed those).
+// Contact state is released only after a stable zero-touch report; this keeps
+// brief FT6336 register/INT glitches from turning one hold into multiple taps.
 volatile bool wasPressed = false;
+uint32_t releaseStartedAt = 0;
+uint32_t lastTapAt = 0;
+constexpr uint32_t kReleaseDebounceMs = 60;
+constexpr uint32_t kTapDebounceMs = 180;
 
 // Small ring so taps that arrive during present/draw are not overwritten.
 constexpr uint8_t kTapQ = 4;
@@ -33,18 +36,11 @@ void pushTap(int16_t x, int16_t y) {
   qHead = next;
 }
 
-bool intIsUp() {
-  return gpio_get_level(static_cast<gpio_num_t>(TOUCH_INT)) != 0;
-}
-
-// FT6336 INT is active-low while a finger is down. CHANGE + clear-on-rise
-// unsticks wasPressed the instant the finger lifts, even mid-present.
+// FT6336 may pulse INT while a contact remains active. Keep only an edge latch
+// for short taps that begin and end during a blocked display present.
 volatile bool irqLatch = false;
 void IRAM_ATTR touchIsr() {
   irqLatch = true;
-  if (gpio_get_level(static_cast<gpio_num_t>(TOUCH_INT)) != 0) {
-    wasPressed = false;  // release — next press can edge-detect
-  }
 }
 
 // Panel native 240×320 portrait → UI landscape 320×240 (rotation 1).
@@ -68,8 +64,8 @@ bool coordsPlausible(uint16_t rawX, uint16_t rawY) {
 
 void begin() {
   pinMode(TOUCH_INT, INPUT);
-  // CHANGE: press (falling) and release (rising). Release clears wasPressed
-  // in the ISR so rapid re-taps during SPI are not swallowed.
+  // CHANGE: latch both contact edges. The poller confirms a stable release
+  // before it rearms, while irqLatch preserves taps during a display present.
   attachInterrupt(digitalPinToInterrupt(TOUCH_INT), touchIsr, CHANGE);
 }
 
@@ -78,21 +74,12 @@ Point read() {
   bool irq = irqLatch;
   irqLatch = false;
 
-  // Soft-sync from the pin even if an ISR edge was missed.
-  if (intIsUp()) {
-    wasPressed = false;
-  }
-
   Wire.beginTransmission(TOUCH_ADDRESS);
   Wire.write(0x02);  // TD_STATUS
   if (Wire.endTransmission(false) != 0) {
-    // Do not clear wasPressed on I2C glitch while INT still says down —
-    // that would double-fire on the next good read.
-    if (intIsUp()) wasPressed = false;
     return p;
   }
   if (Wire.requestFrom(static_cast<int>(TOUCH_ADDRESS), 5) != 5) {
-    if (intIsUp()) wasPressed = false;
     return p;
   }
   uint8_t touches = Wire.read() & 0x0F;
@@ -102,23 +89,32 @@ Point read() {
   uint8_t yl = Wire.read();
   uint16_t rawX = static_cast<uint16_t>(((xh & 0x0F) << 8) | xl);
   uint16_t rawY = static_cast<uint16_t>(((yh & 0x0F) << 8) | yl);
-  // P1_XH event: 0=Down, 1=Up, 2=Contact.
-  uint8_t ev = static_cast<uint8_t>((xh >> 6) & 0x03);
-
   if (touches == 0) {
     // Short tap entirely inside a long present: IRQ latched; regs may still
     // hold the last point.
-    if (irq && !wasPressed && millis() > 1500 && coordsPlausible(rawX, rawY)) {
+    uint32_t now = millis();
+    if (!wasPressed && irq && now > 1500 &&
+        now - lastTapAt >= kTapDebounceMs && coordsPlausible(rawX, rawY)) {
       int16_t x = 0, y = 0;
       toLandscape(rawX, rawY, x, y);
       pushTap(x, y);
+      lastTapAt = now;
     }
-    wasPressed = false;
+    if (wasPressed) {
+      if (releaseStartedAt == 0) releaseStartedAt = now;
+      if (now - releaseStartedAt >= kReleaseDebounceMs) {
+        wasPressed = false;
+        releaseStartedAt = 0;
+      }
+    } else {
+      releaseStartedAt = 0;
+    }
     return p;
   }
 
   // Multitouch / palm: stay pressed, do not emit a new edge.
   if (touches > 1) {
+    releaseStartedAt = 0;
     wasPressed = true;
     toLandscape(rawX, rawY, p.x, p.y);
     p.pressed = true;
@@ -127,11 +123,14 @@ Point read() {
 
   toLandscape(rawX, rawY, p.x, p.y);
   p.pressed = true;
+  releaseStartedAt = 0;
 
-  // Rising edge, or controller Down after a missed release between polls.
-  bool newEdge = !wasPressed || (wasPressed && ev == 0);
-  if (newEdge && millis() > 1500) {
+  // A repeated Down register value or INT pulse while held is not another tap.
+  bool newEdge = !wasPressed;
+  uint32_t now = millis();
+  if (newEdge && now > 1500 && now - lastTapAt >= kTapDebounceMs) {
     pushTap(p.x, p.y);
+    lastTapAt = now;
   }
   wasPressed = true;
   return p;

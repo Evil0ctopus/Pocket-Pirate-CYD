@@ -7,9 +7,7 @@
 
 #include "pirate_theme.h"
 
-// Small shared color / drawing helpers — Ship OS 2026.
-// Opaque elevated panels, hairline cyber-teal borders, KPI cards, dense rows.
-// No fillSmooth* spam; solid fills only.
+// Shared color and pixel-panel helpers for the 320x240 pirate UI.
 namespace gfxu {
 
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -32,6 +30,21 @@ inline uint16_t darken(uint16_t c, uint8_t amt) {
   return blend565(c, 0x0000, amt);
 }
 
+inline void normalizePixelText(const char* input, char* output, size_t capacity) {
+  if (!capacity) return;
+  size_t source = 0, target = 0;
+  while (input && input[source] && target + 1 < capacity) {
+    if ((uint8_t)input[source] == 0xC2 &&
+        (uint8_t)input[source + 1] == 0xB7) {
+      output[target++] = '-';
+      source += 2;
+    } else {
+      output[target++] = input[source++];
+    }
+  }
+  output[target] = 0;
+}
+
 inline void vGradient(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       uint16_t top, uint16_t bot, int step = 1) {
   if (h <= 0 || w <= 0) return;
@@ -48,6 +61,9 @@ inline void vGradient(lgfx::LGFXBase& g, int x, int y, int w, int h,
 inline void printFit(lgfx::LGFXBase& g, int x, int y, int maxW, uint16_t fg,
                      uint8_t size, const char* s) {
   if (!s) return;
+  char normalized[128];
+  normalizePixelText(s, normalized, sizeof(normalized));
+  s = normalized;
   g.setTextSize(size);
   g.setTextColor(fg);
   const int gw = 6 * (int)size;
@@ -76,6 +92,9 @@ inline void printFit(lgfx::LGFXBase& g, int x, int y, int maxW, uint16_t fg,
 inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
                           uint16_t fg, uint8_t size, const char* s) {
   if (!s) return;
+  char normalized[128];
+  normalizePixelText(s, normalized, sizeof(normalized));
+  s = normalized;
   g.setTextSize(size);
   g.setTextColor(fg);
   int tw = (int)strlen(s) * 6 * (int)size;
@@ -88,11 +107,14 @@ inline void printCentered(lgfx::LGFXBase& g, int x, int y, int w, int h,
 inline void drawCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      uint16_t fill = theme::kPanel, uint16_t accent = 0,
                      int radius = theme::kRadiusCard) {
-  g.fillRoundRect(x, y, w, h, radius, fill);
-  g.drawRoundRect(x, y, w, h, radius, theme::kBorder);
+  (void)radius;
+  g.fillRect(x + 2, y + 2, w, h, theme::kBgDeep);
+  g.fillRect(x, y, w, h, fill);
+  g.drawRect(x, y, w, h, theme::kBorder);
+  g.drawFastHLine(x + 1, y + 1, w - 2, lighten(fill, 28));
   if (accent) {
     int aw = theme::kAccentW;
-    g.fillRect(x + 1, y + 2, aw, h - 4, accent);
+    g.fillRect(x + 2, y + 2, aw, h - 4, accent);
   }
 }
 
@@ -106,8 +128,11 @@ inline void drawBody(lgfx::LGFXBase& g, int x, int y, int w, int h) {
 // Elevated opaque panel (Material 3 Expressive — no blur).
 inline void drawElevated(lgfx::LGFXBase& g, int x, int y, int w, int h,
                          int radius = theme::kRadiusCard) {
-  g.fillRoundRect(x, y, w, h, radius, theme::kPanelElev);
-  g.drawRoundRect(x, y, w, h, radius, theme::kBorderHi);
+  (void)radius;
+  g.fillRect(x + 2, y + 2, w, h, theme::kBgDeep);
+  g.fillRect(x, y, w, h, theme::kPanelElev);
+  g.drawRect(x, y, w, h, theme::kBorderHi);
+  g.drawFastHLine(x + 1, y + 1, w - 2, lighten(theme::kPanelElev, 36));
 }
 
 // Primary CTA / secondary button.
@@ -118,8 +143,10 @@ inline void drawButton(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       ? fillOverride
                       : (primary ? theme::kGold : theme::kPanelHi);
   uint16_t fg = primary ? theme::kOnGold : theme::kInk;
-  g.fillRoundRect(x, y, w, h, theme::kRadiusBtn, fill);
-  if (!primary) g.drawRoundRect(x, y, w, h, theme::kRadiusBtn, theme::kBorder);
+  if (primary) g.fillRect(x + 2, y + 2, w, h, theme::kBgDeep);
+  g.fillRect(x, y, w, h, fill);
+  g.drawRect(x, y, w, h, primary ? lighten(fill, 48) : theme::kBorder);
+  g.drawFastHLine(x + 1, y + 1, w - 2, lighten(fill, 70));
   printCentered(g, x, y, w, h, fg, 1, label);
 }
 
@@ -128,9 +155,8 @@ inline void drawChip(lgfx::LGFXBase& g, int x, int y, int w, int h,
                      const char* label, bool on, uint16_t onColor = theme::kGold) {
   uint16_t fill = on ? onColor : theme::kPanelSoft;
   uint16_t fg = on ? theme::kOnGold : theme::kInkDim;
-  g.fillRoundRect(x, y, w, h, theme::kRadiusChip, fill);
-  g.drawRoundRect(x, y, w, h, theme::kRadiusChip,
-                  on ? lighten(onColor, 40) : theme::kBorderHi);
+  g.fillRect(x, y, w, h, fill);
+  g.drawRect(x, y, w, h, on ? lighten(onColor, 40) : theme::kBorderHi);
   printCentered(g, x, y, w, h, fg, 1, label);
 }
 
@@ -143,8 +169,8 @@ inline void drawSeparator(lgfx::LGFXBase& g, int x, int y, int w) {
 inline void drawBadge(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       const char* label, uint16_t fg,
                       uint16_t fill = theme::kPanelSoft) {
-  g.fillRoundRect(x, y, w, h, 3, fill);
-  g.drawRoundRect(x, y, w, h, 3, theme::kBorder);
+  g.fillRect(x, y, w, h, fill);
+  g.drawRect(x, y, w, h, theme::kBorder);
   printCentered(g, x, y, w, h, fg, 1, label);
 }
 
@@ -153,8 +179,9 @@ inline void drawKpiCard(lgfx::LGFXBase& g, int x, int y, int w, int h,
                         const char* value, const char* label,
                         uint16_t valueColor = theme::kTeal,
                         uint16_t accent = 0) {
-  g.fillRoundRect(x, y, w, h, 5, theme::kPanelElev);
-  g.drawRoundRect(x, y, w, h, 5, theme::kBorder);
+  g.fillRect(x + 2, y + 2, w, h, theme::kBgDeep);
+  g.fillRect(x, y, w, h, theme::kPanelElev);
+  g.drawRect(x, y, w, h, theme::kBorderHi);
   if (accent) g.fillRect(x + 1, y + 2, theme::kAccentW, h - 4, accent);
   int inset = accent ? 6 : 4;
   g.setTextSize(2);
@@ -218,8 +245,8 @@ inline void drawListRow(lgfx::LGFXBase& g, int x, int y, int w, int h, int index
 inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
                       const char* label, const char* value,
                       uint16_t valueColor = theme::kInk) {
-  g.fillRoundRect(x, y, w, h, 4, theme::kPanelSoft);
-  g.drawRoundRect(x, y, w, h, 4, theme::kBorder);
+  g.fillRect(x, y, w, h, theme::kPanelSoft);
+  g.drawRect(x, y, w, h, theme::kBorder);
   g.setTextSize(1);
   g.setTextColor(theme::kInkDim);
   g.setCursor(x + 8, y + (h - 8) / 2);
@@ -234,12 +261,11 @@ inline void drawKVRow(lgfx::LGFXBase& g, int x, int y, int w, int h,
 
 // Toolbar well for chips / filters.
 inline void drawToolbar(lgfx::LGFXBase& g, int x, int y, int w, int h) {
-  g.fillRoundRect(x, y, w, h, 4, theme::kPanelSoft);
-  g.drawRoundRect(x, y, w, h, 4, theme::kBorder);
+  g.fillRect(x, y, w, h, theme::kPanelSoft);
+  g.drawRect(x, y, w, h, theme::kBorder);
 }
 
-// Station glyph — detailed finished vectors (pirate / Ship OS 2026).
-// Solid fills only (no fillSmooth*). Designed for ~9–12px radius tiles.
+// Station glyphs sit on square, two-tone pixel backplates.
 inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
                       uint16_t accent) {
   uint16_t ink = theme::kInk;
@@ -247,12 +273,12 @@ inline void drawGlyph(lgfx::LGFXBase& g, int cx, int cy, int r, int kind,
   uint16_t gold = theme::kGold;
   uint16_t deep = theme::kBgDeep;
   uint16_t elev = theme::kPanelElev;
-  // Disc + dual-ring bezel
-  g.fillCircle(cx, cy, r, elev);
-  g.drawCircle(cx, cy, r, accent);
-  g.drawCircle(cx, cy, r - 1, darken(accent, 80));
-  // Tiny accent pip at 1-o'clock
-  g.fillCircle(cx + r - 2, cy - r + 3, 1, gold);
+  g.fillRect(cx - r + 2, cy - r + 2, r * 2, r * 2, deep);
+  g.fillRect(cx - r, cy - r, r * 2, r * 2, elev);
+  g.drawRect(cx - r, cy - r, r * 2, r * 2, accent);
+  g.drawRect(cx - r + 2, cy - r + 2, r * 2 - 4, r * 2 - 4,
+             darken(accent, 80));
+  g.fillRect(cx + r - 3, cy - r + 2, 2, 2, gold);
 
   uint16_t c = accent;
   switch (kind % 15) {
@@ -395,10 +421,12 @@ inline void textAt(lgfx::LGFXBase& g, int x, int y, uint16_t fg, uint8_t size,
   va_start(a, fmt);
   vsnprintf(b, sizeof(b), fmt, a);
   va_end(a);
+  char normalized[96];
+  normalizePixelText(b, normalized, sizeof(normalized));
   g.setTextSize(size);
   g.setTextColor(fg);
   g.setCursor(x, y);
-  g.print(b);
+  g.print(normalized);
 }
 
 }  // namespace gfxu

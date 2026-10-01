@@ -46,11 +46,13 @@ void txt(int x, int y, uint16_t fg, uint8_t size, const char* fmt, ...) {
   va_start(a, fmt);
   vsnprintf(b, sizeof(b), fmt, a);
   va_end(a);
+  char normalized[96];
+  gfxu::normalizePixelText(b, normalized, sizeof(normalized));
   auto& g = G();
   g.setTextSize(size);
   g.setTextColor(fg);  // transparent bg — no Win95 opaque dump
   g.setCursor(x, y);
-  g.print(b);
+  g.print(normalized);
 }
 
 void btn(int x, int y, int w, int h, const char* label, bool primary = true,
@@ -462,10 +464,22 @@ struct BleDev {
   uint8_t kind;       // 0 generic, 1 tracker, 2 camera-ish
   uint16_t company;   // BLE SIG company id from manufacturer data (0 = none)
   char detail[22];    // decoded advertisement summary (iBeacon/Eddystone/...)
+  char serviceUuid[40];
+  uint8_t serviceCount;
+  uint8_t addressType;
+  uint16_t appearance;
+  int8_t txPower;
+  bool connectable;
+  bool hasAppearance;
+  bool hasTxPower;
 };
 BleDev g_ble[48];
 int g_bleCount = 0;
 bool g_bleInited = false;
+BleDev g_bleWork[48];
+int g_bleWorkCount = 0;
+volatile bool g_blePublishPending = false;
+uint32_t g_bleGeneration = 0;
 std::set<uint64_t> g_seenBle;
 
 // A small subset of the Bluetooth SIG "Company Identifiers" registry -- the
@@ -584,16 +598,35 @@ void decodeBle(BLEAdvertisedDevice& d, BleDev& e) {
 
 class BleCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice d) override {
-    if (g_bleCount >= (int)(sizeof(g_ble) / sizeof(g_ble[0]))) return;
+    if (g_bleWorkCount >= (int)(sizeof(g_bleWork) / sizeof(g_bleWork[0])))
+      return;
     String mac = String(d.getAddress().toString().c_str());
-    for (int i = 0; i < g_bleCount; i++)
-      if (g_ble[i].mac == mac) return;  // already in this pass
-    BleDev& e = g_ble[g_bleCount++];
+    for (int i = 0; i < g_bleWorkCount; i++)
+      if (g_bleWork[i].mac == mac) return;  // already in this pass
+    BleDev& e = g_bleWork[g_bleWorkCount++];
     e.mac = mac;
     e.name = d.haveName() ? String(d.getName().c_str()) : String("");
     e.rssi = d.getRSSI();
     e.kind = classifyBle(d);
     decodeBle(d, e);
+    e.serviceUuid[0] = 0;
+    e.serviceCount = (uint8_t)min(d.getServiceUUIDCount(), 255);
+    if (d.haveServiceUUID()) {
+      String uuid = String(d.getServiceUUID().toString().c_str());
+      snprintf(e.serviceUuid, sizeof(e.serviceUuid), "%s", uuid.c_str());
+    } else if (d.getServiceDataCount() > 0) {
+      String uuid = String(d.getServiceDataUUID(0).toString().c_str());
+      snprintf(e.serviceUuid, sizeof(e.serviceUuid), "%s", uuid.c_str());
+    }
+      e.serviceCount = (uint8_t)min(d.getServiceUUIDCount() +
+                                        d.getServiceDataCount(),
+                                    255);
+    e.addressType = d.getAddressType();
+    e.connectable = d.isConnectable();
+    e.hasAppearance = d.haveAppearance();
+    e.appearance = e.hasAppearance ? d.getAppearance() : 0;
+    e.hasTxPower = d.haveTXPower();
+    e.txPower = e.hasTxPower ? d.getTXPower() : 0;
 
     uint64_t k = macKey(mac);
     if (g_seenBle.insert(k).second) {
@@ -622,6 +655,7 @@ bool g_bleScanning = false;
 
 void bleScanDone(BLEScanResults) {
   g_bleScanning = false;
+  g_blePublishPending = true;
   if (g_bleScan) g_bleScan->clearResults();
 }
 
@@ -634,13 +668,19 @@ void bleStop() {
 }
 
 void bleTick(uint32_t now) {
+  if (g_blePublishPending) {
+    g_blePublishPending = false;
+    g_bleCount = g_bleWorkCount;
+    for (int i = 0; i < g_bleCount; i++) g_ble[i] = g_bleWork[i];
+    g_bleGeneration++;
+  }
   // Shared 2.4 GHz radio — never start BLE while WiFi scan/promisc is armed.
   if (g_rfWant != RfWant::Idle) return;
   bleEnsureInit();
   if (g_bleScanning) return;
   if (now - g_bleLastScan < 3000) return;
   g_bleLastScan = now;
-  g_bleCount = 0;
+  g_bleWorkCount = 0;
   g_bleScanning = true;
   // duration=1s, callback form returns immediately (no UI freeze).
   g_bleScan->start(1, bleScanDone, false);
@@ -658,9 +698,19 @@ struct CnNet {
   int32_t rssi;
   uint8_t channel;
   wifi_auth_mode_t auth;
+  int8_t rssiDelta;
+  bool isNew;
+  bool channelChanged;
+  bool securityChanged;
 };
 CnNet cnNets[48];
+CnNet cnPreviousNets[48];
 int cnCount = 0;
+int cnPreviousCount = 0;
+int cnNewCount = 0;
+int cnGoneCount = 0;
+int cnChannelChangeCount = 0;
+int cnSecurityChangeCount = 0;
 int cnProcessed = -1;
 uint32_t cnLast = 0;
 int cnScroll = 0;          // first visible row
@@ -671,6 +721,8 @@ uint8_t cnDetailBssid[6] = {0};
 
 int cnVisibleIdx[48];
 int cnVisibleCount = 0;
+int cnChannelFilter = 0;
+bool cnSpectrumView = false;
 
 // Pin/Watch — passive RSSI time series for one BSSID (no associate / TX).
 bool cnWatching = false;
@@ -758,6 +810,7 @@ void cnRebuildVisible() {
     bool open = (cnNets[i].auth == WIFI_AUTH_OPEN);
     if (cnFilter == 1 && !open) continue;
     if (cnFilter == 2 && open) continue;
+    if (cnChannelFilter && cnNets[i].channel != cnChannelFilter) continue;
     cnVisibleIdx[cnVisibleCount++] = i;
   }
   auto cmp = [](int a, int b) {
@@ -788,6 +841,14 @@ void cnRebuildVisible() {
 
 void cnCapture(int st) {
   (void)st;
+  int previousCount = cnCount;
+  if (previousCount > 0)
+    memcpy(cnPreviousNets, cnNets, previousCount * sizeof(CnNet));
+  cnPreviousCount = previousCount;
+  bool previousMatched[48] = {};
+  cnNewCount = 0;
+  cnChannelChangeCount = 0;
+  cnSecurityChangeCount = 0;
   int n = g_rfNetCount;
   if (n < 0) n = 0;
   if (n > 48) n = 48;
@@ -800,7 +861,30 @@ void cnCapture(int st) {
     dst.rssi = s.rssi;
     dst.channel = s.channel;
     dst.auth = s.auth;
+    dst.rssiDelta = 0;
+    dst.isNew = true;
+    dst.channelChanged = false;
+    dst.securityChanged = false;
+    for (int old = 0; old < cnPreviousCount; old++) {
+      const CnNet& prev = cnPreviousNets[old];
+      if (memcmp(prev.bssid, dst.bssid, 6) != 0) continue;
+      previousMatched[old] = true;
+      dst.isNew = false;
+      int delta = dst.rssi - prev.rssi;
+      if (delta < -127) delta = -127;
+      if (delta > 127) delta = 127;
+      dst.rssiDelta = (int8_t)delta;
+      dst.channelChanged = dst.channel != prev.channel;
+      dst.securityChanged = dst.auth != prev.auth;
+      if (dst.channelChanged) cnChannelChangeCount++;
+      if (dst.securityChanged) cnSecurityChangeCount++;
+      break;
+    }
+    if (dst.isNew) cnNewCount++;
   }
+  cnGoneCount = 0;
+  for (int i = 0; i < cnPreviousCount; i++)
+    if (!previousMatched[i]) cnGoneCount++;
   g_lastWifiCount = cnCount;
   cnRebuildVisible();
   // Re-bind detail / watch by BSSID — scan order changes each sweep.
@@ -899,6 +983,8 @@ void cnOpen() {
   cnScroll = 0;
   cnFilter = 0;  // never open into a filter that hides every row
   cnSort = 0;
+  cnChannelFilter = 0;
+  cnSpectrumView = false;
   // Keep an active watch across reopen so Pin survives Back→Nest.
   wifiScanBegin();  // arm only — RF deferred
   cnLast = millis();
@@ -908,6 +994,7 @@ void cnTick(uint32_t now) {
   if (st >= 0 && st != cnProcessed) {
     cnProcessed = st;
     cnCapture(st);
+    cnLast = now;
     for (int i = 0; i < cnCount; i++) {
       uint64_t k = bssidKey(cnNets[i].bssid);
       if (g_seenAp.insert(k).second) {
@@ -918,10 +1005,9 @@ void cnTick(uint32_t now) {
     }
     if (!cnWatching) tools::toast("Charted %d networks", st);
   }
-  // Passive refresh while watching or viewing detail (RSSI updates / sparkline).
-  const bool wantRefresh = cnWatching || cnDetail >= 0;
-  const uint32_t refreshMs = cnWatching ? 3500u : 5000u;
-  if (wantRefresh && st >= 0 && st == cnProcessed && now - cnLast > refreshMs) {
+  // Keep the AP list live; watch/detail views poll faster for RSSI history.
+  const uint32_t refreshMs = cnWatching ? 3500u : (cnDetail >= 0 ? 6500u : 12000u);
+  if (st >= 0 && st == cnProcessed && now - cnLast > refreshMs) {
     wifiScanBegin();
     cnLast = now;
     cnProcessed = -1;
@@ -1041,8 +1127,8 @@ void cnDrawList(int x, int y, int w, int h) {
          theme::kTeal);
   }
   chip(x + 236, below + 2, 44, theme::kChipH, "SAVE", false, theme::kGold);
-  if (cnWatching)
-    chip(x + 284, below + 2, 28, theme::kChipH, "PIN", true, theme::kWarn);
+  chip(x + 284, below + 2, 28, theme::kChipH, "MAP", cnSpectrumView,
+       theme::kCyan);
 
   constexpr int kRh = theme::kRowH;
   const int listTop = below + 22;
@@ -1082,6 +1168,22 @@ void cnDrawList(int x, int y, int w, int h) {
       snprintf(sec, sizeof(sec), "%s ch%u", band, (unsigned)n.channel);
     if (strlen(sec) > 22) sec[22] = 0;
     txt(x + 28, ry + 10, theme::kInkMuted, 1, "%s", sec);
+    char change[8] = "";
+    uint16_t changeColor = theme::kInkMuted;
+    if (n.isNew) {
+      snprintf(change, sizeof(change), "NEW");
+      changeColor = theme::kGood;
+    } else if (n.securityChanged) {
+      snprintf(change, sizeof(change), "SEC");
+      changeColor = theme::kBad;
+    } else if (n.channelChanged) {
+      snprintf(change, sizeof(change), "CHG");
+      changeColor = theme::kWarn;
+    } else if (n.rssiDelta >= 8 || n.rssiDelta <= -8) {
+      snprintf(change, sizeof(change), "%+ddB", (int)n.rssiDelta);
+      changeColor = n.rssiDelta > 0 ? theme::kGood : theme::kWarn;
+    }
+    if (change[0]) txt(x + 180, ry + 5, changeColor, 1, "%s", change);
     txt(x + 234, ry + 5, riskColor(encRisk(n.auth)), 1, "%s", encLabel(n.auth));
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 40, theme::kBorder);
   }
@@ -1098,15 +1200,167 @@ void cnDrawList(int x, int y, int w, int h) {
     btn(x + w - 30, listTop, 26, 20, "^", false);
   if (cnScroll + kRows < cnVisibleCount)
     btn(x + w - 30, y + h - 28, 26, 20, "v", false);
-  txt(x + 8, y + h - 10, theme::kInkMuted, 1,
-      cnWatching ? "PIN active · row=detail · SAVE=/log"
-                 : "Tap row=detail · SAVE=/log · empty=rescan");
+  char hint[64];
+  if (cnChannelFilter)
+    snprintf(hint, sizeof(hint), "CH %02d · MAP=chart · sweep +%d/-%d",
+             cnChannelFilter, cnNewCount, cnGoneCount);
+  else if (cnWatching)
+    snprintf(hint, sizeof(hint), "PIN active · row=detail · sweep +%d/-%d",
+             cnNewCount, cnGoneCount);
+  else
+    snprintf(hint, sizeof(hint), "row=detail · MAP=channels · sweep +%d/-%d",
+             cnNewCount, cnGoneCount);
+  gfxu::printFit(G(), x + 8, y + h - 10, w - 16, theme::kInkMuted, 1, hint);
 }
+
+void cnDrawSpectrum(int x, int y, int w, int h) {
+  body(x, y, w, h);
+  int openCount = 0;
+  int channelCount[15] = {};
+  int channelStrong[15] = {};
+  int channelMedium[15] = {};
+  int channelWeak[15] = {};
+  int maxLoad = 0;
+  int busiestChannel = 0;
+  for (int i = 0; i < cnCount; i++) {
+    const CnNet& n = cnNets[i];
+    if (n.auth == WIFI_AUTH_OPEN) openCount++;
+    if (n.channel < 1 || n.channel > 14) continue;
+    int ch = n.channel;
+    channelCount[ch]++;
+    if (n.rssi >= -55) channelStrong[ch]++;
+    else if (n.rssi >= -75) channelMedium[ch]++;
+    else channelWeak[ch]++;
+    if (channelCount[ch] > maxLoad) {
+      maxLoad = channelCount[ch];
+      busiestChannel = ch;
+    }
+  }
+
+  char vAps[8], vOpen[8], vDelta[16];
+  snprintf(vAps, sizeof(vAps), "%d", cnCount);
+  snprintf(vOpen, sizeof(vOpen), "%d", openCount);
+  snprintf(vDelta, sizeof(vDelta), "+%d/-%d", cnNewCount, cnGoneCount);
+  const char* values[] = {vAps, vOpen, vDelta};
+  const char* labels[] = {"APs", "open", "new / lost"};
+  const uint16_t colors[] = {theme::kCyan,
+                             openCount ? theme::kBad : theme::kGood,
+                             (cnNewCount || cnGoneCount) ? theme::kGold
+                                                         : theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors) + 2;
+  txt(x + 8, below, theme::kInkDim, 1,
+      "2.4 GHz AP channel occupancy · tap a channel to focus");
+
+  const int chartX = x + 9;
+  const int chartW = w - 18;
+  const int top = y + 55;
+  const int base = y + 130;
+  const int plotHeight = base - top;
+  auto& g = G();
+  for (int line = 0; line < 4; line++) {
+    int gy = base - (plotHeight * line) / 3;
+    g.drawFastHLine(chartX, gy, chartW, line == 0 ? theme::kBorderHi
+                                                  : theme::kBorder);
+    if (line == 0 || line == 2 || line == 3) {
+      int tick = line == 0 ? maxLoad : (line == 2 ? maxLoad / 2 : 0);
+      char tickLabel[5];
+      snprintf(tickLabel, sizeof(tickLabel), "%d", tick);
+      gfxu::printFit(g, x + 1, gy - 4, 8, theme::kInkMuted, 1, tickLabel);
+    }
+  }
+  const int slot = chartW / 14;
+  const int barW = 10;
+  for (int ch = 1; ch <= 14; ch++) {
+    int center = chartX + (ch - 1) * slot + slot / 2;
+    int weakH = maxLoad ? channelWeak[ch] * (plotHeight - 13) / maxLoad : 0;
+    int medH = maxLoad ? channelMedium[ch] * (plotHeight - 13) / maxLoad : 0;
+    int strongH = maxLoad ? channelStrong[ch] * (plotHeight - 13) / maxLoad : 0;
+    int cursor = base;
+    if (weakH) {
+      cursor -= weakH;
+      g.fillRect(center - barW / 2, cursor, barW, weakH, theme::kLocked);
+    }
+    if (medH) {
+      cursor -= medH;
+      g.fillRect(center - barW / 2, cursor, barW, medH, theme::kCyan);
+    }
+    if (strongH) {
+      cursor -= strongH;
+      g.fillRect(center - barW / 2, cursor, barW, strongH, theme::kGold);
+    }
+    if (channelCount[ch])
+      gfxu::printCentered(g, center - slot / 2, cursor - 10, slot, 8,
+                          theme::kInk, 1, String(channelCount[ch]).c_str());
+    char channelLabel[4];
+    snprintf(channelLabel, sizeof(channelLabel), "%d", ch);
+    uint16_t labelColor = cnChannelFilter == ch ? theme::kGold
+                                                : theme::kInkMuted;
+    gfxu::printCentered(g, center - slot / 2, base + 2, slot, 9, labelColor, 1,
+                        channelLabel);
+  }
+
+  int legendY = y + 144;
+  g.fillRect(x + 10, legendY + 1, 5, 5, theme::kGold);
+  txt(x + 18, legendY, theme::kInkMuted, 1, "strong");
+  g.fillRect(x + 66, legendY + 1, 5, 5, theme::kCyan);
+  txt(x + 74, legendY, theme::kInkMuted, 1, "medium");
+  g.fillRect(x + 132, legendY + 1, 5, 5, theme::kLocked);
+  txt(x + 140, legendY, theme::kInkMuted, 1, "weak");
+  char summary[52];
+  snprintf(summary, sizeof(summary), "Busy ch %02d (%d AP) · moved %d · auth changed %d",
+           busiestChannel, maxLoad, cnChannelChangeCount, cnSecurityChangeCount);
+  gfxu::printFit(g, x + 10, y + 160, w - 20, theme::kInkDim, 1, summary);
+
+  const int buttonY = y + h - 28;
+  btn(x + 6, buttonY, 68, 24, "LIST", true, theme::kCyan);
+  btn(x + 82, buttonY, 68, 24, "SAVE", false);
+  btn(x + 158, buttonY, 68, 24, "SCAN", false);
+  btn(x + 234, buttonY, 78, 24, "ALL CH", false);
+}
+
+bool cnSpectrumTouch(int16_t x, int16_t y) {
+  if (y >= 208) {
+    if (x < 78) {
+      cnSpectrumView = false;
+    } else if (x < 154) {
+      cnSaveSurvey(nullptr, 0);
+    } else if (x < 230) {
+      wifiScanBegin();
+      cnLast = millis();
+      cnProcessed = -1;
+    } else {
+      cnChannelFilter = 0;
+      cnSpectrumView = false;
+      cnScroll = 0;
+      cnRebuildVisible();
+    }
+    return true;
+  }
+  const int chartX = 9;
+  const int chartW = theme::kScreenW - 18;
+  if (y >= 88 && y <= 176 && x >= chartX && x < chartX + chartW) {
+    int slot = chartW / 14;
+    int channel = (x - chartX) / slot + 1;
+    if (channel >= 1 && channel <= 14) {
+      cnChannelFilter = cnChannelFilter == channel ? 0 : channel;
+      cnSpectrumView = false;
+      cnScroll = 0;
+      cnRebuildVisible();
+      tools::toast(cnChannelFilter ? "Focus: channel %d" : "Channel focus cleared",
+                   cnChannelFilter);
+    }
+    return true;
+  }
+  return true;
+}
+
 void cnDraw(int x, int y, int w, int h) {
-  if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
+  if (cnSpectrumView) cnDrawSpectrum(x, y, w, h);
+  else if (cnDetail >= 0) cnDrawDetail(x, y, w, h);
   else cnDrawList(x, y, w, h);
 }
 bool cnTouch(int16_t x, int16_t y) {
+  if (cnSpectrumView) return cnSpectrumTouch(x, y);
   // Absolute screen coords. Layout: KPI + gap + toolbar(20) + list.
   // Must match cnDrawList: below = ct+2+kKpiH+2, listTop = below+22.
   int ly = y;
@@ -1181,15 +1435,8 @@ bool cnTouch(int16_t x, int16_t y) {
       cnSaveSurvey(nullptr, 0);
       return true;
     }
-    if (cx >= 284 && cx <= 312 && cnWatching) {
-      // Jump to watched AP detail if still in buffer.
-      int i = cnFindBssid(cnWatchBssid);
-      if (i >= 0) {
-        cnDetail = i;
-        memcpy(cnDetailBssid, cnWatchBssid, 6);
-      } else {
-        tools::toast("Pin not in last sweep");
-      }
+    if (cx >= 284 && cx <= 312) {
+      cnSpectrumView = !cnSpectrumView;
       return true;
     }
   }
@@ -1223,47 +1470,228 @@ bool cnTouch(int16_t x, int16_t y) {
 //  2. Harbor Ledger -- BLE discovery
 // ===========================================================================
 namespace {
-void hlOpen() { g_bleLastScan = 0; }
-void hlTick(uint32_t now) { bleTick(now); }
-void hlClose() { bleStop(); }
-void hlDraw(int x, int y, int w, int h) {
-  body(x, y, w, h);
-  int trackers = 0;
-  for (int i = 0; i < g_bleCount; i++)
-    if (g_ble[i].kind == 1) trackers++;
-  char vBottles[8], vTrack[8], vSeen[8];
-  snprintf(vBottles, sizeof(vBottles), "%d", g_bleCount);
-  snprintf(vTrack, sizeof(vTrack), "%d", trackers);
-  snprintf(vSeen, sizeof(vSeen), "%lu", (unsigned long)g_seenBle.size());
-  const char* vals[] = {vBottles, vTrack, vSeen};
-  const char* labs[] = {"adrift", "trackers", "session"};
-  uint16_t cols[] = {theme::kCyan, trackers ? theme::kWarn : theme::kGood,
-                     theme::kTeal};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkMuted, 1, "passive BLE · Field Tablet");
-  below += 12;
-  constexpr int kRh = theme::kRowHCompact;
-  int rows = min(g_bleCount, 9);
-  for (int i = 0; i < rows; i++) {
-    int ry = below + i * kRh;
-    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    rssiBars(x + 8, ry + 3, g_ble[i].rssi);
-    String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
-    if (label.length() > 16) label = label.substring(0, 16);
-    uint16_t c = g_ble[i].kind == 1 ? theme::kWarn : theme::kInk;
-    txt(x + 28, ry + 1, c, 1, "%s", label.c_str());
-    const char* ven = oui::vendorStr(g_ble[i].mac);
-    char meta[24];
-    if (ven[0])
-      snprintf(meta, sizeof(meta), "%.7s %ddB", ven, g_ble[i].rssi);
-    else
-      snprintf(meta, sizeof(meta), "%ddB", g_ble[i].rssi);
-    int mw = (int)strlen(meta) * 6;
-    txt(x + w - mw - 10, ry + 4, theme::kInkDim, 1, "%s", meta);
-    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
+int hlFilter = 0;  // all, named, identified, tracker
+int hlSort = 0;    // RSSI, name
+int hlScroll = 0;
+int hlVisible[48];
+int hlVisibleCount = 0;
+uint32_t hlGeneration = 0;
+bool hlHasDetail = false;
+BleDev hlDetail{};
+
+void hlRebuild() {
+  hlVisibleCount = 0;
+  for (int i = 0; i < g_bleCount; i++) {
+    const BleDev& d = g_ble[i];
+    bool named = d.name.length() > 0;
+    bool identified = d.company || d.serviceUuid[0] || d.detail[0];
+    if (hlFilter == 1 && !named) continue;
+    if (hlFilter == 2 && !identified) continue;
+    if (hlFilter == 3 && d.kind != 1) continue;
+    hlVisible[hlVisibleCount++] = i;
+  }
+  auto before = [](int a, int b) {
+    if (hlSort == 1) {
+      const char* an = g_ble[a].name.length() ? g_ble[a].name.c_str()
+                                               : g_ble[a].mac.c_str();
+      const char* bn = g_ble[b].name.length() ? g_ble[b].name.c_str()
+                                               : g_ble[b].mac.c_str();
+      int cmp = strcasecmp(an, bn);
+      if (cmp) return cmp < 0;
+    }
+    return g_ble[a].rssi > g_ble[b].rssi;
+  };
+  for (int i = 1; i < hlVisibleCount; i++) {
+    int index = hlVisible[i], j = i;
+    while (j > 0 && before(index, hlVisible[j - 1])) {
+      hlVisible[j] = hlVisible[j - 1];
+      j--;
+    }
+    hlVisible[j] = index;
+  }
+  int maxScroll = max(0, hlVisibleCount - 7);
+  if (hlScroll > maxScroll) hlScroll = maxScroll;
+}
+
+void hlOpen() {
+  hlFilter = 0;
+  hlSort = 0;
+  hlScroll = 0;
+  hlHasDetail = false;
+  hlGeneration = g_bleGeneration;
+  hlRebuild();
+  g_bleLastScan = 0;
+}
+void hlTick(uint32_t now) {
+  bleTick(now);
+  if (hlGeneration != g_bleGeneration) {
+    hlGeneration = g_bleGeneration;
+    hlRebuild();
   }
 }
-bool hlTouch(int16_t, int16_t) { return false; }
+void hlClose() {
+  bleStop();
+  hlHasDetail = false;
+}
+
+void hlDrawDetail(int x, int y, int w, int h) {
+  body(x, y, w, h);
+  const BleDev& d = hlDetail;
+  char rssi[12], type[16], count[8], mac[20], service[44], vendor[24];
+  snprintf(rssi, sizeof(rssi), "%d", d.rssi);
+  snprintf(type, sizeof(type), "%s", d.kind == 1 ? "TRACKER" : "DEVICE");
+  snprintf(count, sizeof(count), "%u", d.serviceCount);
+  snprintf(mac, sizeof(mac), "%s", d.mac.c_str());
+  snprintf(service, sizeof(service), "%s", d.serviceUuid[0] ? d.serviceUuid
+                                                             : "not advertised");
+  const char* vendorName = oui::vendorStr(d.mac);
+  snprintf(vendor, sizeof(vendor), "%s", vendorName[0] ? vendorName : "unknown");
+  const char* values[] = {rssi, type, count};
+  const char* labels[] = {"RSSI dBm", "class", "services"};
+  const uint16_t colors[] = {theme::kCyan,
+                             d.kind == 1 ? theme::kWarn : theme::kGood,
+                             d.serviceCount ? theme::kTeal : theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors) + 3;
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "Address", mac, theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 20, w - 12, 18, "Vendor", vendor,
+                  theme::kTeal);
+  gfxu::drawKVRow(G(), x + 6, below + 40, w - 12, 18, "Service UUID", service,
+                  theme::kInk);
+  char power[20], addressType[20], appearance[20];
+  snprintf(power, sizeof(power), "%s%d dBm", d.hasTxPower ? "" : "n/a ",
+           d.hasTxPower ? d.txPower : 0);
+  snprintf(addressType, sizeof(addressType), "%u", d.addressType);
+  if (d.hasAppearance)
+    snprintf(appearance, sizeof(appearance), "0x%04X", d.appearance);
+  else
+    snprintf(appearance, sizeof(appearance), "not advertised");
+  gfxu::drawKVRow(G(), x + 6, below + 60, w - 12, 18, "TX power", power);
+  gfxu::drawKVRow(G(), x + 6, below + 80, w - 12, 18, "Address type",
+                  addressType);
+  gfxu::drawKVRow(G(), x + 6, below + 100, w - 12, 18, "Appearance",
+                  appearance);
+  txt(x + 10, y + h - 42, theme::kInkMuted, 1,
+      d.connectable ? "Advertising only · not connected"
+                    : "Non-connectable advertisement · public fields only");
+  btn(x + 6, y + h - 24, 72, 20, "BACK", false);
+}
+
+void hlDraw(int x, int y, int w, int h) {
+  if (hlHasDetail) {
+    hlDrawDetail(x, y, w, h);
+    return;
+  }
+  body(x, y, w, h);
+  int named = 0, identified = 0, trackers = 0;
+  for (int i = 0; i < g_bleCount; i++) {
+    if (g_ble[i].name.length()) named++;
+    if (g_ble[i].company || g_ble[i].serviceUuid[0] || g_ble[i].detail[0])
+      identified++;
+    if (g_ble[i].kind == 1) trackers++;
+  }
+  char vSeen[8], vNamed[8], vIds[8], vTrack[8];
+  snprintf(vSeen, sizeof(vSeen), "%d", g_bleCount);
+  snprintf(vNamed, sizeof(vNamed), "%d", named);
+  snprintf(vIds, sizeof(vIds), "%d", identified);
+  snprintf(vTrack, sizeof(vTrack), "%d", trackers);
+  const char* values[] = {vSeen, vNamed, vIds, vTrack};
+  const char* labels[] = {"seen", "named", "decoded", "trackers"};
+  const uint16_t colors[] = {theme::kCyan, theme::kInk, theme::kTeal,
+                             trackers ? theme::kWarn : theme::kGood};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, values, labels, colors) + 2;
+  gfxu::drawToolbar(G(), x + 4, below, w - 8, 18);
+  chip(x + 6, below + 1, 38, 16, "ALL", hlFilter == 0);
+  chip(x + 46, below + 1, 46, 16, "NAMED", hlFilter == 1);
+  chip(x + 94, below + 1, 40, 16, "ID", hlFilter == 2);
+  chip(x + 136, below + 1, 46, 16, "TAG", hlFilter == 3, theme::kWarn);
+  char sort[10];
+  snprintf(sort, sizeof(sort), "%s", hlSort ? "NAME" : "RSSI");
+  chip(x + 184, below + 1, 52, 16, sort, false, theme::kGold);
+  chip(x + 240, below + 1, 72, 16, "RESCAN", false, theme::kCyan);
+
+  int listTop = below + 20;
+  constexpr int rowH = 18;
+  int rows = min(hlVisibleCount - hlScroll, max(0, (y + h - 12 - listTop) / rowH));
+  if (!g_bleCount) {
+    gfxu::printFit(G(), x + 12, listTop + 8, w - 24, theme::kInkDim, 1,
+                   g_bleScanning ? "Scanning · awaiting first pass"
+                                 : "No devices · waiting for BLE scan");
+  }
+  for (int row = 0; row < rows; row++) {
+    int index = hlVisible[hlScroll + row];
+    const BleDev& d = g_ble[index];
+    int ry = listTop + row * rowH;
+    if (row & 1) G().fillRect(x + 4, ry, w - 8, rowH, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 3, d.rssi);
+    String label = d.name.length() ? d.name : d.mac;
+    if (label.length() > 24) label = label.substring(0, 24);
+    uint16_t color = d.kind == 1 ? theme::kWarn : theme::kInk;
+    gfxu::printFit(G(), x + 30, ry + 1, 170, color, 1, label.c_str());
+    char rssiText[12];
+    snprintf(rssiText, sizeof(rssiText), "%d dBm", d.rssi);
+    gfxu::printFit(G(), x + w - 52, ry + 1, 46, theme::kInkDim, 1, rssiText);
+    const char* vendorName = oui::vendorStr(d.mac);
+    char meta[44];
+    if (d.detail[0])
+      snprintf(meta, sizeof(meta), "%s%s", d.detail,
+               d.connectable ? " · connectable" : "");
+    else
+      snprintf(meta, sizeof(meta), "%s%s", vendorName[0] ? vendorName : "BLE",
+               d.connectable ? " · connectable" : " · beacon");
+    gfxu::printFit(G(), x + 30, ry + 9, 170, theme::kInkMuted, 1, meta);
+    if (d.serviceCount)
+      txt(x + 206, ry + 9, theme::kCyan, 1, "%u svc", d.serviceCount);
+    G().drawFastHLine(x + 8, ry + rowH - 1, w - 16, theme::kBorder);
+  }
+  if (hlScroll > 0) btn(x + w - 28, listTop, 24, 18, "^", false);
+  if (hlScroll + rows < hlVisibleCount)
+    btn(x + w - 28, y + h - 30, 24, 18, "v", false);
+  const char* scanLabel = g_bleScanning ? "Passive scan · previous sweep kept"
+                                        : "Passive scan · no connection";
+  gfxu::printFit(G(), x + 8, y + h - 10, w - 16, theme::kInkMuted, 1,
+                 scanLabel);
+}
+
+bool hlTouch(int16_t x, int16_t y) {
+  if (hlHasDetail) {
+    if (y >= theme::kScreenH - 34 && x < 90) hlHasDetail = false;
+    return true;
+  }
+  const int toolbarY = contentTop() + 32;
+  if (y >= toolbarY && y < toolbarY + 20) {
+    if (x < 45) hlFilter = 0;
+    else if (x < 93) hlFilter = 1;
+    else if (x < 135) hlFilter = 2;
+    else if (x < 183) hlFilter = 3;
+    else if (x < 238) hlSort = !hlSort;
+    else {
+      bleStop();
+      g_bleLastScan = 0;
+    }
+    hlScroll = 0;
+    hlRebuild();
+    return true;
+  }
+  const int listTop = toolbarY + 20;
+  constexpr int rowH = 18;
+  const int listBot = theme::kScreenH - 12;
+  const int rows = max(0, (listBot - listTop) / rowH);
+  if (x >= theme::kScreenW - 30) {
+    if (y < listTop + rowH && hlScroll > 0) hlScroll--;
+    else if (y > theme::kScreenH - 34 && hlScroll + rows < hlVisibleCount)
+      hlScroll++;
+    return true;
+  }
+  if (y >= listTop && y < listTop + rows * rowH) {
+    int row = (y - listTop) / rowH;
+    if (hlScroll + row < hlVisibleCount) {
+      hlDetail = g_ble[hlVisible[hlScroll + row]];
+      hlHasDetail = true;
+    }
+    return true;
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1272,8 +1700,15 @@ bool hlTouch(int16_t, int16_t) { return false; }
 namespace {
 const char* kWigleFile = "/wigle.csv";
 uint32_t crLoggedSession = 0;
+uint32_t crUniqueSession = 0;
+uint32_t crSweepCount = 0;
+uint32_t crNewLastSweep = 0;
+uint32_t crLastSweepAt = 0;
+int crLastSweepCount = 0;
+bool crPaused = false;
 int crProcessed = -1;
 bool crHeader = false;
+std::set<uint64_t> crSeenBssids;
 
 const char* wigleAuth(wifi_auth_mode_t m) {
   switch (m) {
@@ -1314,15 +1749,34 @@ void crEnsureHeader() {
 }
 void crOpen() {
   crProcessed = -1;
+  crLoggedSession = 0;
+  crUniqueSession = 0;
+  crSweepCount = 0;
+  crNewLastSweep = 0;
+  crLastSweepAt = 0;
+  crLastSweepCount = 0;
+  crPaused = false;
+  crSeenBssids.clear();
   crEnsureHeader();
   wifiScanBegin();
 }
 void crTick(uint32_t now) {
   (void)now;
+  if (crPaused) return;
   int st = wifiScanState();
   if (st >= 0 && st != crProcessed) {
     crProcessed = st;
     g_lastWifiCount = st;
+    crSweepCount++;
+    crLastSweepAt = millis();
+    crLastSweepCount = st;
+    crNewLastSweep = 0;
+    for (int i = 0; i < g_rfNetCount && i < st; i++) {
+      if (crSeenBssids.insert(bssidKey(g_rfNets[i].bssid)).second) {
+        crUniqueSession++;
+        crNewLastSweep++;
+      }
+    }
     if (app::sdReady()) {
       File f = SD_MMC.open(kWigleFile, FILE_APPEND);
       if (f) {
@@ -1356,7 +1810,6 @@ void crTick(uint32_t now) {
         }
         f.close();
         game::addLoot(game::Loot::Cargo, 1);
-        tools::toast(fix ? "Logged %d + GPS" : "Logged %d (no GPS)", st);
       }
     }
     wifiScanBegin();
@@ -1366,31 +1819,83 @@ void crClose() { wifiRfLeave(); }
 void crDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   bool fix = gps::hasFix();
-  char vRows[10], vGps[8], vSd[8];
+  char vRows[10], vUnique[10], vNew[10], vGps[8];
   snprintf(vRows, sizeof(vRows), "%lu", (unsigned long)crLoggedSession);
+  snprintf(vUnique, sizeof(vUnique), "%lu", (unsigned long)crUniqueSession);
+  snprintf(vNew, sizeof(vNew), "+%lu", (unsigned long)crNewLastSweep);
   snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
-  snprintf(vSd, sizeof(vSd), "%s", app::sdReady() ? "OK" : "--");
-  const char* vals[] = {vRows, vGps, vSd};
-  const char* labs[] = {"logged", "GPS", "SD"};
-  uint16_t cols[] = {theme::kGold, fix ? theme::kGood : theme::kWarn,
-                     app::sdReady() ? theme::kGood : theme::kBad};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 6;
-  char v[48];
-  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "WiGLE file", kWigleFile,
-                  theme::kCyan);
-  if (fix) {
-    snprintf(v, sizeof(v), "%.5f, %.5f  %.0fm", gps::latitude(),
-             gps::longitude(), gps::altitudeM());
-    gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Fix", v, theme::kCyan);
-  } else {
-    gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Fix",
-                    "lat/lon blank until fix", theme::kInkMuted);
+  const char* vals[] = {vRows, vUnique, vNew, vGps};
+  const char* labs[] = {"rows", "unique AP", "last sweep", "GPS"};
+  uint16_t cols[] = {theme::kGold, theme::kCyan,
+                     crNewLastSweep ? theme::kGood : theme::kInkDim,
+                     fix ? theme::kGood : theme::kWarn};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 4;
+  char value[48];
+  snprintf(value, sizeof(value), "%s · %lu sats · HDOP %.1f",
+           fix ? "FIX" : "NO FIX", (unsigned long)gps::satellites(),
+           gps::hdop());
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "GPS", value,
+                  fix ? theme::kGood : theme::kWarn);
+  uint64_t bytes = 0;
+  if (app::sdReady() && SD_MMC.exists(kWigleFile)) {
+    File log = SD_MMC.open(kWigleFile, FILE_READ);
+    if (log) {
+      bytes = log.size();
+      log.close();
+    }
   }
-  txt(x + 10, below + 50, theme::kInkMuted, 1, "UART GPS GPIO43 RX / 44 TX");
-  txt(x + 10, below + 64, theme::kInkMuted, 1, "Passive survey — no association.");
-  txt(x + 10, below + 80, theme::kTeal, 1, "Bridge Console · Chart Room");
+  char size[20];
+  if (bytes >= 1024 * 1024)
+    snprintf(size, sizeof(size), "%lu KB", (unsigned long)(bytes / 1024));
+  else
+    snprintf(size, sizeof(size), "%lu B", (unsigned long)bytes);
+  gfxu::drawKVRow(G(), x + 6, below + 20, w - 12, 18, "CSV / SD",
+                  app::sdReady() ? size : "SD unavailable",
+                  app::sdReady() ? theme::kGood : theme::kBad);
+  int rowTop = below + 44;
+  txt(x + 8, rowTop, theme::kTeal, 1, "%s · sweep %lu · %d APs · /wigle.csv",
+      crPaused ? "PAUSED" : "RECORDING", (unsigned long)crSweepCount,
+      crLastSweepCount);
+  const int rowH = 17;
+  int visibleNetworks = g_rfNetCount;
+  if (visibleNetworks > 5) visibleNetworks = 5;
+  for (int i = 0; i < visibleNetworks; i++) {
+    int ry = rowTop + 12 + i * rowH;
+    const RfNetSnap& net = g_rfNets[i];
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, rowH, theme::kPanelSoft);
+    char label[22], metadata[30];
+    const char* ssid = net.ssid[0] ? net.ssid : "<hidden>";
+    snprintf(label, sizeof(label), "%.16s", ssid);
+    snprintf(metadata, sizeof(metadata), "ch%u %ddB %s", net.channel,
+             (int)net.rssi, encLabel(net.auth));
+    gfxu::printFit(G(), x + 9, ry + 4, 128, theme::kInk, 1, label);
+    gfxu::printFit(G(), x + 148, ry + 4, 164, theme::kInkDim, 1, metadata);
+    G().drawFastHLine(x + 8, ry + rowH - 1, w - 16, theme::kBorder);
+  }
+  const int buttonY = y + h - 27;
+  btn(x + 6, buttonY, 142, 22, crPaused ? "RESUME" : "PAUSE", !crPaused,
+      crPaused ? theme::kGood : theme::kWarn);
+  btn(x + 158, buttonY, 154, 22, "SCAN NOW", false, theme::kCyan);
 }
-bool crTouch(int16_t, int16_t) { return false; }
+bool crTouch(int16_t x, int16_t y) {
+  if (y < theme::kScreenH - 32) return true;
+  if (x < 154) {
+    crPaused = !crPaused;
+    if (crPaused) {
+      wifiRfLeave();
+      tools::toast("Wardrive paused");
+    } else {
+      crProcessed = -1;
+      wifiScanBegin();
+      tools::toast("Wardrive resumed");
+    }
+  } else {
+    crPaused = false;
+    crProcessed = -1;
+    wifiScanBegin();
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1399,13 +1904,28 @@ bool crTouch(int16_t, int16_t) { return false; }
 namespace {
 int lkHist[14] = {0};
 int lkOpenHist[14] = {0};
+constexpr int kLkHistory = 18;
+int8_t lkTimeline[14][kLkHistory] = {};
+int8_t lkOpenTimeline[14][kLkHistory] = {};
+int lkHistoryHead = kLkHistory - 1;
+int lkHistoryCount = 0;
 int lkProcessed = -1;
 int lkSelected = 0;  // 0 = none, 1..13 = channel detail
 int lkTotal = 0;
+int lkSweepCount = 0;
+int lkPeakChannel = 1;
+int lkOpenTotal = 0;
+bool lkPaused = false;
 
 void lkOpen() {
   lkProcessed = -1;
   lkSelected = 0;
+  lkHistoryHead = kLkHistory - 1;
+  lkHistoryCount = 0;
+  lkSweepCount = 0;
+  lkPaused = false;
+  memset(lkTimeline, 0, sizeof(lkTimeline));
+  memset(lkOpenTimeline, 0, sizeof(lkOpenTimeline));
   wifiScanBegin();
 }
 void lkTick(uint32_t now) {
@@ -1414,6 +1934,8 @@ void lkTick(uint32_t now) {
   if (st >= 0 && st != lkProcessed) {
     lkProcessed = st;
     lkTotal = st;
+    lkOpenTotal = 0;
+    lkPeakChannel = 1;
     g_lastWifiCount = st;
     for (int c = 1; c <= 13; c++) {
       lkHist[c] = 0;
@@ -1425,77 +1947,143 @@ void lkTick(uint32_t now) {
       int c = g_rfNets[i].channel;
       if (c >= 1 && c <= 13) {
         lkHist[c]++;
-        if (g_rfNets[i].auth == WIFI_AUTH_OPEN) lkOpenHist[c]++;
+        if (g_rfNets[i].auth == WIFI_AUTH_OPEN) {
+          lkOpenHist[c]++;
+          lkOpenTotal++;
+        }
+        if (lkHist[c] > lkHist[lkPeakChannel]) lkPeakChannel = c;
       }
     }
-    wifiScanBegin();
+    lkHistoryHead = (lkHistoryHead + 1) % kLkHistory;
+    for (int c = 1; c <= 13; c++) {
+      lkTimeline[c][lkHistoryHead] = (int8_t)min(lkHist[c], 127);
+      lkOpenTimeline[c][lkHistoryHead] = (int8_t)min(lkOpenHist[c], 127);
+    }
+    if (lkHistoryCount < kLkHistory) lkHistoryCount++;
+    lkSweepCount++;
+    if (!lkPaused) wifiScanBegin();
   }
 }
 void lkClose() { wifiRfLeave(); }
 void lkDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  int maxv = 1, openSum = 0, peakCh = 1;
+  int maxv = 1;
   for (int c = 1; c <= 13; c++) {
-    if (lkHist[c] > maxv) { maxv = lkHist[c]; peakCh = c; }
-    openSum += lkOpenHist[c];
-  }
-  char vTot[8], vPeak[8], vOpen[8];
-  snprintf(vTot, sizeof(vTot), "%d", lkTotal);
-  snprintf(vPeak, sizeof(vPeak), "%d", peakCh);
-  snprintf(vOpen, sizeof(vOpen), "%d", openSum);
-  const char* vals[] = {vTot, vPeak, vOpen};
-  const char* labs[] = {"APs", "peak CH", "open"};
-  uint16_t cols[] = {theme::kTeal, theme::kGold, openSum ? theme::kWarn
-                                                          : theme::kGood};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  int baseY = y + h - 36;
-  int plotH = baseY - below - 14;
-  if (plotH < 40) plotH = 40;
-  int bw = 18, gap = 3;
-  gfxu::drawElevated(G(), x + 4, below, w - 8, plotH + 16);
-  for (int c = 1; c <= 13; c++) {
-    int bx = x + 12 + (c - 1) * (bw + gap);
-    int bh = maxv ? (lkHist[c] * plotH) / maxv : 0;
-    bool sel = (lkSelected == c);
-    uint16_t col = sel ? theme::kGold
-                       : (lkHist[c] >= maxv && maxv > 1 ? theme::kWarn
-                                                        : theme::kTeal);
-    if (bh > 0) G().fillRoundRect(bx, baseY - bh, bw, bh, 2, col);
-    if (lkOpenHist[c] > 0 && bh > 0) {
-      int oh = max(2, (lkOpenHist[c] * plotH) / maxv);
-      if (oh > bh) oh = bh;
-      G().fillRoundRect(bx, baseY - oh, bw, oh, 2, theme::kBad);
+    for (int i = 0; i < lkHistoryCount; i++) {
+      int index = (lkHistoryHead - i + kLkHistory) % kLkHistory;
+      if (lkTimeline[c][index] > maxv) maxv = lkTimeline[c][index];
     }
-    if (sel)
-      G().drawRoundRect(bx - 1, baseY - max(bh, 4) - 1, bw + 2, max(bh, 4) + 2,
-                        2, theme::kInk);
-    txt(bx + (c >= 10 ? 1 : 5), baseY + 3, theme::kInkDim, 1, "%d", c);
-    if (lkHist[c])
-      txt(bx + 2, baseY - bh - 9, theme::kInk, 1, "%d", lkHist[c]);
   }
-  G().fillRoundRect(x + 4, y + h - 20, w - 8, 16, 3, theme::kBgDeep);
-  G().fillRoundRect(x + 10, y + h - 15, 7, 7, 1, theme::kTeal);
-  txt(x + 20, y + h - 14, theme::kInkDim, 1, "sec");
-  G().fillRoundRect(x + 48, y + h - 15, 7, 7, 1, theme::kBad);
-  txt(x + 58, y + h - 14, theme::kInkDim, 1, "open");
-  if (lkSelected >= 1 && lkSelected <= 13)
-    txt(x + 100, y + h - 14, theme::kGold, 1, "CH%d: %d (%d open)", lkSelected,
-        lkHist[lkSelected], lkOpenHist[lkSelected]);
-  else
-    txt(x + 100, y + h - 14, theme::kInkMuted, 1, "tap a bar");
+  char vTot[8], vPeak[8], vOpen[8], vSweeps[8];
+  snprintf(vTot, sizeof(vTot), "%d", lkTotal);
+  snprintf(vPeak, sizeof(vPeak), "%d", lkPeakChannel);
+  snprintf(vOpen, sizeof(vOpen), "%d", lkOpenTotal);
+  snprintf(vSweeps, sizeof(vSweeps), "%d", lkSweepCount);
+  const char* vals[] = {vTot, vPeak, vOpen, vSweeps};
+  const char* labs[] = {"APs", "peak CH", "open", "sweeps"};
+  uint16_t cols[] = {theme::kCyan, theme::kGold,
+                     lkOpenTotal ? theme::kBad : theme::kGood, theme::kTeal};
+  kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols);
+  txt(x + 8, y + 36, theme::kInkDim, 1,
+      "Channel × sweep · AP beacon counts, not RF energy");
+
+  const int plotX = x + 34;
+  const int plotY = y + 49;
+  constexpr int rowH = 7;
+  constexpr int cellW = 12;
+  constexpr int cellGap = 2;
+  const int cellStep = cellW + cellGap;
+  const int firstColumn = kLkHistory - lkHistoryCount;
+  G().fillRect(plotX, plotY, kLkHistory * cellStep - cellGap, 13 * rowH,
+               theme::kBgDeep);
+  for (int row = 0; row < 13; row++) {
+    int channel = 13 - row;
+    int rowY = plotY + row * rowH;
+    uint16_t labelColor = lkSelected == channel ? theme::kGold : theme::kInkMuted;
+    txt(x + 8, rowY, labelColor, 1, "%02d", channel);
+    for (int column = 0; column < kLkHistory; column++) {
+      int cellX = plotX + column * cellStep;
+      uint16_t color = theme::kPanelSoft;
+      if (column >= firstColumn) {
+        int sweepIndex = (lkHistoryHead - (kLkHistory - 1 - column) +
+                          kLkHistory * 2) % kLkHistory;
+        int count = lkTimeline[channel][sweepIndex];
+        int open = lkOpenTimeline[channel][sweepIndex];
+        if (count > 0) {
+          color = count >= max(3, maxv / 2) ? theme::kGold
+                  : count >= 2              ? theme::kCyan
+                                             : theme::kBorderHi;
+          if (open > 0) color = theme::kBad;
+        }
+      }
+      G().fillRect(cellX, rowY, cellW, rowH - 1, color);
+      if (lkSelected == channel) G().drawRect(cellX, rowY, cellW, rowH - 1,
+                                               theme::kInk);
+    }
+  }
+  int axisY = plotY + 13 * rowH + 2;
+  txt(plotX, axisY, theme::kInkMuted, 1, "old");
+  gfxu::printFit(G(), plotX + kLkHistory * cellStep - 24, axisY, 24,
+                 theme::kInkMuted, 1, "now");
+  G().fillRect(x + 6, y + 150, 5, 5, theme::kBorderHi);
+  txt(x + 13, y + 149, theme::kInkMuted, 1, "1 AP");
+  G().fillRect(x + 54, y + 150, 5, 5, theme::kCyan);
+  txt(x + 61, y + 149, theme::kInkMuted, 1, "2+");
+  G().fillRect(x + 90, y + 150, 5, 5, theme::kGold);
+  txt(x + 97, y + 149, theme::kInkMuted, 1, "busy");
+  G().fillRect(x + 132, y + 150, 5, 5, theme::kBad);
+  txt(x + 139, y + 149, theme::kInkMuted, 1, "open AP present");
+  if (lkSelected >= 1 && lkSelected <= 13) {
+    int trend = 0;
+    if (lkHistoryCount >= 2) {
+      int previous = (lkHistoryHead - 1 + kLkHistory) % kLkHistory;
+      trend = lkHist[lkSelected] - lkTimeline[lkSelected][previous];
+    }
+    gfxu::printFit(G(), x + 8, y + 165, w - 16, theme::kGold, 1,
+                   String("CH " + String(lkSelected) + ": " +
+                          String(lkHist[lkSelected]) + " AP / " +
+                          String(lkOpenHist[lkSelected]) + " open / " +
+                          String(trend >= 0 ? "+" : "") + String(trend) +
+                          " vs prev").c_str());
+  } else {
+    txt(x + 8, y + 165, theme::kInkMuted, 1, "Tap a channel row to inspect its trend");
+  }
+  const int buttonY = y + h - 27;
+  btn(x + 6, buttonY, 94, 22, lkPaused ? "RESUME" : "PAUSE", !lkPaused,
+      lkPaused ? theme::kGood : theme::kWarn);
+  btn(x + 108, buttonY, 94, 22, "CLEAR", false);
+  btn(x + 210, buttonY, 102, 22, "SCAN NOW", false, theme::kCyan);
 }
 bool lkTouch(int16_t x, int16_t y) {
-  int bw = 18, gap = 3;
-  // Absolute coords; bars sit under KPI strip (contentTop + ~40).
-  for (int c = 1; c <= 13; c++) {
-    int bx = 10 + (c - 1) * (bw + gap);
-    if (x >= bx && x <= bx + bw && y >= 70 && y <= 220) {
-      lkSelected = (lkSelected == c) ? 0 : c;
-      return true;
+  if (y >= theme::kScreenH - 32) {
+    if (x < 104) {
+      lkPaused = !lkPaused;
+      if (lkPaused) wifiRfLeave();
+      else {
+        lkProcessed = -1;
+        wifiScanBegin();
+      }
+    } else if (x < 208) {
+      memset(lkTimeline, 0, sizeof(lkTimeline));
+      memset(lkOpenTimeline, 0, sizeof(lkOpenTimeline));
+      lkHistoryHead = kLkHistory - 1;
+      lkHistoryCount = 0;
+      lkSweepCount = 0;
+      lkSelected = 0;
+    } else {
+      lkPaused = false;
+      lkProcessed = -1;
+      wifiScanBegin();
     }
+    return true;
   }
-  wifiScanBegin();
-  lkProcessed = -1;
+  const int plotY = contentTop() + 49;
+  constexpr int rowH = 7;
+  if (y >= plotY && y < plotY + 13 * rowH && x < theme::kScreenW - 4) {
+    int channel = 13 - (y - plotY) / rowH;
+    lkSelected = lkSelected == channel ? 0 : channel;
+    return true;
+  }
   return true;
 }
 }  // namespace
@@ -1505,9 +2093,25 @@ bool lkTouch(int16_t x, int16_t y) {
 // ===========================================================================
 namespace {
 int sgProcessed = -1;
-struct Hit { String ssid; String bssid; String label; int rssi; };
+struct Hit {
+  String ssid;
+  String bssid;
+  String label;
+  int rssi;
+  uint8_t channel;
+  wifi_auth_mode_t auth;
+  uint8_t confidence;  // 2 = verified OUI prefix, 1 = SSID keyword only
+  char evidence[24];
+};
 Hit sgHits[12];
 int sgHitCount = 0;
+int sgOuiCount = 0;
+int sgKeywordCount = 0;
+uint32_t sgSweepCount = 0;
+int sgFilter = 0;
+int sgSelected = -1;
+int sgVisible[12];
+int sgVisibleCount = 0;
 
 bool ouiMatch(const String& bssid, const char* prefix) {
   if (!prefix || !prefix[0]) return false;
@@ -1525,9 +2129,25 @@ bool ssidMatch(const String& ssid, const char* sub) {
   q.toLowerCase();
   return s.indexOf(q) >= 0;
 }
+
+void sgRebuildVisible() {
+  sgVisibleCount = 0;
+  for (int i = 0; i < sgHitCount; i++) {
+    if (sgFilter == 1 && sgHits[i].confidence != 2) continue;
+    if (sgFilter == 2 && sgHits[i].confidence != 1) continue;
+    sgVisible[sgVisibleCount++] = i;
+  }
+}
+
 void sgOpen() {
   sgProcessed = -1;
   sgHitCount = 0;
+  sgOuiCount = 0;
+  sgKeywordCount = 0;
+  sgSweepCount = 0;
+  sgFilter = 0;
+  sgSelected = -1;
+  sgVisibleCount = 0;
   wifiScanBegin();
 }
 void sgTick(uint32_t now) {
@@ -1536,6 +2156,9 @@ void sgTick(uint32_t now) {
   if (st >= 0 && st != sgProcessed) {
     sgProcessed = st;
     sgHitCount = 0;
+    sgOuiCount = 0;
+    sgKeywordCount = 0;
+    sgSweepCount++;
     for (int i = 0; i < g_rfNetCount && i < st && sgHitCount < 12; i++) {
       const RfNetSnap& net = g_rfNets[i];
       String ssid = String(net.ssid);
@@ -1546,96 +2169,318 @@ void sgTick(uint32_t now) {
       String bssid = String(bssidBuf);
       for (int s = 0; s < spyglass::kSignatureCount; s++) {
         const auto& sig = spyglass::kSignatures[s];
-        if (ouiMatch(bssid, sig.ouiPrefix) || ssidMatch(ssid, sig.ssidSubstr)) {
-          Hit& hh = sgHits[sgHitCount++];
-          hh.ssid = ssid.length() ? ssid : String("<hidden>");
-          hh.bssid = bssid;
-          hh.label = sig.label;
-          hh.rssi = net.rssi;
-          break;
-        }
+        bool isOui = ouiMatch(bssid, sig.ouiPrefix);
+        bool isKeyword = ssidMatch(ssid, sig.ssidSubstr);
+        if (!isOui && !isKeyword) continue;
+        Hit& hit = sgHits[sgHitCount++];
+        hit.ssid = ssid.length() ? ssid : String("<hidden>");
+        hit.bssid = bssid;
+        hit.label = sig.label;
+        hit.rssi = net.rssi;
+        hit.channel = net.channel;
+        hit.auth = net.auth;
+        hit.confidence = isOui ? 2 : 1;
+        if (isOui) {
+          snprintf(hit.evidence, sizeof(hit.evidence), "OUI %.8s", sig.ouiPrefix);
+          sgOuiCount++;
+        } else {
+          snprintf(hit.evidence, sizeof(hit.evidence), "SSID has %.12s",
+                   sig.ssidSubstr);
+          sgKeywordCount++;
+      }
+      sgRebuildVisible();
+        break;
       }
         }
     wifiScanBegin();
   }
 }
 void sgClose() { wifiRfLeave(); }
+
+bool sgSave() {
+  if (!app::sdReady()) {
+    tools::toast("Save failed · no SD");
+    return false;
+  }
+  if (!sgHitCount) {
+    tools::toast("No Spyglass leads to save");
+    return false;
+  }
+  if (!SD_MMC.exists("/log") && !SD_MMC.mkdir("/log")) {
+    tools::toast("Save failed · /log");
+    return false;
+  }
+  const char* path = "/log/spyglass.csv";
+  bool header = !SD_MMC.exists(path);
+  File file = SD_MMC.open(path, FILE_APPEND);
+  if (!file) {
+    tools::toast("Save failed · open");
+    return false;
+  }
+  if (header)
+    file.println("timestamp,match_type,evidence,label,SSID,BSSID,channel,RSSI,auth,latitude,longitude");
+  char timestamp[24];
+  if (!gps::formatTimestamp(timestamp, sizeof(timestamp)))
+    snprintf(timestamp, sizeof(timestamp), "uptime-%lu",
+             (unsigned long)(millis() / 1000));
+  for (int i = 0; i < sgHitCount; i++) {
+    const Hit& hit = sgHits[i];
+    char ssid[40], label[44];
+    snprintf(ssid, sizeof(ssid), "%s", hit.ssid.c_str());
+    snprintf(label, sizeof(label), "%s", hit.label.c_str());
+    for (char* p = ssid; *p; p++)
+      if (*p == ',' || *p == '\n' || *p == '\r') *p = ' ';
+    for (char* p = label; *p; p++)
+      if (*p == ',' || *p == '\n' || *p == '\r') *p = ' ';
+    file.printf("%s,%s,%s,%s,%s,%s,%u,%d,%s,", timestamp,
+                hit.confidence == 2 ? "oui_lead" : "ssid_keyword_candidate",
+                hit.evidence, label, ssid, hit.bssid.c_str(), hit.channel,
+                hit.rssi, encLabel(hit.auth));
+    if (gps::hasFix())
+      file.printf("%.6f,%.6f\n", gps::latitude(), gps::longitude());
+    else
+      file.println(",");
+  }
+  file.close();
+  tools::toast("Saved %d Spyglass leads", sgHitCount);
+  return true;
+}
+
+void sgDrawDetail(int x, int y, int w, int h) {
+  body(x, y, w, h);
+  if (sgSelected < 0 || sgSelected >= sgHitCount) return;
+  const Hit& hit = sgHits[sgSelected];
+  uint16_t matchColor = hit.confidence == 2 ? theme::kGood : theme::kWarn;
+  char rssi[12], channel[16], vendor[24];
+  snprintf(rssi, sizeof(rssi), "%d dBm", hit.rssi);
+  snprintf(channel, sizeof(channel), "%u · %s", hit.channel,
+           bandFromChannel(hit.channel));
+  const char* vendorName = oui::vendorStr(hit.bssid);
+  snprintf(vendor, sizeof(vendor), "%s", vendorName[0] ? vendorName : "unknown");
+  const char* values[] = {hit.confidence == 2 ? "OUI" : "KEYWORD", rssi,
+                          encLabel(hit.auth)};
+  const char* labels[] = {"match", "signal", "auth"};
+  const uint16_t colors[] = {matchColor, theme::kCyan,
+                             riskColor(encRisk(hit.auth))};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors) + 3;
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "Candidate", hit.label.c_str(),
+                  matchColor);
+  gfxu::drawKVRow(G(), x + 6, below + 20, w - 12, 18, "Evidence", hit.evidence,
+                  matchColor);
+  gfxu::drawKVRow(G(), x + 6, below + 40, w - 12, 18, "SSID", hit.ssid.c_str());
+  gfxu::drawKVRow(G(), x + 6, below + 60, w - 12, 18, "BSSID", hit.bssid.c_str(),
+                  theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 80, w - 12, 18, "Vendor", vendor,
+                  theme::kTeal);
+  gfxu::drawKVRow(G(), x + 6, below + 100, w - 12, 18, "Channel", channel);
+  txt(x + 10, y + h - 41, matchColor, 1,
+      hit.confidence == 2 ? "OUI lead · not proof of camera identity"
+                          : "Keyword candidate · verify independently");
+  btn(x + 6, y + h - 24, 72, 20, "BACK", false);
+  btn(x + w - 84, y + h - 24, 78, 20, "SAVE", false);
+}
+
 void sgDraw(int x, int y, int w, int h) {
+  if (sgSelected >= 0) {
+    sgDrawDetail(x, y, w, h);
+    return;
+  }
   body(x, y, w, h);
   bool armed = spyglass::hasVerifiedSignature();
-  char vHits[8], vMode[8], vSig[8];
+  char vHits[8], vOui[8], vKeyword[8], vSig[8];
   snprintf(vHits, sizeof(vHits), "%d", sgHitCount);
-  snprintf(vMode, sizeof(vMode), "%s", armed ? "OUI" : "KW");
+  snprintf(vOui, sizeof(vOui), "%d", sgOuiCount);
+  snprintf(vKeyword, sizeof(vKeyword), "%d", sgKeywordCount);
   snprintf(vSig, sizeof(vSig), "%d", spyglass::kSignatureCount);
-  const char* vals[] = {vHits, vMode, vSig};
-  const char* labs[] = {"hits", "mode", "sigs"};
-  uint16_t cols[] = {sgHitCount ? theme::kBad : theme::kGood,
-                     armed ? theme::kGood : theme::kWarn, theme::kTeal};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkMuted, 1,
-      armed ? "DeFlock OUIs armed · OUI=strong" : "Keyword heuristics only");
-  below += 12;
-  constexpr int kRh = theme::kRowH;
-  int rows = min(sgHitCount, 6);
+  const char* vals[] = {vHits, vOui, vKeyword, vSig};
+  const char* labs[] = {"leads", "OUI", "keyword", "sigs"};
+  uint16_t cols[] = {sgHitCount ? theme::kWarn : theme::kGood,
+                     sgOuiCount ? theme::kGood : theme::kInkDim,
+                     sgKeywordCount ? theme::kWarn : theme::kInkDim,
+                     armed ? theme::kTeal : theme::kWarn};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 2;
+  gfxu::drawToolbar(G(), x + 4, below, w - 8, 18);
+  chip(x + 6, below + 1, 48, 16, "ALL", sgFilter == 0);
+  chip(x + 58, below + 1, 48, 16, "OUI", sgFilter == 1, theme::kGood);
+  chip(x + 110, below + 1, 64, 16, "KEYWORD", sgFilter == 2, theme::kWarn);
+  chip(x + 240, below + 1, 72, 16, "SAVE", false, theme::kCyan);
+  below += 20;
+  constexpr int kRh = theme::kRowHCompact;
+  int rows = min(sgVisibleCount, 7);
   for (int i = 0; i < rows; i++) {
     int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    String lab = sgHits[i].label;
+    const Hit& hit = sgHits[sgVisible[i]];
+    uint16_t color = hit.confidence == 2 ? theme::kGood : theme::kWarn;
+    String lab = hit.label;
     if (lab.length() > 28) lab = lab.substring(0, 28);
-    txt(x + 10, ry + 1, theme::kBad, 1, "%s", lab.c_str());
+    gfxu::printFit(G(), x + 10, ry + 1, w - 18, color, 1, lab.c_str());
     char sec[42];
-    snprintf(sec, sizeof(sec), "%s  %ddB", sgHits[i].bssid.c_str(),
-             sgHits[i].rssi);
-    txt(x + 10, ry + 10, theme::kInkMuted, 1, "%s", sec);
+    snprintf(sec, sizeof(sec), "%s · %.12s · ch%u %ddB", hit.evidence,
+             hit.ssid.c_str(), hit.channel, hit.rssi);
+    gfxu::printFit(G(), x + 10, ry + 10, w - 18, theme::kInkMuted, 1, sec);
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
+  if (!sgVisibleCount)
+    txt(x + 10, below + 6, theme::kInkMuted, 1,
+        "No candidates in the latest sweep");
+  txt(x + 8, y + h - 10, theme::kInkMuted, 1,
+      "Passive public metadata · leads only · sweep %lu",
+      (unsigned long)sgSweepCount);
 }
-bool sgTouch(int16_t, int16_t) { return false; }
+bool sgTouch(int16_t x, int16_t y) {
+  if (sgSelected >= 0) {
+    if (y >= theme::kScreenH - 34) {
+      if (x < 90) sgSelected = -1;
+      else sgSave();
+    }
+    return true;
+  }
+  const int toolbarY = contentTop() + 32;
+  if (y >= toolbarY && y < toolbarY + 20) {
+    if (x < 56) sgFilter = 0;
+    else if (x < 108) sgFilter = 1;
+    else if (x < 178) sgFilter = 2;
+    else if (x >= 240) sgSave();
+    sgRebuildVisible();
+    return true;
+  }
+  const int listTop = toolbarY + 20;
+  constexpr int rowH = theme::kRowHCompact;
+  if (y >= listTop && y < listTop + 7 * rowH) {
+    int row = (y - listTop) / rowH;
+    if (row < sgVisibleCount) sgSelected = sgVisible[row];
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
 //  6. Tracker Watch -- nearby BLE item-tracker spotter (anti-stalking)
 // ===========================================================================
 namespace {
-void twOpen() { g_bleLastScan = 0; }
-void twTick(uint32_t now) { bleTick(now); }
+constexpr int kTwRecords = 24;
+struct TwRecord {
+  String mac;
+  String name;
+  char detail[22];
+  int currentRssi;
+  int strongestRssi;
+  uint16_t sweepsSeen;
+  uint32_t lastGeneration;
+};
+TwRecord twRecords[kTwRecords];
+int twRecordCount = 0;
+uint32_t twGeneration = 0;
+uint32_t twSweepCount = 0;
+uint32_t twLastSweepAt = 0;
+
+void twOpen() {
+  g_bleLastScan = 0;
+  twRecordCount = 0;
+  twGeneration = g_bleGeneration;
+  twSweepCount = 0;
+  twLastSweepAt = 0;
+}
+void twTick(uint32_t now) {
+  bleTick(now);
+  if (twGeneration == g_bleGeneration) return;
+  twGeneration = g_bleGeneration;
+  twSweepCount++;
+  twLastSweepAt = now;
+  for (int i = 0; i < g_bleCount; i++) {
+    const BleDev& device = g_ble[i];
+    if (device.kind != 1) continue;
+    int record = -1;
+    for (int r = 0; r < twRecordCount; r++)
+      if (twRecords[r].mac == device.mac) { record = r; break; }
+    if (record < 0) {
+      if (twRecordCount >= kTwRecords) continue;
+      record = twRecordCount++;
+      TwRecord& item = twRecords[record];
+      item.mac = device.mac;
+      item.name = device.name;
+      item.currentRssi = device.rssi;
+      item.strongestRssi = device.rssi;
+      item.sweepsSeen = 0;
+      item.lastGeneration = 0;
+      snprintf(item.detail, sizeof(item.detail), "%s", device.detail);
+    }
+    TwRecord& item = twRecords[record];
+    item.currentRssi = device.rssi;
+    if (device.rssi > item.strongestRssi) item.strongestRssi = device.rssi;
+    if (item.sweepsSeen < 65535 && item.lastGeneration != twGeneration)
+      item.sweepsSeen++;
+    item.lastGeneration = twGeneration;
+    item.name = device.name;
+    snprintf(item.detail, sizeof(item.detail), "%s", device.detail);
+  }
+}
 void twClose() { bleStop(); }
 void twDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  int n = 0;
+  int current = 0, repeat = 0, nearest = -127;
   for (int i = 0; i < g_bleCount; i++)
-    if (g_ble[i].kind == 1) n++;
-  char vTrack[8], vBle[8], vStat[8];
-  snprintf(vTrack, sizeof(vTrack), "%d", n);
-  snprintf(vBle, sizeof(vBle), "%d", g_bleCount);
-  snprintf(vStat, sizeof(vStat), "%s", n ? "ALERT" : "CLEAR");
-  const char* vals[] = {vTrack, vBle, vStat};
-  const char* labs[] = {"trackers", "BLE", "status"};
-  uint16_t cols[] = {n ? theme::kWarn : theme::kGood, theme::kCyan,
-                     n ? theme::kWarn : theme::kGood};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkMuted, 1, "AirTag / Tile / SmartTag · detect only");
+    if (g_ble[i].kind == 1) {
+      current++;
+      if (g_ble[i].rssi > nearest) nearest = g_ble[i].rssi;
+    }
+  for (int i = 0; i < twRecordCount; i++)
+    if (twRecords[i].sweepsSeen > 1) repeat++;
+  char vCurrent[8], vUnique[8], vRepeat[8], vSignal[12];
+  snprintf(vCurrent, sizeof(vCurrent), "%d", current);
+  snprintf(vUnique, sizeof(vUnique), "%d", twRecordCount);
+  snprintf(vRepeat, sizeof(vRepeat), "%d", repeat);
+  if (nearest > -127) snprintf(vSignal, sizeof(vSignal), "%d", nearest);
+  else snprintf(vSignal, sizeof(vSignal), "--");
+  const char* vals[] = {vCurrent, vUnique, vRepeat, vSignal};
+  const char* labs[] = {"now", "session IDs", "repeat", "near dBm"};
+  const uint16_t cols[] = {current ? theme::kWarn : theme::kGood,
+                           theme::kCyan, repeat ? theme::kWarn : theme::kInkDim,
+                           nearest > -60 ? theme::kWarn : theme::kGood};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 2;
+  gfxu::printFit(G(), x + 8, below, w - 16, theme::kInkMuted, 1,
+                 "Likely tracker · passive ads only");
   below += 12;
-  int shown = 0;
-  constexpr int kRh = theme::kRowH;
-  for (int i = 0; i < g_bleCount && shown < 6; i++) {
-    if (g_ble[i].kind != 1) continue;
-    int ry = below + shown * kRh;
-    if (shown & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    rssiBars(x + 8, ry + 4, g_ble[i].rssi);
-    String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
-    if (label.length() > 22) label = label.substring(0, 22);
-    txt(x + 28, ry + 5, theme::kWarn, 1, "%s", label.c_str());
-    char meta[12];
-    snprintf(meta, sizeof(meta), "%ddB", g_ble[i].rssi);
-    txt(x + w - 40, ry + 5, theme::kInkDim, 1, "%s", meta);
-    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
-    shown++;
+  const int rowH = 20;
+  int rows = min(twRecordCount, 5);
+  for (int i = 0; i < rows; i++) {
+    const TwRecord& item = twRecords[i];
+    int ry = below + i * rowH;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, rowH, theme::kPanelSoft);
+    rssiBars(x + 8, ry + 3, item.currentRssi);
+    String label = item.name.length() ? item.name : item.mac;
+    gfxu::printFit(G(), x + 29, ry + 1, 148, theme::kWarn, 1, label.c_str());
+    char meta[36];
+    snprintf(meta, sizeof(meta), "%s · %u sweeps", item.detail[0] ? item.detail : "tracker-like",
+             item.sweepsSeen);
+    gfxu::printFit(G(), x + 29, ry + 10, 182, theme::kInkMuted, 1, meta);
+    char signal[12];
+    snprintf(signal, sizeof(signal), "%ddB", item.currentRssi);
+    gfxu::printFit(G(), x + w - 42, ry + 2, 36, theme::kInkDim, 1, signal);
+    G().drawFastHLine(x + 8, ry + rowH - 1, w - 16, theme::kBorder);
   }
-  if (n == 0)
-    txt(x + 12, below + 8, theme::kInkMuted, 1, "All clear — no trackers seen.");
+  if (twRecordCount == 0)
+    txt(x + 12, below + 8, theme::kInkMuted, 1,
+        "No likely trackers in the latest passive sweep.");
+  const int buttonY = y + h - 27;
+  btn(x + 6, buttonY, 142, 22, "CLEAR SESSION", false);
+  btn(x + 158, buttonY, 154, 22, "SCAN NOW", false, theme::kCyan);
 }
-bool twTouch(int16_t, int16_t) { return false; }
+bool twTouch(int16_t x, int16_t y) {
+  if (y < theme::kScreenH - 32) return true;
+  if (x < 154) {
+    twRecordCount = 0;
+    twSweepCount = 0;
+    twLastSweepAt = 0;
+    twGeneration = g_bleGeneration;
+    tools::toast("Tracker session cleared");
+  } else {
+    bleStop();
+    g_bleLastScan = 0;
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1649,26 +2494,56 @@ char rwLastSrc[18] = "--";
 uint32_t rwLastHit = 0;
 int rwChannel = 1;
 uint32_t rwHopAt = 0;
+constexpr int kRwBins = 16;
+volatile uint16_t rwDeauthBins[kRwBins] = {};
+volatile uint16_t rwDisassocBins[kRwBins] = {};
+volatile uint32_t rwBinEpochs[kRwBins] = {};
+uint32_t rwChannelEvents[14] = {};
 
 void rwPromiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
   auto* p = (wifi_promiscuous_pkt_t*)buf;
+  if (p->rx_ctrl.sig_len < 24) return;
   const uint8_t* pl = p->payload;
   uint8_t subtype = (pl[0] >> 4) & 0x0F;
   // Inspect only management-frame subtype + transmitter address. No payload,
   // no data frames, nothing stored beyond counters -- this is an IDS, not a
   // capture tool.
   if (subtype == 12 || subtype == 10) {
-    if (subtype == 12) rwDeauth++;
-    else rwDisassoc++;
+    uint32_t now = millis();
+    uint32_t epoch = now / 2000;
+    int bin = epoch % kRwBins;
+    if (rwBinEpochs[bin] != epoch) {
+      rwDeauthBins[bin] = 0;
+      rwDisassocBins[bin] = 0;
+      rwBinEpochs[bin] = epoch;
+    }
+    if (subtype == 12) {
+      rwDeauth++;
+      uint16_t count = rwDeauthBins[bin];
+      if (count < 65535) rwDeauthBins[bin] = count + 1;
+    } else {
+      rwDisassoc++;
+      uint16_t count = rwDisassocBins[bin];
+      if (count < 65535) rwDisassocBins[bin] = count + 1;
+    }
+    if (rwChannel >= 1 && rwChannel <= 13) rwChannelEvents[rwChannel]++;
     snprintf(rwLastSrc, sizeof(rwLastSrc), "%02X:%02X:%02X:%02X:%02X:%02X",
              pl[10], pl[11], pl[12], pl[13], pl[14], pl[15]);
     rwLastRssi = p->rx_ctrl.rssi;
-    rwLastHit = millis();
+    rwLastHit = now;
   }
 }
 void rwOpen() {
   rwDeauth = rwDisassoc = 0;
+  memset((void*)rwDeauthBins, 0, sizeof(rwDeauthBins));
+  memset((void*)rwDisassocBins, 0, sizeof(rwDisassocBins));
+  memset((void*)rwBinEpochs, 0, sizeof(rwBinEpochs));
+  memset(rwChannelEvents, 0, sizeof(rwChannelEvents));
+  rwLastHit = 0;
+  rwLastSrc[0] = '-';
+  rwLastSrc[1] = '-';
+  rwLastSrc[2] = 0;
   rwChannel = 1;
   wifiPromiscBegin(&rwPromiscCb, rwChannel);
 }
@@ -1683,33 +2558,110 @@ void rwTick(uint32_t now) {
 void rwClose() { wifiRfLeave(); }
 void rwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  bool recent = (millis() - rwLastHit) < 4000 && (rwDeauth + rwDisassoc) > 0;
-  char vDe[10], vDi[10], vCh[8];
+  bool recent = rwLastHit && (millis() - rwLastHit) < 4000;
+  uint32_t epoch = millis() / 2000;
+  char vDe[10], vDi[10], vCh[8], vNow[8];
   snprintf(vDe, sizeof(vDe), "%lu", (unsigned long)rwDeauth);
   snprintf(vDi, sizeof(vDi), "%lu", (unsigned long)rwDisassoc);
   snprintf(vCh, sizeof(vCh), "%d", rwChannel);
-  const char* vals[] = {vDe, vDi, vCh};
-  const char* labs[] = {"deauth", "disassoc", "CH hop"};
+  uint16_t recentEvents = 0;
+  uint32_t currentEpoch = epoch;
+  int currentBin = currentEpoch % kRwBins;
+  if (rwBinEpochs[currentBin] == currentEpoch)
+    recentEvents = (uint16_t)rwDeauthBins[currentBin] +
+                   (uint16_t)rwDisassocBins[currentBin];
+  snprintf(vNow, sizeof(vNow), "%u", recentEvents);
+  const char* vals[] = {vDe, vDi, vNow, vCh};
+  const char* labs[] = {"deauth", "disassoc", "last 2s", "CH"};
   uint16_t cols[] = {rwDeauth ? theme::kBad : theme::kGood,
-                     rwDisassoc ? theme::kWarn : theme::kGood, theme::kCyan};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 6;
-  char v[24];
-  gfxu::drawKVRow(G(), x + 6, below, w - 12, 20, "Last source", rwLastSrc,
-                  theme::kCyan);
-  snprintf(v, sizeof(v), "%d dB", rwLastRssi);
-  gfxu::drawKVRow(G(), x + 6, below + 24, w - 12, 20, "Last RSSI", v);
-  if (recent) {
-    G().fillRoundRect(x + 6, below + 52, w - 12, 28, 5, theme::kBad);
-    G().setTextColor(theme::kInk);
-    G().setTextSize(1);
-    G().setCursor(x + 14, below + 62);
-    G().print("ALERT: attack frames nearby!");
-  } else {
-    txt(x + 12, below + 58, theme::kGood, 1, "Calm seas — no attack detected.");
+                     rwDisassoc ? theme::kWarn : theme::kGood,
+                     recentEvents ? theme::kBad : theme::kGood, theme::kCyan};
+  kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols);
+  txt(x + 8, y + 35, recent ? theme::kBad : theme::kGood, 1,
+      recent ? "Recent management-frame burst · review in context"
+             : "No recent deauth/disassoc frames · passive monitor");
+
+  const int plotX = x + 10, plotY = y + 49, plotW = w - 20, plotH = 48;
+  int maxBin = 1;
+  for (int i = 0; i < kRwBins; i++) {
+    uint32_t sampleEpoch = epoch - (kRwBins - 1 - i);
+    int index = sampleEpoch % kRwBins;
+    if (rwBinEpochs[index] != sampleEpoch) continue;
+    int sum = (uint16_t)rwDeauthBins[index] + (uint16_t)rwDisassocBins[index];
+    if (sum > maxBin) maxBin = sum;
   }
-  txt(x + 12, below + 82, theme::kInkMuted, 1, "IDS only · passive MGMT listen");
+  G().fillRect(plotX, plotY, plotW, plotH, theme::kBgDeep);
+  G().drawRect(plotX, plotY, plotW, plotH, theme::kBorder);
+  G().drawFastHLine(plotX + 1, plotY + plotH - 1, plotW - 2, theme::kBorderHi);
+  const int slot = plotW / kRwBins;
+  for (int i = 0; i < kRwBins; i++) {
+    uint32_t sampleEpoch = epoch - (kRwBins - 1 - i);
+    int index = sampleEpoch % kRwBins;
+    if (rwBinEpochs[index] != sampleEpoch) continue;
+    int deauth = (uint16_t)rwDeauthBins[index];
+    int disassoc = (uint16_t)rwDisassocBins[index];
+    int dh = deauth * (plotH - 4) / maxBin;
+    int sh = disassoc * (plotH - 4) / maxBin;
+    int bx = plotX + i * slot + 2;
+    int base = plotY + plotH - 2;
+    if (dh) {
+      base -= dh;
+      G().fillRect(bx, base, max(2, slot - 3), dh, theme::kBad);
+    }
+    if (sh) {
+      base -= sh;
+      G().fillRect(bx, base, max(2, slot - 3), sh, theme::kWarn);
+    }
+  }
+  txt(plotX, plotY + plotH + 1, theme::kInkMuted, 1, "32 sec · 2 sec bins");
+
+  const int channelBase = y + 132;
+  int channelMax = 1;
+  for (int ch = 1; ch <= 13; ch++)
+    if (rwChannelEvents[ch] > (uint32_t)channelMax)
+      channelMax = (int)rwChannelEvents[ch];
+  const int channelSlot = (w - 20) / 13;
+  for (int ch = 1; ch <= 13; ch++) {
+    int bx = x + 10 + (ch - 1) * channelSlot;
+    int bh = rwChannelEvents[ch] * 20 / channelMax;
+    if (bh) G().fillRect(bx + 3, channelBase - bh, channelSlot - 6, bh,
+                         ch == rwChannel ? theme::kGold : theme::kCyan);
+    char channelLabel[4];
+    snprintf(channelLabel, sizeof(channelLabel), "%d", ch);
+    txt(bx + (ch >= 10 ? 3 : 6), channelBase + 2, theme::kInkMuted, 1,
+        "%s", channelLabel);
+  }
+  char source[52];
+  if (rwLastHit)
+    snprintf(source, sizeof(source), "Last %s · %d dBm · CH %d", rwLastSrc,
+             rwLastRssi, rwChannel);
+  else
+    snprintf(source, sizeof(source), "No event yet · monitoring CH %d", rwChannel);
+  gfxu::printFit(G(), x + 8, y + 158, w - 16, theme::kInkDim, 1, source);
+  const int buttonY = y + h - 27;
+  btn(x + 6, buttonY, 142, 22, "CLEAR COUNTERS", false);
+  btn(x + 158, buttonY, 154, 22, "RESET CHANNEL HOP", false, theme::kCyan);
 }
-bool rwTouch(int16_t, int16_t) { return false; }
+bool rwTouch(int16_t x, int16_t y) {
+  if (y < theme::kScreenH - 32) return true;
+  if (x < 154) {
+    rwDeauth = rwDisassoc = 0;
+    rwLastHit = 0;
+    rwLastSrc[0] = '-';
+    rwLastSrc[1] = '-';
+    rwLastSrc[2] = 0;
+    memset((void*)rwDeauthBins, 0, sizeof(rwDeauthBins));
+    memset((void*)rwDisassocBins, 0, sizeof(rwDisassocBins));
+    memset((void*)rwBinEpochs, 0, sizeof(rwBinEpochs));
+    memset(rwChannelEvents, 0, sizeof(rwChannelEvents));
+    tools::toast("Rigging counters cleared");
+  } else {
+    rwChannel = 1;
+    rwHopAt = millis();
+    wifiPromiscHop(rwChannel);
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1717,66 +2669,259 @@ bool rwTouch(int16_t, int16_t) { return false; }
 // ===========================================================================
 namespace {
 int hiProcessed = -1;
-int hiOpen_ = 0, hiWeak = 0, hiStrong = 0, hiTotal = 0;
-struct HiRow { char ssid[20]; wifi_auth_mode_t auth; };
-HiRow hiRows[16];
+int hiOpen_ = 0, hiLegacy = 0, hiStrong = 0, hiTotal = 0;
+int hiStored = 0;
+uint32_t hiLastScan = 0;
+int hiFilter = 0;
+int hiSelected = -1;
+int hiScroll = 0;
+int hiVisible[48];
+int hiVisibleCount = 0;
+struct HiRow {
+  char ssid[33];
+  uint8_t bssid[6];
+  wifi_auth_mode_t auth;
+  int32_t rssi;
+  uint8_t channel;
+};
+HiRow hiRows[48];
+
+bool hiIsRisky(wifi_auth_mode_t auth) {
+  return auth == WIFI_AUTH_OPEN || auth == WIFI_AUTH_WEP ||
+         auth == WIFI_AUTH_WPA_PSK || auth == WIFI_AUTH_WPA_WPA2_PSK;
+}
+
+void hiRebuildVisible() {
+  hiVisibleCount = 0;
+  for (int i = 0; i < hiStored; i++) {
+    bool risky = hiIsRisky(hiRows[i].auth);
+    if (hiFilter == 1 && !risky) continue;
+    if (hiFilter == 2 && risky) continue;
+    hiVisible[hiVisibleCount++] = i;
+  }
+  int maxScroll = max(0, hiVisibleCount - 6);
+  if (hiScroll > maxScroll) hiScroll = maxScroll;
+}
+
 void hiOpen() {
   hiProcessed = -1;
+  hiOpen_ = hiLegacy = hiStrong = hiTotal = hiStored = 0;
+  hiFilter = 0;
+  hiSelected = -1;
+  hiScroll = 0;
+  hiVisibleCount = 0;
+  hiLastScan = millis();
   wifiScanBegin();
 }
 void hiTick(uint32_t now) {
-  (void)now;
   int st = wifiScanState();
   if (st >= 0 && st != hiProcessed) {
     hiProcessed = st;
-    hiOpen_ = hiWeak = hiStrong = 0;
     int n = g_rfNetCount;
     if (n > st) n = st;
-    if (n > 16) n = 16;
-    hiTotal = n;
+    if (n > 48) n = 48;
+    hiOpen_ = hiLegacy = hiStrong = 0;
+    hiTotal = st;
+    hiStored = n;
     for (int i = 0; i < n; i++) {
       hiRows[i].auth = g_rfNets[i].auth;
       strncpy(hiRows[i].ssid, g_rfNets[i].ssid, sizeof(hiRows[i].ssid) - 1);
       hiRows[i].ssid[sizeof(hiRows[i].ssid) - 1] = 0;
-      int r = encRisk(g_rfNets[i].auth);
-      if (r == 3) hiOpen_++;
-      else if (r == 2) hiWeak++;
-      else if (r == 0) hiStrong++;
+      memcpy(hiRows[i].bssid, g_rfNets[i].bssid, 6);
+      hiRows[i].rssi = g_rfNets[i].rssi;
+      hiRows[i].channel = g_rfNets[i].channel;
     }
+    int scannedCount = g_rfNetCount;
+    if (scannedCount > st) scannedCount = st;
+    for (int i = 0; i < scannedCount; i++) {
+      wifi_auth_mode_t auth = g_rfNets[i].auth;
+      int risk = encRisk(auth);
+      if (auth == WIFI_AUTH_OPEN || auth == WIFI_AUTH_WEP) hiOpen_++;
+      else if (auth == WIFI_AUTH_WPA_PSK || auth == WIFI_AUTH_WPA_WPA2_PSK)
+        hiLegacy++;
+      else if (risk == 0) hiStrong++;
+    }
+    hiLastScan = now;
+    hiRebuildVisible();
+    if (hiSelected >= hiStored) hiSelected = -1;
+  } else if (st >= 0 && st == hiProcessed && now - hiLastScan > 12000) {
+    hiLastScan = now;
+    hiProcessed = -1;
+    wifiScanBegin();
   }
 }
-void hiClose() { wifiRfLeave(); }
-void hiDraw(int x, int y, int w, int h) {
+void hiClose() { wifiRfLeave(); hiSelected = -1; }
+
+bool hiSave() {
+  if (!app::sdReady()) {
+    tools::toast("Audit save failed · no SD");
+    return false;
+  }
+  if (!hiStored) {
+    tools::toast("No audit rows to save");
+    return false;
+  }
+  if (!SD_MMC.exists("/log") && !SD_MMC.mkdir("/log")) {
+    tools::toast("Audit save failed · /log");
+    return false;
+  }
+  const char* path = "/log/hull_audit.csv";
+  bool header = !SD_MMC.exists(path);
+  File file = SD_MMC.open(path, FILE_APPEND);
+  if (!file) {
+    tools::toast("Audit save failed · open");
+    return false;
+  }
+  if (header)
+    file.println("timestamp,SSID,BSSID,auth,channel,RSSI,risk,vendor,latitude,longitude");
+  char timestamp[24];
+  if (!gps::formatTimestamp(timestamp, sizeof(timestamp)))
+    snprintf(timestamp, sizeof(timestamp), "uptime-%lu",
+             (unsigned long)(millis() / 1000));
+  for (int i = 0; i < hiStored; i++) {
+    const HiRow& row = hiRows[i];
+    char ssid[40], bssid[18];
+    snprintf(ssid, sizeof(ssid), "%s", row.ssid);
+    for (char* p = ssid; *p; p++)
+      if (*p == ',' || *p == '\n' || *p == '\r') *p = ' ';
+    cnFmtMac(bssid, sizeof(bssid), row.bssid);
+    const char* vendorName = oui::vendor(row.bssid);
+    file.printf("%s,%s,%s,%s,%u,%d,%s,%s,", timestamp, ssid, bssid,
+                encLabel(row.auth), row.channel, (int)row.rssi,
+                hiIsRisky(row.auth) ? "review" : "advertised-secure",
+                vendorName[0] ? vendorName : "unknown");
+    if (gps::hasFix())
+      file.printf("%.6f,%.6f\n", gps::latitude(), gps::longitude());
+    else
+      file.println(",");
+  }
+  file.close();
+  tools::toast("Saved %d audit rows", hiStored);
+  return true;
+}
+
+void hiDrawDetail(int x, int y, int w, int h) {
   body(x, y, w, h);
-  char vOpen[8], vWeak[8], vStrong[8], vTot[8];
+  if (hiSelected < 0 || hiSelected >= hiStored) return;
+  const HiRow& row = hiRows[hiSelected];
+  char bssid[18], channel[16], signal[16], vendor[24];
+  cnFmtMac(bssid, sizeof(bssid), row.bssid);
+  snprintf(channel, sizeof(channel), "%u · %s", row.channel,
+           bandFromChannel(row.channel));
+  snprintf(signal, sizeof(signal), "%d dBm", (int)row.rssi);
+  const char* vendorName = oui::vendor(row.bssid);
+  snprintf(vendor, sizeof(vendor), "%s", vendorName[0] ? vendorName : "unknown");
+  const char* riskLabel = row.auth == WIFI_AUTH_OPEN ? "OPEN"
+                          : row.auth == WIFI_AUTH_WEP ? "WEP"
+                          : hiIsRisky(row.auth)       ? "LEGACY WPA"
+                                                     : "ADVERTISED SECURE";
+  uint16_t riskColorValue = hiIsRisky(row.auth) ? theme::kWarn : theme::kGood;
+  const char* values[] = {riskLabel, encLabel(row.auth), signal};
+  const char* labels[] = {"review", "auth", "signal"};
+  const uint16_t colors[] = {riskColorValue, riskColor(encRisk(row.auth)),
+                             theme::kCyan};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors) + 3;
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "SSID", row.ssid);
+  gfxu::drawKVRow(G(), x + 6, below + 20, w - 12, 18, "BSSID", bssid,
+                  theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 40, w - 12, 18, "Vendor", vendor,
+                  theme::kTeal);
+  gfxu::drawKVRow(G(), x + 6, below + 60, w - 12, 18, "Channel", channel);
+  gfxu::drawKVRow(G(), x + 6, below + 80, w - 12, 18, "Advertised auth",
+                  encLabelLong(row.auth), riskColorValue);
+  txt(x + 10, y + h - 41, theme::kInkMuted, 1,
+      "Passive beacon only · WPS/PMF not reported by scan");
+  btn(x + 6, y + h - 24, 72, 20, "BACK", false);
+  btn(x + w - 84, y + h - 24, 78, 20, "SAVE", false);
+}
+
+void hiDraw(int x, int y, int w, int h) {
+  if (hiSelected >= 0) {
+    hiDrawDetail(x, y, w, h);
+    return;
+  }
+  body(x, y, w, h);
+  char vOpen[8], vLegacy[8], vStrong[8], vTot[8];
   snprintf(vOpen, sizeof(vOpen), "%d", hiOpen_);
-  snprintf(vWeak, sizeof(vWeak), "%d", hiWeak);
+  snprintf(vLegacy, sizeof(vLegacy), "%d", hiLegacy);
   snprintf(vStrong, sizeof(vStrong), "%d", hiStrong);
   snprintf(vTot, sizeof(vTot), "%d", hiTotal);
-  const char* vals[] = {vOpen, vWeak, vStrong, vTot};
-  const char* labs[] = {"risky", "aging", "WPA3", "total"};
+  const char* vals[] = {vOpen, vLegacy, vStrong, vTot};
+  const char* labs[] = {"open/WEP", "legacy WPA", "WPA2/3", "APs"};
   uint16_t cols[] = {hiOpen_ ? theme::kBad : theme::kGood,
-                     hiWeak ? theme::kWarn : theme::kInkDim, theme::kGood,
+                     hiLegacy ? theme::kWarn : theme::kInkDim, theme::kGood,
                      theme::kTeal};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 4;
-  txt(x + 8, below, theme::kInkMuted, 1, "Prefer WPA2/3 · disable WPS · PMF");
-  below += 12;
-  constexpr int kRh = theme::kRowHCompact;
-  int rows = min(hiTotal, 7);
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 2;
+  gfxu::printFit(G(), x + 8, below, w - 16, theme::kInkMuted, 1,
+                 "Beacon auth only · WPS/PMF not reported");
+  int toolbarY = below + 10;
+  gfxu::drawToolbar(G(), x + 4, toolbarY, w - 8, 18);
+  chip(x + 6, toolbarY + 1, 42, 16, "ALL", hiFilter == 0);
+  chip(x + 50, toolbarY + 1, 52, 16, "RISK", hiFilter == 1, theme::kWarn);
+  chip(x + 104, toolbarY + 1, 72, 16, "SECURE", hiFilter == 2, theme::kGood);
+  chip(x + 240, toolbarY + 1, 72, 16, "SAVE", false, theme::kCyan);
+  int listTop = toolbarY + 20;
+  constexpr int kRh = 18;
+  int rows = min(hiVisibleCount - hiScroll,
+                 max(0, (y + h - 18 - listTop) / kRh));
   for (int i = 0; i < rows; i++) {
-    int ry = below + i * kRh;
+    int index = hiVisible[hiScroll + i];
+    const HiRow& row = hiRows[index];
+    int ry = listTop + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    wifi_auth_mode_t m = hiRows[i].auth;
-    char ssid[20];
-    strncpy(ssid, hiRows[i].ssid, sizeof(ssid) - 1);
-    ssid[sizeof(ssid) - 1] = 0;
-    if (strlen(ssid) > 18) ssid[18] = 0;
-    txt(x + 10, ry + 4, theme::kInk, 1, "%s", ssid);
-    txt(x + 230, ry + 4, riskColor(encRisk(m)), 1, "%s", encLabel(m));
+    rssiBars(x + 8, ry + 3, row.rssi);
+    gfxu::printFit(G(), x + 29, ry + 1, 124, theme::kInk, 1, row.ssid);
+    char meta[38];
+    snprintf(meta, sizeof(meta), "ch%u %ddBm · %s", row.channel, (int)row.rssi,
+             oui::vendor(row.bssid)[0] ? oui::vendor(row.bssid) : "unknown");
+    gfxu::printFit(G(), x + 29, ry + 9, 166, theme::kInkMuted, 1, meta);
+    gfxu::printFit(G(), x + 224, ry + 4, 84, riskColor(encRisk(row.auth)), 1,
+                   encLabel(row.auth));
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
+  if (hiScroll > 0) btn(x + w - 28, listTop, 24, 18, "^", false);
+  if (hiScroll + rows < hiVisibleCount)
+    btn(x + w - 28, y + h - 31, 24, 18, "v", false);
+  if (!hiVisibleCount)
+    txt(x + 10, listTop + 6, theme::kInkMuted, 1,
+        hiTotal ? "No APs in this posture filter" : "Waiting for passive AP scan...");
+  gfxu::printFit(G(), x + 8, y + h - 10, w - 16, theme::kInkMuted, 1,
+                 "Row=details · scan every 12s · passive only");
 }
-bool hiTouch(int16_t, int16_t) { return false; }
+bool hiTouch(int16_t x, int16_t y) {
+  if (hiSelected >= 0) {
+    if (y >= theme::kScreenH - 34) {
+      if (x < 90) hiSelected = -1;
+      else hiSave();
+    }
+    return true;
+  }
+  const int toolbarY = contentTop() + 36;
+  if (y >= toolbarY && y < toolbarY + 20) {
+    if (x < 48) hiFilter = 0;
+    else if (x < 102) hiFilter = 1;
+    else if (x < 178) hiFilter = 2;
+    else if (x >= 240) hiSave();
+    hiScroll = 0;
+    hiRebuildVisible();
+    return true;
+  }
+  const int listTop = toolbarY + 20;
+  constexpr int rowH = 18;
+  const int rows = max(1, (theme::kScreenH - 18 - listTop) / rowH);
+  if (x >= theme::kScreenW - 30) {
+    if (y < listTop + rowH && hiScroll > 0) hiScroll--;
+    else if (y > theme::kScreenH - 34 && hiScroll + rows < hiVisibleCount)
+      hiScroll++;
+    return true;
+  }
+  if (y >= listTop && y < listTop + rows * rowH) {
+    int row = (y - listTop) / rowH;
+    if (hiScroll + row < hiVisibleCount)
+      hiSelected = hiVisible[hiScroll + row];
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -1787,20 +2932,48 @@ String clFiles[32];
 long clSizes[32];
 int clCount = 0;
 int clScroll = 0;
+bool clSortBySize = false;
 int clMode = 0;  // 0=list, 1=preview
 String clOpenName;
 String clLines[14];
 int clLineCount = 0;
 int clPreviewScroll = 0;
 bool clIsWigle = false;
+bool clIsCsv = false;
 int clWigleRows = 0;
 int clWigleUnique = 0;
+int clCsvRows = 0;
+int clCsvUnique = 0;
+bool clCsvHasKeys = false;
 
 void clAddEntry(const String& displayName, long size) {
   if (clCount >= 32) return;
   clFiles[clCount] = displayName;
   clSizes[clCount] = size;
   clCount++;
+}
+
+void clSortEntries() {
+  for (int i = 1; i < clCount; i++) {
+    String name = clFiles[i];
+    long size = clSizes[i];
+    int j = i;
+    auto shouldShift = [&](int previous) {
+      if (clSortBySize) {
+        long prevSize = clSizes[previous] < 0 ? LONG_MAX : clSizes[previous];
+        long nextSize = size < 0 ? LONG_MAX : size;
+        return prevSize < nextSize;
+      }
+      return strcasecmp(clFiles[previous].c_str(), name.c_str()) > 0;
+    };
+    while (j > 0 && shouldShift(j - 1)) {
+      clFiles[j] = clFiles[j - 1];
+      clSizes[j] = clSizes[j - 1];
+      j--;
+    }
+    clFiles[j] = name;
+    clSizes[j] = size;
+  }
 }
 
 void clScanDir(const char* dirPath, const char* prefix) {
@@ -1833,6 +3006,7 @@ void clRefresh() {
   clScanDir("/", "");
   // Crow's Nest / Chart Room style logs under /log (skip if already listed as [log]).
   if (SD_MMC.exists("/log")) clScanDir("/log", "log/");
+  clSortEntries();
 }
 
 bool clLooksText(const String& name) {
@@ -1847,8 +3021,12 @@ void clLoadPreview(const String& name) {
   clLineCount = 0;
   clPreviewScroll = 0;
   clIsWigle = false;
+  clIsCsv = false;
   clWigleRows = 0;
   clWigleUnique = 0;
+  clCsvRows = 0;
+  clCsvUnique = 0;
+  clCsvHasKeys = false;
   for (int i = 0; i < 14; i++) clLines[i] = "";
   if (!app::sdReady()) return;
   String path = name;
@@ -1861,6 +3039,7 @@ void clLoadPreview(const String& name) {
   }
   String lower = name;
   lower.toLowerCase();
+  clIsCsv = lower.endsWith(".csv");
   clIsWigle = lower.endsWith(".csv") &&
               (lower.indexOf("wigle") >= 0 || lower == "wigle.csv");
 
@@ -1910,6 +3089,61 @@ void clLoadPreview(const String& name) {
       }
     }
     clWigleUnique = hashCount;
+  } else if (clIsCsv) {
+    uint32_t hashes[64];
+    int hashCount = 0;
+    int lineNo = 0;
+    int keyColumn = -1;
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (!line.length()) continue;
+      lineNo++;
+      if (lineNo == 1) {
+        String header = line;
+        header.toLowerCase();
+        int col = 0, start = 0;
+        while (start <= header.length()) {
+          int comma = header.indexOf(',', start);
+          if (comma < 0) comma = header.length();
+          String field = header.substring(start, comma);
+          field.trim();
+          if (field == "bssid" || field == "mac") keyColumn = col;
+          col++;
+          if (comma >= header.length()) break;
+          start = comma + 1;
+        }
+        clCsvHasKeys = keyColumn >= 0;
+        if (clLineCount < 14) clLines[clLineCount++] = line.substring(0, 42);
+        continue;
+      }
+      clCsvRows++;
+      if (clCsvHasKeys) {
+        int start = 0, column = 0;
+        while (start <= line.length()) {
+          int comma = line.indexOf(',', start);
+          if (comma < 0) comma = line.length();
+          if (column == keyColumn) {
+            String key = line.substring(start, comma);
+            uint32_t hash = 2166136261u;
+            for (size_t c = 0; c < key.length(); c++) {
+              hash ^= (uint8_t)key[c];
+              hash *= 16777619u;
+            }
+            bool found = false;
+            for (int i = 0; i < hashCount; i++)
+              if (hashes[i] == hash) { found = true; break; }
+            if (!found && key.length() && hashCount < 64) hashes[hashCount++] = hash;
+            break;
+          }
+          column++;
+          if (comma >= line.length()) break;
+          start = comma + 1;
+        }
+      }
+      if (clLineCount < 14) clLines[clLineCount++] = line.substring(0, 42);
+    }
+    clCsvUnique = clCsvHasKeys ? hashCount : clCsvRows;
   } else {
     while (f.available() && clLineCount < 14) {
       String line = f.readStringUntil('\n');
@@ -1947,37 +3181,61 @@ void clDraw(int x, int y, int w, int h) {
       txt(x + 8, y + 28, theme::kGood, 1, "WiGLE: %d rows, %d unique SSIDs",
           clWigleRows, clWigleUnique);
       txt(x + 8, y + 40, theme::kInkDim, 1, "SSID           RSSI  Auth");
-      int rows = min(clLineCount, 10);
+      int rows = min(10, clLineCount - clPreviewScroll);
       for (int i = 0; i < rows; i++) {
         int ry = y + 54 + i * 12;
-        txt(x + 8, ry, theme::kInk, 1, "%s", clLines[i].c_str());
+        txt(x + 8, ry, theme::kInk, 1, "%s", clLines[clPreviewScroll + i].c_str());
       }
       if (clWigleRows == 0)
         txt(x + 8, y + 54, theme::kInkDim, 1, "(empty log — sail Chart Room)");
+    } else if (clIsCsv) {
+      txt(x + 8, y + 28, theme::kCyan, 1, "CSV: %d rows · %d %s", clCsvRows,
+          clCsvUnique, clCsvHasKeys ? "unique keys" : "sample lines");
+      int rows = min(11, clLineCount - clPreviewScroll);
+      for (int i = 0; i < rows; i++) {
+        int ry = y + 44 + i * 13;
+        gfxu::printFit(G(), x + 8, ry, w - 16, theme::kInk, 1,
+                       clLines[clPreviewScroll + i].c_str());
+      }
+      if (clCsvRows == 0)
+        txt(x + 8, y + 44, theme::kInkDim, 1, "(CSV header only)");
     } else {
       txt(x + 8, y + 28, theme::kInkDim, 1, "Preview (first lines):");
-      int rows = min(clLineCount, 12);
+      int rows = min(12, clLineCount - clPreviewScroll);
       for (int i = 0; i < rows; i++) {
         int ry = y + 42 + i * 12;
-        txt(x + 8, ry, theme::kInk, 1, "%s", clLines[i].c_str());
+        gfxu::printFit(G(), x + 8, ry, w - 16, theme::kInk, 1,
+                       clLines[clPreviewScroll + i].c_str());
       }
       if (clLineCount == 0)
         txt(x + 8, y + 42, theme::kInkDim, 1, "(empty or binary file)");
     }
+    if (clPreviewScroll > 0) btn(x + w - 32, y + 28, 24, 18, "^", false);
+    if (clPreviewScroll + 10 < clLineCount)
+      btn(x + w - 32, y + h - 28, 24, 18, "v", false);
     return;
   }
 
-  // List pane — KPI then Field Tablet rows
-  char vItems[8], vSd[8], vMode[8];
+  // List pane — storage overview, explicit refresh/sort controls, file rows.
+  char vItems[8], vSd[8], vBytes[12];
+  uint64_t totalBytes = 0;
+  for (int i = 0; i < clCount; i++)
+    if (clSizes[i] > 0) totalBytes += (uint64_t)clSizes[i];
   snprintf(vItems, sizeof(vItems), "%d", clCount);
   snprintf(vSd, sizeof(vSd), "%s", app::sdReady() ? "OK" : "--");
-  snprintf(vMode, sizeof(vMode), "LOG");
-  const char* vals[] = {vItems, vSd, vMode};
-  const char* labs[] = {"items", "SD", "hold"};
+  if (totalBytes >= 1024 * 1024)
+    snprintf(vBytes, sizeof(vBytes), "%llu", (unsigned long long)(totalBytes / (1024 * 1024)));
+  else
+    snprintf(vBytes, sizeof(vBytes), "%llu", (unsigned long long)(totalBytes / 1024));
+  const char* vals[] = {vItems, vSd, vBytes};
+  const char* labs[] = {"items", "SD", totalBytes >= 1024 * 1024 ? "MB" : "KB"};
   uint16_t cols[] = {theme::kTeal, theme::kGood, theme::kGold};
   int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkMuted, 1, "Tap row = preview · empty = refresh");
-  below += 12;
+  gfxu::drawToolbar(G(), x + 4, below, w - 8, 18);
+  chip(x + 6, below + 1, 76, 16, clSortBySize ? "SIZE" : "NAME", false,
+       theme::kGold);
+  chip(x + 88, below + 1, 88, 16, "REFRESH", false, theme::kCyan);
+  int listTop = below + 20;
   const int visible = 6;
   constexpr int kRh = theme::kRowH;
   if (clScroll > clCount - visible) clScroll = max(0, clCount - visible);
@@ -1985,7 +3243,7 @@ void clDraw(int x, int y, int w, int h) {
   int rows = min(visible, clCount - clScroll);
   for (int i = 0; i < rows; i++) {
     int idx = clScroll + i;
-    int ry = below + i * kRh;
+    int ry = listTop + i * kRh;
     bool wigle = false;
     String low = clFiles[idx];
     low.toLowerCase();
@@ -2005,7 +3263,7 @@ void clDraw(int x, int y, int w, int h) {
   }
   // Scroll affordances
   if (clCount > visible) {
-    btn(x + 280, below, 28, 20, "^", false);
+    btn(x + 280, listTop, 28, 20, "^", false);
     btn(x + 280, y + h - 28, 28, 20, "v", false);
   }
 }
@@ -2017,16 +3275,32 @@ bool clTouch(int16_t x, int16_t y) {
       clMode = 0;
       return true;
     }
+    if (x >= theme::kScreenW - 40) {
+      if (ly < 54) clPreviewScroll = max(0, clPreviewScroll - 8);
+      else if (ly > theme::kToolBodyH - 42)
+        clPreviewScroll = min(max(0, clLineCount - 10), clPreviewScroll + 8);
+      return true;
+    }
     return true;
   }
-  // Scroll buttons — list starts after KPI(~36)+hint(~14) ≈ 50
-  const int listY = theme::kKpiH + 16;
+  const int toolbarY = theme::kKpiH + 4;
+  if (ly >= toolbarY && ly < toolbarY + 20) {
+    if (x >= 6 && x <= 84) {
+      clSortBySize = !clSortBySize;
+      clSortEntries();
+      clScroll = 0;
+    } else if (x >= 88 && x <= 178) {
+      clRefresh();
+    }
+    return true;
+  }
+  const int listY = toolbarY + 20;
   if (clCount > 6 && x >= 270) {
-    if (ly >= listY && ly <= listY + 40) {
+    if (ly >= listY && ly <= listY + 24) {
       clScroll = max(0, clScroll - 3);
       return true;
     }
-    if (ly >= 150) {
+    if (ly >= theme::kToolBodyH - 36) {
       clScroll = min(max(0, clCount - 6), clScroll + 3);
       return true;
     }
@@ -2045,8 +3319,7 @@ bool clTouch(int16_t x, int16_t y) {
       return true;
     }
   }
-  // Empty tap refreshes
-  clRefresh();
+  // Empty space is inert; refresh is an explicit toolbar action.
   return true;
 }
 }  // namespace
@@ -2060,43 +3333,74 @@ void ssTick(uint32_t) {}
 void ssClose() {}
 void ssDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  int pct = power::batteryPct();
-  char vHeap[10], vBat[10], vGps[8];
-  snprintf(vHeap, sizeof(vHeap), "%u", (unsigned)(ESP.getFreeHeap() / 1024));
-  if (power::usbPowered())
-    snprintf(vBat, sizeof(vBat), "%s", power::powerLabel());
-  else
-    snprintf(vBat, sizeof(vBat), "%d%%", pct);
-  snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
-  const char* vals[] = {vHeap, vBat, vGps};
-  const char* labs[] = {"heap KB", "power", "GPS"};
-  uint16_t cols[] = {theme::kTeal,
-                     power::lowBattery() ? theme::kBad : theme::kGold,
-                     gps::hasFix() ? theme::kGood : theme::kInkDim};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
-  char v[40];
-  snprintf(v, sizeof(v), "%s x%d @ %dMHz", ESP.getChipModel(),
+  const uint32_t heapTotal = ESP.getHeapSize();
+  const uint32_t heapFree = ESP.getFreeHeap();
+  const uint32_t psramTotal = ESP.getPsramSize();
+  const uint32_t psramFree = ESP.getFreePsram();
+  const int heapUsedPct = heapTotal ? (int)((heapTotal - heapFree) * 100 / heapTotal) : 0;
+  const int psramUsedPct = psramTotal ? (int)((psramTotal - psramFree) * 100 / psramTotal) : 0;
+  const int battery = power::batteryPct();
+  char vHeap[10], vPsram[10], vPower[12];
+  snprintf(vHeap, sizeof(vHeap), "%u", (unsigned)(heapFree / 1024));
+  snprintf(vPsram, sizeof(vPsram), "%u", (unsigned)(psramFree / 1024));
+  snprintf(vPower, sizeof(vPower), "%s", power::usbPowered() ? "USB" : "BAT");
+  const char* values[] = {vHeap, vPsram, vPower};
+  const char* labels[] = {"heap KB", "PSRAM KB", "power"};
+  const uint16_t colors[] = {heapUsedPct > 85 ? theme::kWarn : theme::kTeal,
+                             psramUsedPct > 85 ? theme::kWarn : theme::kCyan,
+                             power::lowBattery() ? theme::kBad : theme::kGood};
+  kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors);
+
+  auto memoryBar = [&](int barY, const char* label, uint32_t freeBytes,
+                       uint32_t totalBytes, int usedPct, uint16_t color) {
+    char amount[28];
+    snprintf(amount, sizeof(amount), "%s %u/%u KB free", label,
+             (unsigned)(freeBytes / 1024), (unsigned)(totalBytes / 1024));
+    txt(x + 8, barY, theme::kInkDim, 1, "%s", amount);
+    const int barX = x + 8, barW = w - 16, barHeight = 7;
+    G().fillRect(barX, barY + 10, barW, barHeight, theme::kBgDeep);
+    G().drawRect(barX, barY + 10, barW, barHeight, theme::kBorder);
+    int fill = totalBytes ? (barW - 2) * usedPct / 100 : 0;
+    if (fill > 0) G().fillRect(barX + 1, barY + 11, fill, barHeight - 2, color);
+  };
+  memoryBar(y + 36, "RAM", heapFree, heapTotal, heapUsedPct,
+            heapUsedPct > 85 ? theme::kWarn : theme::kTeal);
+  memoryBar(y + 56, "PSRAM", psramFree, psramTotal, psramUsedPct,
+            psramUsedPct > 85 ? theme::kWarn : theme::kCyan);
+
+  int below = y + 78;
+  char value[56];
+  snprintf(value, sizeof(value), "%s · %d core · %d MHz", ESP.getChipModel(),
            ESP.getChipCores(), getCpuFrequencyMhz());
-  gfxu::drawKVRow(G(), x + 6, below, w - 12, 16, "Chip", v, theme::kCyan);
-  snprintf(v, sizeof(v), "%u / %u KB", (unsigned)(ESP.getFreePsram() / 1024),
-           (unsigned)(ESP.getPsramSize() / 1024));
-  gfxu::drawKVRow(G(), x + 6, below + 18, w - 12, 16, "PSRAM", v, theme::kTeal);
-  snprintf(v, sizeof(v), "%u MB",
-           (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
-  gfxu::drawKVRow(G(), x + 6, below + 36, w - 12, 16, "Flash", v);
-  gfxu::drawKVRow(G(), x + 6, below + 54, w - 12, 16, "SD",
-                  app::sdReady() ? "mounted" : "absent",
-                  app::sdReady() ? theme::kGood : theme::kBad);
-  uint32_t up = millis() / 1000;
-  snprintf(v, sizeof(v), "%lu:%02lu:%02lu", (unsigned long)(up / 3600),
-           (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
-  gfxu::drawKVRow(G(), x + 6, below + 72, w - 12, 16, "Uptime", v);
-  snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
-           (unsigned long)power::batteryMv());
-  gfxu::drawKVRow(G(), x + 6, below + 90, w - 12, 16, "Power", v, theme::kGold);
-  G().drawRoundRect(x + 6, below + 112, 104, 10, 3, theme::kBorder);
-  G().fillRoundRect(x + 8, below + 114, max(1, pct), 6, 2,
-                    power::lowBattery() ? theme::kBad : theme::kGood);
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 16, "Chip", value, theme::kCyan);
+  snprintf(value, sizeof(value), "%u MB · used %u MB",
+           (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)),
+           (unsigned)((ESP.getSketchSize() + 1024 * 1024 - 1) / (1024 * 1024)));
+  gfxu::drawKVRow(G(), x + 6, below + 18, w - 12, 16, "Flash", value);
+  snprintf(value, sizeof(value), "%s · %s", app::sdReady() ? "mounted" : "absent",
+           app::sdReady() ? "FAT volume" : "check card");
+  gfxu::drawKVRow(G(), x + 6, below + 36, w - 12, 16, "SD",
+                  value, app::sdReady() ? theme::kGood : theme::kBad);
+  snprintf(value, sizeof(value), "%s · %lu sats · HDOP %.1f",
+           gps::hasFix() ? "FIX" : gps::statusLabel(),
+           (unsigned long)gps::satellites(), gps::hdop());
+  gfxu::drawKVRow(G(), x + 6, below + 54, w - 12, 16, "GPS", value,
+                  gps::hasFix() ? theme::kGood : theme::kInkMuted);
+  snprintf(value, sizeof(value), "W%u B%u · RF %d/%d · scan %d",
+           tools::lastWifiCount(), tools::lastBleCount(), tools::rfWant(),
+           tools::rfPhase(), tools::rfScanStatus());
+  gfxu::drawKVRow(G(), x + 6, below + 72, w - 12, 16, "Radio", value,
+                  tools::rfWant() ? theme::kCyan : theme::kInkDim);
+  snprintf(value, sizeof(value), "%s · %lumV · %lu:%02lu:%02lu",
+           power::powerLabel(), (unsigned long)power::batteryMv(),
+           (unsigned long)(millis() / 3600000),
+           (unsigned long)((millis() / 60000) % 60),
+           (unsigned long)((millis() / 1000) % 60));
+  gfxu::drawKVRow(G(), x + 6, below + 90, w - 12, 16, "Power / up", value,
+                  power::lowBattery() ? theme::kBad : theme::kGold);
+  snprintf(value, sizeof(value), "RF phase %lu ms · heap used %d%%",
+           (unsigned long)tools::rfLastPhaseMs(), heapUsedPct);
+  gfxu::printFit(G(), x + 8, below + 110, w - 16, theme::kInkMuted, 1, value);
 }
 bool ssTouch(int16_t, int16_t) { return false; }
 }  // namespace
@@ -2112,7 +3416,6 @@ void slDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   char vMode[12], vGlow[8], vSnd[8];
   snprintf(vMode, sizeof(vMode), "%s", led::modeName(led::mode()));
-  if (strlen(vMode) > 6) vMode[6] = 0;
   snprintf(vGlow, sizeof(vGlow), "%d%%", led::brightness());
   snprintf(vSnd, sizeof(vSnd), "%s", app::sound() ? "ON" : "off");
   const char* vals[] = {vMode, vGlow, vSnd};
@@ -2126,14 +3429,20 @@ void slDraw(int x, int y, int w, int h) {
   btn(x + 8, below, 150, 26, modeLab, false);
   txt(x + 168, below + 8, theme::kInkMuted, 1, "tap to cycle");
 
-  txt(x + 8, below + 36, theme::kInkDim, 1, "Color:");
+  txt(x + 8, below + 36, theme::kInkDim, 1, "Color: %s",
+      led::colorName(led::colorIdx()));
+  static const char* const kColorTags[led::kColorCount] = {
+      "GD", "RD", "GN", "BL", "TL", "PU", "WH", "OR"};
   for (int i = 0; i < led::kColorCount; i++) {
     uint32_t c = led::colorRgb(i);
     uint16_t col565 = G().color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     int sx = x + 52 + i * 32;
-    G().fillRoundRect(sx, below + 30, 26, 24, 4, col565);
+    G().fillRect(sx, below + 30, 26, 24, col565);
+    G().drawRect(sx, below + 30, 26, 24, theme::kBorder);
     if (i == led::colorIdx())
-      G().drawRoundRect(sx - 2, below + 28, 30, 28, 5, theme::kGold);
+      G().drawRect(sx - 2, below + 28, 30, 28, theme::kGold);
+    gfxu::printCentered(G(), sx, below + 54, 26, 9, theme::kInkMuted, 1,
+                        kColorTags[i]);
   }
 
   txt(x + 8, below + 68, theme::kInk, 1, "Glow: %d%%", led::brightness());
@@ -2143,8 +3452,8 @@ void slDraw(int x, int y, int w, int h) {
   btn(x + 8, below + 92, 150, 26, app::sound() ? "Sound: ON" : "Sound: off",
       false, app::sound() ? theme::kGood : theme::kLocked);
 
-  txt(x + 8, below + 128, theme::kInkMuted, 1,
-      "Profile persists across every station.");
+    txt(x + 8, below + 128, theme::kInkMuted, 1,
+      "Saved to device · applies across all stations");
 }
 bool slTouch(int16_t x, int16_t y) {
   int ly = y - contentTop();  // content-local
@@ -2164,11 +3473,11 @@ bool slTouch(int16_t x, int16_t y) {
   }
   if (ly >= base + 58 && ly <= base + 90) {
     if (x >= 144 && x <= 182) {
-      led::setBrightness(led::brightness() - 10);
+      led::setBrightness(led::brightness() - 5);
       return true;
     }
     if (x >= 183 && x <= 222) {
-      led::setBrightness(led::brightness() + 10);
+      led::setBrightness(led::brightness() + 5);
       return true;
     }
   }
@@ -2201,7 +3510,7 @@ struct SeLayout {
   int captainSec, rename;
   int displaySec, bri, sound;
   int powerSec, powerRow;
-  int systemSec, kv0;  // 4 KV rows
+  int systemSec, kv0;  // live device diagnostics
   int otaCard, actionRow;
   int contentH;
 };
@@ -2217,7 +3526,7 @@ SeLayout seLayout() {
   L.powerSec = y; y += kSeSecH;
   L.powerRow = y; y += kSeBtnH + kSeGap;
   L.systemSec = y; y += kSeSecH;
-  L.kv0 = y; y += kSeKvH * 4 + 2;
+  L.kv0 = y; y += kSeKvH * 6 + 2;
   L.otaCard = y; y += kSeOtaH + 2;
   L.actionRow = y; y += kSeBtnH + 2;
   L.contentH = y;
@@ -2352,16 +3661,25 @@ void seDraw(int x, int y, int w, int h) {
            (unsigned)(ESP.getMinFreeHeap() / 1024));
   gfxu::drawKVRow(G(), x + 6, cy(L.kv0), w - 40, kSeKvH - 1, "Heap free/min", v,
                   theme::kTeal);
+  snprintf(v, sizeof(v), "%u / %u KB",
+           (unsigned)(ESP.getFreePsram() / 1024),
+           (unsigned)(ESP.getPsramSize() / 1024));
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH), w - 40, kSeKvH - 1,
+                  "PSRAM free/total", v, theme::kCyan);
   seFmtMac(v, sizeof(v));
-  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH), w - 40, kSeKvH - 1, "WiFi MAC",
-                  v, theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 2), w - 40, kSeKvH - 1,
+                  "WiFi MAC", v, theme::kInkDim);
+  snprintf(v, sizeof(v), "AP %d · BLE %d · RF %d/%d", tools::lastWifiCount(),
+           tools::lastBleCount(), tools::rfWant(), tools::rfPhase());
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 3), w - 40, kSeKvH - 1,
+                  "Radio", v, theme::kCyan);
   snprintf(v, sizeof(v), "%u MB",
            (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
-  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 2), w - 40, kSeKvH - 1,
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 4), w - 40, kSeKvH - 1,
                   "Flash", v);
   seFmtSd(v, sizeof(v));
-  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 3), w - 40, kSeKvH - 1, "SD free",
-                  v, app::sdReady() ? theme::kGood : theme::kBad);
+  gfxu::drawKVRow(G(), x + 6, cy(L.kv0 + kSeKvH * 5), w - 40, kSeKvH - 1,
+                  "SD free", v, app::sdReady() ? theme::kGood : theme::kBad);
 
   gfxu::drawElevated(G(), x + 4, cy(L.otaCard), w - 36, kSeOtaH - 2);
   txt(x + 10, cy(L.otaCard) + 3, theme::kInkMuted, 1, "OTA: %s", ota::status());
@@ -2423,11 +3741,13 @@ bool seTouch(int16_t x, int16_t y) {
   }
   if (inRow(L.bri)) {
     if (x >= 72 && x <= 104) {
-      app::setBrightness(app::brightness() - 10);
+      int next = max(5, (int)app::brightness() - 5);
+      app::setBrightness((uint8_t)next);
       return true;
     }
     if (x >= 104 && x <= 136) {
-      app::setBrightness(app::brightness() + 10);
+      int next = min(100, (int)app::brightness() + 5);
+      app::setBrightness((uint8_t)next);
       return true;
     }
   }
@@ -2480,16 +3800,20 @@ bool seTouch(int16_t x, int16_t y) {
 namespace {
 struct Probe {
   char mac[18];
-  char ssid[26];
+  uint32_t ssidHashes[8];
+  uint8_t ssidHashCount;
+  uint8_t sessionId;
   int8_t rssi;
+  int8_t strongestRssi;
   uint16_t hits;
+  uint32_t lastSeen;
 };
 Probe pwList[16];
 int pwCount = 0;
-int pwRewarded = 0;
 uint32_t pwTotal = 0;
 int pwChannel = 1;
 uint32_t pwHopAt = 0;
+uint8_t pwNextSessionId = 1;
 
 // Runs in the Wi-Fi task: parse only the transmitter address + requested SSID
 // from a broadcast probe-request management frame. No payload/data frames are
@@ -2497,10 +3821,11 @@ uint32_t pwHopAt = 0;
 void pwPromiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
   auto* p = (wifi_promiscuous_pkt_t*)buf;
+  int len = p->rx_ctrl.sig_len;
+  if (len < 24) return;
   const uint8_t* pl = p->payload;
   if (((pl[0] >> 4) & 0x0F) != 4) return;  // probe request subtype only
   pwTotal++;
-  int len = p->rx_ctrl.sig_len;
   char ssid[26] = "";
   if (len >= 26 && pl[24] == 0) {  // first tagged element = SSID
     int sl = pl[25];
@@ -2514,29 +3839,50 @@ void pwPromiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
       ssid[j] = 0;
     }
   }
+  uint32_t ssidHash = 2166136261u;
+  for (const char* c = ssid; *c; c++) {
+    ssidHash ^= (uint8_t)*c;
+    ssidHash *= 16777619u;
+  }
   char mac[18];
   snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", pl[10], pl[11],
            pl[12], pl[13], pl[14], pl[15]);
   for (int i = 0; i < pwCount; i++) {
-    if (strcmp(pwList[i].mac, mac) == 0 && strcmp(pwList[i].ssid, ssid) == 0) {
-      pwList[i].rssi = p->rx_ctrl.rssi;
-      if (pwList[i].hits < 65535) pwList[i].hits++;
+    if (strcmp(pwList[i].mac, mac) == 0) {
+      Probe& probe = pwList[i];
+      probe.rssi = p->rx_ctrl.rssi;
+      if (probe.rssi > probe.strongestRssi) probe.strongestRssi = probe.rssi;
+      if (probe.hits < 65535) probe.hits++;
+      probe.lastSeen = millis();
+      if (ssid[0] && probe.ssidHashCount < 8) {
+        bool known = false;
+        for (int j = 0; j < probe.ssidHashCount; j++)
+          if (probe.ssidHashes[j] == ssidHash) known = true;
+        if (!known) probe.ssidHashes[probe.ssidHashCount++] = ssidHash;
+      }
       return;
     }
   }
   int idx = pwCount < 16 ? pwCount++ : (int)(pwTotal % 16);
-  strncpy(pwList[idx].mac, mac, sizeof(pwList[idx].mac) - 1);
-  pwList[idx].mac[sizeof(pwList[idx].mac) - 1] = 0;
-  strncpy(pwList[idx].ssid, ssid, sizeof(pwList[idx].ssid) - 1);
-  pwList[idx].ssid[sizeof(pwList[idx].ssid) - 1] = 0;
-  pwList[idx].rssi = p->rx_ctrl.rssi;
-  pwList[idx].hits = 1;
+  Probe& probe = pwList[idx];
+  memset(&probe, 0, sizeof(probe));
+  strncpy(probe.mac, mac, sizeof(probe.mac) - 1);
+  probe.sessionId = pwNextSessionId++;
+  if (pwNextSessionId == 0) pwNextSessionId = 1;
+  probe.rssi = p->rx_ctrl.rssi;
+  probe.strongestRssi = probe.rssi;
+  probe.hits = 1;
+  probe.lastSeen = millis();
+  if (ssid[0]) {
+    probe.ssidHashes[0] = ssidHash;
+    probe.ssidHashCount = 1;
+  }
 }
 void pwOpen() {
   pwCount = 0;
-  pwRewarded = 0;
   pwTotal = 0;
   pwChannel = 1;
+  pwNextSessionId = 1;
   wifiPromiscBegin(&pwPromiscCb, pwChannel);
 }
 void pwTick(uint32_t now) {
@@ -2545,96 +3891,265 @@ void pwTick(uint32_t now) {
     pwChannel = pwChannel >= 13 ? 1 : pwChannel + 1;
     wifiPromiscHop(pwChannel);
   }
-  while (pwRewarded < pwCount) {  // xp for each new unique client seen
-    pwRewarded++;
-    game::awardXp(1);
-  }
 }
 void pwClose() { wifiRfLeave(); }
 void pwDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
-  char vCli[8], vCh[8], vFrm[10];
+  int uniqueNames = 0;
+  for (int i = 0; i < pwCount; i++) uniqueNames += pwList[i].ssidHashCount;
+  char vCli[8], vCh[8], vFrm[10], vNames[8];
   snprintf(vCli, sizeof(vCli), "%d", pwCount);
   snprintf(vCh, sizeof(vCh), "%d", pwChannel);
   snprintf(vFrm, sizeof(vFrm), "%lu", (unsigned long)pwTotal);
-  const char* vals[] = {vCli, vCh, vFrm};
-  const char* labs[] = {"clients", "CH hop", "frames"};
-  uint16_t cols[] = {theme::kTeal, theme::kCyan, theme::kGold};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  txt(x + 8, below, theme::kInkMuted, 1, "passive probe-request sniff");
+  snprintf(vNames, sizeof(vNames), "%d", uniqueNames);
+  const char* vals[] = {vCli, vNames, vFrm, vCh};
+  const char* labs[] = {"session IDs", "SSID hashes", "frames", "channel"};
+  const uint16_t cols[] = {theme::kCyan, theme::kTeal, theme::kGold, theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 2;
+  gfxu::printFit(G(), x + 8, below, w - 16, theme::kInkMuted, 1,
+                 "Session IDs only · SSID names discarded");
   below += 12;
-  constexpr int kRh = theme::kRowHCompact;
-  int rows = min(pwCount, 8);
+  constexpr int kRh = 19;
+  int rows = min(pwCount, 6);
   for (int i = 0; i < rows; i++) {
     int ry = below + i * kRh;
     if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
     rssiBars(x + 8, ry + 3, pwList[i].rssi);
-    if (pwList[i].ssid[0]) {
-      String s = String(pwList[i].ssid);
-      if (s.length() > 14) s = s.substring(0, 14);
-      txt(x + 28, ry + 4, theme::kInk, 1, "%s", s.c_str());
-    } else {
-      txt(x + 28, ry + 4, theme::kInkDim, 1, "<broadcast>");
-    }
+    char alias[12], meta[30];
+    snprintf(alias, sizeof(alias), "P-%02u", pwList[i].sessionId);
+    gfxu::printFit(G(), x + 28, ry + 1, 46, theme::kCyan, 1, alias);
     const char* ven = oui::vendorStr(String(pwList[i].mac));
-    txt(x + 150, ry + 4, theme::kTeal, 1, "%.8s",
-        ven[0] ? ven : pwList[i].mac + 9);
-    txt(x + 250, ry + 4, theme::kInkDim, 1, "x%u", pwList[i].hits);
+    snprintf(meta, sizeof(meta), "%s · %u names", ven[0] ? ven : "unknown vendor",
+             pwList[i].ssidHashCount);
+    gfxu::printFit(G(), x + 78, ry + 1, 166, theme::kInk, 1, meta);
+    txt(x + 250, ry + 1, theme::kGold, 1, "x%u", pwList[i].hits);
+    txt(x + 250, ry + 10, theme::kInkMuted, 1, "%ddB", pwList[i].rssi);
     G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
   }
   if (pwCount == 0)
-    txt(x + 12, below + 8, theme::kInkMuted, 1, "Listening… hopping channels.");
+    gfxu::printFit(G(), x + 12, below + 8, w - 24, theme::kInkMuted, 1,
+                   "Listening passively · waiting for probes");
+  int buttonY = y + h - 27;
+  btn(x + 6, buttonY, 142, 22, "CLEAR SESSION", false);
+  btn(x + 158, buttonY, 154, 22, "RESET CHANNEL HOP", false, theme::kCyan);
 }
-bool pwTouch(int16_t, int16_t) { return false; }
+bool pwTouch(int16_t x, int16_t y) {
+  if (y < theme::kScreenH - 32) return true;
+  if (x < 154) {
+    pwCount = 0;
+    pwTotal = 0;
+    pwNextSessionId = 1;
+    return true;
+  }
+  pwChannel = 1;
+  pwHopAt = millis();
+  wifiPromiscHop(pwChannel);
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
 //  14. Deep BLE ID -- advertisement decoder (company / iBeacon / Eddystone)
 // ===========================================================================
 namespace {
-void dbOpen() { g_bleLastScan = 0; }
-void dbTick(uint32_t now) { bleTick(now); }
-void dbClose() { bleStop(); }
-void dbDraw(int x, int y, int w, int h) {
+int dbFilter = 0;  // all, named, decoded, connectable
+int dbSort = 0;    // RSSI, name
+int dbScroll = 0;
+int dbVisible[48];
+int dbVisibleCount = 0;
+uint32_t dbGeneration = 0;
+int dbSelected = -1;
+
+void dbRebuild() {
+  dbVisibleCount = 0;
+  for (int i = 0; i < g_bleCount; i++) {
+    const BleDev& device = g_ble[i];
+    if (dbFilter == 1 && !device.name.length()) continue;
+    if (dbFilter == 2 && !device.detail[0] && !device.company &&
+        !device.serviceUuid[0]) continue;
+    if (dbFilter == 3 && !device.connectable) continue;
+    dbVisible[dbVisibleCount++] = i;
+  }
+  auto before = [](int a, int b) {
+    if (dbSort == 1) {
+      const char* an = g_ble[a].name.length() ? g_ble[a].name.c_str()
+                                               : g_ble[a].mac.c_str();
+      const char* bn = g_ble[b].name.length() ? g_ble[b].name.c_str()
+                                               : g_ble[b].mac.c_str();
+      int cmp = strcasecmp(an, bn);
+      if (cmp) return cmp < 0;
+    }
+    return g_ble[a].rssi > g_ble[b].rssi;
+  };
+  for (int i = 1; i < dbVisibleCount; i++) {
+    int item = dbVisible[i], j = i;
+    while (j > 0 && before(item, dbVisible[j - 1])) {
+      dbVisible[j] = dbVisible[j - 1];
+      j--;
+    }
+    dbVisible[j] = item;
+  }
+  int maxScroll = max(0, dbVisibleCount - 6);
+  if (dbScroll > maxScroll) dbScroll = maxScroll;
+}
+
+void dbOpen() {
+  dbFilter = 0;
+  dbSort = 0;
+  dbScroll = 0;
+  dbSelected = -1;
+  dbGeneration = g_bleGeneration;
+  dbRebuild();
+  g_bleLastScan = 0;
+}
+void dbTick(uint32_t now) {
+  bleTick(now);
+  if (dbGeneration != g_bleGeneration) {
+    dbGeneration = g_bleGeneration;
+    dbRebuild();
+  }
+}
+void dbClose() { bleStop(); dbSelected = -1; }
+void dbDrawDetail(int x, int y, int w, int h) {
   body(x, y, w, h);
-  int named = 0, decoded = 0;
+  if (dbSelected < 0 || dbSelected >= g_bleCount) return;
+  const BleDev& device = g_ble[dbSelected];
+  char rssi[12], txPower[12], services[8], company[20], appearance[18];
+  snprintf(rssi, sizeof(rssi), "%d dBm", device.rssi);
+  snprintf(txPower, sizeof(txPower), "%s", device.hasTxPower ? "present" : "n/a");
+  snprintf(services, sizeof(services), "%u", device.serviceCount);
+  snprintf(company, sizeof(company), "%s", bleCompanyName(device.company));
+  if (!company[0] && device.company)
+    snprintf(company, sizeof(company), "0x%04X", device.company);
+  if (!company[0]) snprintf(company, sizeof(company), "not advertised");
+  if (device.hasAppearance)
+    snprintf(appearance, sizeof(appearance), "0x%04X", device.appearance);
+  else
+    snprintf(appearance, sizeof(appearance), "not advertised");
+  const char* values[] = {rssi, device.connectable ? "YES" : "NO", services};
+  const char* labels[] = {"signal", "connectable", "services"};
+  const uint16_t colors[] = {theme::kCyan,
+                             device.connectable ? theme::kGood : theme::kInkDim,
+                             device.serviceCount ? theme::kTeal : theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 3, values, labels, colors) + 3;
+  String name = device.name.length() ? device.name : String("(unnamed)");
+  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "Name", name.c_str());
+  gfxu::drawKVRow(G(), x + 6, below + 20, w - 12, 18, "Address",
+                  device.mac.c_str(), theme::kCyan);
+  gfxu::drawKVRow(G(), x + 6, below + 40, w - 12, 18, "Company", company,
+                  theme::kTeal);
+  gfxu::drawKVRow(G(), x + 6, below + 60, w - 12, 18, "Advertisement",
+                  device.detail[0] ? device.detail : "generic", theme::kInkDim);
+  gfxu::drawKVRow(G(), x + 6, below + 80, w - 12, 18, "Service UUID",
+                  device.serviceUuid[0] ? device.serviceUuid : "not advertised",
+                  theme::kInk);
+  gfxu::drawKVRow(G(), x + 6, below + 100, w - 12, 18, "TX power",
+                  txPower, device.hasTxPower ? theme::kGold : theme::kInkMuted);
+  gfxu::drawKVRow(G(), x + 6, below + 120, w - 12, 18, "Appearance",
+                  appearance);
+  btn(x + 6, y + h - 24, 72, 20, "BACK", false);
+}
+
+void dbDraw(int x, int y, int w, int h) {
+  if (dbSelected >= 0) {
+    dbDrawDetail(x, y, w, h);
+    return;
+  }
+  body(x, y, w, h);
+  int named = 0, decoded = 0, connectable = 0;
   for (int i = 0; i < g_bleCount; i++) {
     if (g_ble[i].name.length()) named++;
-    if (g_ble[i].detail[0] || g_ble[i].company) decoded++;
+    if (g_ble[i].detail[0] || g_ble[i].company || g_ble[i].serviceUuid[0]) decoded++;
+    if (g_ble[i].connectable) connectable++;
   }
-  char vAdv[8], vDec[8], vNam[8];
+  char vAdv[8], vDec[8], vNam[8], vConn[8];
   snprintf(vAdv, sizeof(vAdv), "%d", g_bleCount);
   snprintf(vDec, sizeof(vDec), "%d", decoded);
   snprintf(vNam, sizeof(vNam), "%d", named);
-  const char* vals[] = {vAdv, vDec, vNam};
-  const char* labs[] = {"adverts", "decoded", "named"};
-  uint16_t cols[] = {theme::kCyan, theme::kTeal, theme::kGold};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 2;
-  constexpr int kRh = theme::kRowH;
-  int rows = min(g_bleCount, 7);
+  snprintf(vConn, sizeof(vConn), "%d", connectable);
+  const char* vals[] = {vAdv, vDec, vNam, vConn};
+  const char* labs[] = {"seen", "decoded", "named", "connectable"};
+  const uint16_t cols[] = {theme::kCyan, theme::kTeal, theme::kGold,
+                           connectable ? theme::kGood : theme::kInkDim};
+  int below = kpiStrip(x + 4, y + 2, w - 8, 4, vals, labs, cols) + 2;
+  gfxu::drawToolbar(G(), x + 4, below, w - 8, 18);
+  chip(x + 6, below + 1, 38, 16, "ALL", dbFilter == 0);
+  chip(x + 46, below + 1, 46, 16, "NAMED", dbFilter == 1);
+  chip(x + 94, below + 1, 42, 16, "DECODED", dbFilter == 2, theme::kTeal);
+  chip(x + 138, below + 1, 56, 16, "CONNECT", dbFilter == 3, theme::kGood);
+  chip(x + 196, below + 1, 42, 16, dbSort ? "NAME" : "RSSI", false,
+       theme::kGold);
+  chip(x + 240, below + 1, 72, 16, "RESCAN", false, theme::kCyan);
+  int listTop = below + 20;
+  constexpr int rowH = 20;
+  int rows = min(dbVisibleCount - dbScroll,
+                 max(0, (y + h - 12 - listTop) / rowH));
   for (int i = 0; i < rows; i++) {
-    int ry = below + i * kRh;
-    if (i & 1) G().fillRect(x + 4, ry, w - 8, kRh, theme::kPanelSoft);
-    String label = g_ble[i].name.length() ? g_ble[i].name : g_ble[i].mac;
-    if (label.length() > 20) label = label.substring(0, 20);
-    txt(x + 10, ry + 1, theme::kInk, 1, "%s", label.c_str());
-    txt(x + w - 40, ry + 1, theme::kInkDim, 1, "%ddB", g_ble[i].rssi);
-    const char* co = bleCompanyName(g_ble[i].company);
-    if (g_ble[i].detail[0])
-      txt(x + 16, ry + 10, theme::kTeal, 1, "%s", g_ble[i].detail);
-    else if (co[0])
-      txt(x + 16, ry + 10, theme::kTeal, 1, "%s", co);
-    else if (g_ble[i].company)
-      txt(x + 16, ry + 10, theme::kInkMuted, 1, "company 0x%04X",
-          g_ble[i].company);
+    const BleDev& device = g_ble[dbVisible[dbScroll + i]];
+    int ry = listTop + i * rowH;
+    if (i & 1) G().fillRect(x + 4, ry, w - 8, rowH, theme::kPanelSoft);
+    String label = device.name.length() ? device.name : device.mac;
+    gfxu::printFit(G(), x + 9, ry + 1, 190, theme::kInk, 1, label.c_str());
+    const char* vendorName = bleCompanyName(device.company);
+    char summary[36];
+    if (device.detail[0])
+      snprintf(summary, sizeof(summary), "%s · %s", device.detail,
+               device.connectable ? "connectable" : "beacon");
     else
-      txt(x + 16, ry + 10, theme::kInkMuted, 1, "no manufacturer data");
-    G().drawFastHLine(x + 8, ry + kRh - 1, w - 16, theme::kBorder);
+      snprintf(summary, sizeof(summary), "%s · %u svc",
+               vendorName[0] ? vendorName : "unknown", device.serviceCount);
+    gfxu::printFit(G(), x + 9, ry + 10, 208, theme::kInkMuted, 1, summary);
+    char rssi[12];
+    snprintf(rssi, sizeof(rssi), "%d", device.rssi);
+    gfxu::printFit(G(), x + w - 44, ry + 2, 38, theme::kCyan, 1, rssi);
+    G().drawFastHLine(x + 8, ry + rowH - 1, w - 16, theme::kBorder);
   }
-  if (g_bleCount == 0)
-    txt(x + 12, below + 8, theme::kInkMuted, 1, "Sampling the air...");
+  if (!dbVisibleCount)
+    gfxu::printFit(G(), x + 10, listTop + 8, w - 20, theme::kInkMuted, 1,
+                   g_bleScanning ? "Passive scan · previous completed pass retained"
+                                 : "No advertisements in last completed pass");
+  if (dbScroll > 0) btn(x + w - 28, listTop, 24, 18, "^", false);
+  if (dbScroll + rows < dbVisibleCount)
+    btn(x + w - 28, y + h - 30, 24, 18, "v", false);
+  gfxu::printFit(G(), x + 8, y + h - 10, w - 16, theme::kInkMuted, 1,
+                 "Public advertisements only · no GATT connection");
 }
-bool dbTouch(int16_t, int16_t) { return false; }
+
+bool dbTouch(int16_t x, int16_t y) {
+  if (dbSelected >= 0) {
+    if (y >= theme::kScreenH - 34 && x < 90) dbSelected = -1;
+    return true;
+  }
+  const int toolbarY = contentTop() + 32;
+  if (y >= toolbarY && y < toolbarY + 20) {
+    if (x < 45) dbFilter = 0;
+    else if (x < 93) dbFilter = 1;
+    else if (x < 138) dbFilter = 2;
+    else if (x < 196) dbFilter = 3;
+    else if (x < 239) dbSort = !dbSort;
+    else {
+      bleStop();
+      g_bleLastScan = 0;
+    }
+    dbScroll = 0;
+    dbRebuild();
+    return true;
+  }
+  const int listTop = toolbarY + 20;
+  constexpr int rowH = 20;
+  const int rows = max(0, (theme::kScreenH - 12 - listTop) / rowH);
+  if (x >= theme::kScreenW - 30) {
+    if (y < listTop + rowH && dbScroll > 0) dbScroll--;
+    else if (y > theme::kScreenH - 34 && dbScroll + rows < dbVisibleCount)
+      dbScroll++;
+    return true;
+  }
+  if (y >= listTop && y < listTop + rows * rowH) {
+    int row = (y - listTop) / rowH;
+    if (dbScroll + row < dbVisibleCount) dbSelected = dbVisible[dbScroll + row];
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================
@@ -2643,60 +4158,152 @@ bool dbTouch(int16_t, int16_t) { return false; }
 namespace {
 float siTemp = 0;
 uint32_t siLast = 0;
-void siOpen() { siLast = 0; }
+constexpr int kSiTempHistory = 48;
+float siTempHistory[kSiTempHistory] = {};
+int siTempHistoryCount = 0;
+int siTempHistoryHead = 0;
+bool siFahrenheit = false;
+uint32_t siSavedFixes = 0;
+
+void siOpen() {
+  siLast = 0;
+  siTempHistoryCount = 0;
+  siTempHistoryHead = 0;
+  siSavedFixes = 0;
+}
 void siTick(uint32_t now) {
   if (now - siLast > 1000) {
     siLast = now;
     siTemp = temperatureRead();  // on-die core temperature sensor
+    siTempHistory[siTempHistoryHead] = siTemp;
+    siTempHistoryHead = (siTempHistoryHead + 1) % kSiTempHistory;
+    if (siTempHistoryCount < kSiTempHistory) siTempHistoryCount++;
   }
 }
 void siClose() {}
+
+bool siSaveFix() {
+  if (!gps::hasFix()) {
+    tools::toast("No GPS fix to save");
+    return false;
+  }
+  if (!app::sdReady()) {
+    tools::toast("Save failed · no SD");
+    return false;
+  }
+  if (!SD_MMC.exists("/log") && !SD_MMC.mkdir("/log")) {
+    tools::toast("Save failed · /log");
+    return false;
+  }
+  const char* path = "/log/instruments.csv";
+  bool header = !SD_MMC.exists(path);
+  File file = SD_MMC.open(path, FILE_APPEND);
+  if (!file) {
+    tools::toast("Save failed · open");
+    return false;
+  }
+  if (header)
+    file.println("timestamp,latitude,longitude,altitude_m,satellites,hdop,battery_mv,battery_pct");
+  char timestamp[24];
+  if (!gps::formatTimestamp(timestamp, sizeof(timestamp)))
+    snprintf(timestamp, sizeof(timestamp), "uptime-%lu",
+             (unsigned long)(millis() / 1000));
+  file.printf("%s,%.6f,%.6f,%.1f,%lu,%.1f,%lu,%d\n", timestamp,
+              gps::latitude(), gps::longitude(), gps::altitudeM(),
+              (unsigned long)gps::satellites(), gps::hdop(),
+              (unsigned long)power::batteryMv(), power::batteryPct());
+  file.close();
+  siSavedFixes++;
+  tools::toast("Saved GPS fix · %lu", (unsigned long)siSavedFixes);
+  return true;
+}
 void siDraw(int x, int y, int w, int h) {
   body(x, y, w, h);
   int pct = power::batteryPct();
   bool fix = gps::hasFix();
+  float shownTemp = siFahrenheit ? siTemp * 9.0f / 5.0f + 32.0f : siTemp;
   char vTemp[10], vBat[10], vGps[8];
-  snprintf(vTemp, sizeof(vTemp), "%.0fC", siTemp);
+  snprintf(vTemp, sizeof(vTemp), "%.0f%s", shownTemp,
+           siFahrenheit ? "F" : "C");
   if (power::usbPowered())
     snprintf(vBat, sizeof(vBat), "%s", power::powerLabel());
   else
     snprintf(vBat, sizeof(vBat), "%d%%", pct);
   snprintf(vGps, sizeof(vGps), "%s", gps::statusLabel());
   const char* vals[] = {vTemp, vBat, vGps};
-  const char* labs[] = {"core", "power", "GPS"};
+  const char* labs[] = {"internal", "power", "GPS"};
   uint16_t cols[] = {theme::kGold,
                      power::lowBattery() ? theme::kBad : theme::kTeal,
                      fix ? theme::kGood : theme::kWarn};
-  int below = kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols) + 4;
-  char v[40];
-  snprintf(v, sizeof(v), "%.1f C / %.0f F", siTemp,
-           siTemp * 9.0f / 5.0f + 32.0f);
-  gfxu::drawKVRow(G(), x + 6, below, w - 12, 18, "Core temp", v, theme::kGold);
-  snprintf(v, sizeof(v), "%s  %lumV", power::powerLabel(),
-           (unsigned long)power::batteryMv());
-  gfxu::drawKVRow(G(), x + 6, below + 22, w - 12, 18, "Power", v, theme::kGold);
-  G().drawRoundRect(x + 6, below + 46, 104, 10, 3, theme::kBorder);
-  G().fillRoundRect(x + 8, below + 48, max(1, pct), 6, 2,
-                    power::lowBattery() ? theme::kBad : theme::kGood);
-  gfxu::drawKVRow(G(), x + 6, below + 64, w - 12, 18, "GPS", gps::statusLabel(),
+  kpiStrip(x + 4, y + 2, w - 8, 3, vals, labs, cols);
+  txt(x + 8, y + 35, theme::kInkMuted, 1,
+      "ESP32 on-die temperature · not ambient air temperature");
+
+  const int chartX = x + 8, chartY = y + 48, chartW = w - 16, chartH = 38;
+  G().fillRect(chartX, chartY, chartW, chartH, theme::kBgDeep);
+  G().drawRect(chartX, chartY, chartW, chartH, theme::kBorder);
+  for (int line = 1; line <= 2; line++)
+    G().drawFastHLine(chartX + 1, chartY + line * (chartH - 2) / 3,
+                      chartW - 2, theme::kBorder);
+  if (siTempHistoryCount >= 2) {
+    int start = (siTempHistoryHead - siTempHistoryCount + kSiTempHistory) %
+                kSiTempHistory;
+    int prevX = chartX + 2;
+    auto tempY = [&](float celsius) {
+      float scaled = siFahrenheit ? celsius * 9.0f / 5.0f + 32.0f : celsius;
+      float minValue = siFahrenheit ? 86.0f : 30.0f;
+      float maxValue = siFahrenheit ? 194.0f : 90.0f;
+      if (scaled < minValue) scaled = minValue;
+      if (scaled > maxValue) scaled = maxValue;
+      return chartY + chartH - 3 - (int)((scaled - minValue) * (chartH - 6) /
+                                         (maxValue - minValue));
+    };
+    int prevY = tempY(siTempHistory[start]);
+    for (int i = 1; i < siTempHistoryCount; i++) {
+      int index = (start + i) % kSiTempHistory;
+      int px = chartX + 2 + i * (chartW - 4) / (siTempHistoryCount - 1);
+      int py = tempY(siTempHistory[index]);
+      G().drawLine(prevX, prevY, px, py, theme::kGold);
+      prevX = px;
+      prevY = py;
+    }
+  } else {
+    gfxu::printFit(G(), chartX + 5, chartY + 15, chartW - 10, theme::kInkMuted,
+                   1, "Collecting 1-second samples...");
+  }
+
+  char value[48];
+  snprintf(value, sizeof(value), "%s · %lu sats · HDOP %.1f",
+           fix ? "FIX" : gps::statusLabel(),
+           (unsigned long)gps::satellites(), gps::hdop());
+  gfxu::drawKVRow(G(), x + 6, y + 90, w - 12, 17, "GPS", value,
                   fix ? theme::kGood : theme::kWarn);
   if (fix) {
-    snprintf(v, sizeof(v), "%.5f, %.5f", gps::latitude(), gps::longitude());
-    gfxu::drawKVRow(G(), x + 6, below + 86, w - 12, 18, "Lat/Lon", v,
+    snprintf(value, sizeof(value), "%.5f, %.5f · %.0fm", gps::latitude(),
+             gps::longitude(), gps::altitudeM());
+    gfxu::drawKVRow(G(), x + 6, y + 109, w - 12, 17, "Position", value,
                     theme::kCyan);
-    snprintf(v, sizeof(v), "%.0fm  sats %lu  hdop %.1f", gps::altitudeM(),
-             (unsigned long)gps::satellites(), gps::hdop());
-    gfxu::drawKVRow(G(), x + 6, below + 108, w - 12, 18, "Alt/HD", v);
   } else {
-    gfxu::drawKVRow(G(), x + 6, below + 86, w - 12, 18, "Wiring",
-                    "TX->GPIO43 RX->GPIO44", theme::kInkMuted);
+    gfxu::drawKVRow(G(), x + 6, y + 109, w - 12, 17, "Position",
+                    "No fix · TX->GPIO43 RX->GPIO44", theme::kInkMuted);
   }
-  snprintf(v, sizeof(v), "%d%% / %s", app::brightness(),
-           app::sdReady() ? "ok" : "no");
-  gfxu::drawKVRow(G(), x + 6, below + 130, w - 12, 18, "Bri / SD", v);
-  txt(x + 10, below + 156, theme::kInkMuted, 1, "Core temp is on-die (reads warm).");
+  snprintf(value, sizeof(value), "%lu mV · %d%% · %s",
+           (unsigned long)power::batteryMv(), pct, power::powerLabel());
+  gfxu::drawKVRow(G(), x + 6, y + 128, w - 12, 17, "Battery", value,
+                  power::lowBattery() ? theme::kBad : theme::kGold);
+  btn(x + 6, y + h - 27, 94, 22, siFahrenheit ? "TEMP: F" : "TEMP: C", false);
+  btn(x + 108, y + h - 27, 204, 22,
+      fix ? "SAVE GPS FIX" : "SAVE FIX · NO GPS", fix, theme::kCyan);
 }
-bool siTouch(int16_t, int16_t) { return false; }
+bool siTouch(int16_t x, int16_t y) {
+  if (y < theme::kScreenH - 32) return true;
+  if (x < 104) {
+    siFahrenheit = !siFahrenheit;
+  } else {
+    siSaveFix();
+  }
+  return true;
+}
 }  // namespace
 
 // ===========================================================================

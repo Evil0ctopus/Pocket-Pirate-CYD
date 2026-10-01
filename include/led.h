@@ -22,6 +22,7 @@ uint8_t brightness();
 void setBrightness(uint8_t pct);  // 5..100, persists
 
 const char* modeName(uint8_t m);
+const char* colorName(uint8_t idx);
 uint32_t colorRgb(uint8_t idx);  // 0xRRGGBB preset for swatch UI
 
 }  // namespace led

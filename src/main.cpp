@@ -96,6 +96,29 @@ uint32_t g_lastPresentMs = 0;
 uint32_t g_lastTapMs = 0;
 uint32_t g_lastDrawMs = 0;
 uint32_t g_tapStamp = 0;
+int16_t g_tapFeedbackX = -1;
+int16_t g_tapFeedbackY = -1;
+uint32_t g_tapFeedbackUntil = 0;
+
+static inline void drawTapFeedback() {
+  uint32_t now = millis();
+  if (g_tapFeedbackUntil == 0 || (int32_t)(g_tapFeedbackUntil - now) <= 0)
+    return;
+  const int x = g_tapFeedbackX;
+  const int y = g_tapFeedbackY;
+  const int outer = 8;
+  const int arm = 4;
+  const uint16_t color = ((now / 45) & 1) ? theme::kGold : theme::kCyan;
+  display.drawFastHLine(x - outer, y - outer, arm, color);
+  display.drawFastVLine(x - outer, y - outer, arm, color);
+  display.drawFastHLine(x + outer - arm + 1, y - outer, arm, color);
+  display.drawFastVLine(x + outer, y - outer, arm, color);
+  display.drawFastHLine(x - outer, y + outer, arm, color);
+  display.drawFastVLine(x - outer, y + outer - arm + 1, arm, color);
+  display.drawFastHLine(x + outer - arm + 1, y + outer, arm, color);
+  display.drawFastVLine(x + outer, y + outer - arm + 1, arm, color);
+  display.fillRect(x - 1, y - 1, 3, 3, theme::kGold);
+}
 
 // One SPI burst per frame. Split chrome/body presents caused a double freeze
 // (eye saw chrome, then the world hitch while body SPI ran) — feels like
@@ -106,6 +129,7 @@ static inline void present() {
   touch::read();
   uint32_t t0 = millis();
   if (g_canvasOk) canvas.pushSprite(0, 0);
+  drawTapFeedback();
   g_lastPresentMs = millis() - t0;
   touch::read();
   delay(0);  // yield so RF worker / WiFi can run between frames
@@ -225,6 +249,19 @@ void sayRandom() {
   g_sayUntil = millis() + 2800;
 }
 
+void drawPixelBackdrop(uint32_t phase, int seed) {
+  canvas.fillRect(0, 0, theme::kScreenW, theme::kScreenH, theme::kBgDeep);
+  for (int i = 0; i < 32; i++) {
+    int x = (i * 73 + seed * 17) % theme::kScreenW;
+    int y = (i * 47 + seed * 23) % theme::kScreenH;
+    bool bright = ((i + phase) % 5) == 0;
+    uint16_t color = bright ? ((i % 3) ? theme::kCyan : theme::kGold)
+                            : theme::kBorder;
+    int size = bright ? 2 : 1;
+    canvas.fillRect(x, y, size, size, color);
+  }
+}
+
 // Pixel-style speech bubble above the captain, with a stepped tail.
 void drawSpeechBubble(uint32_t now) {
   if (now > g_sayUntil || g_say[0] == 0) return;
@@ -236,10 +273,11 @@ void drawSpeechBubble(uint32_t now) {
   if (x < 4) x = 4;
   // Sit below the status strip so the bubble is never clipped.
   int y = theme::kHeaderH + theme::kStatusH + 6;
-  canvas.fillRoundRect(x, y, w, 22, 6, paper);
-  canvas.drawRoundRect(x, y, w, 22, 6, ink);
-  // soft triangular tail
-  canvas.fillTriangle(154, y + 21, 166, y + 21, 160, y + 30, paper);
+  canvas.fillRect(x + 2, y + 2, w, 22, theme::kBgDeep);
+  canvas.fillRect(x, y, w, 22, paper);
+  canvas.drawRect(x, y, w, 22, ink);
+  canvas.fillRect(156, y + 22, 8, 3, paper);
+  canvas.fillRect(158, y + 25, 4, 3, paper);
   canvas.setTextColor(ink);
   canvas.setTextSize(1);
   canvas.setCursor(x + 8, y + 8);
@@ -247,34 +285,50 @@ void drawSpeechBubble(uint32_t now) {
 }
 
 // ---------------------------------------------------------------------------
-//  World background (vector fallback when no /art/world.png)
+//  Block-pixel sea background and deck
 // ---------------------------------------------------------------------------
 void softCloud(int x, int y, int s) {
-  uint16_t w = rgb(250, 252, 255);
-  canvas.fillCircle(x, y, s, w);
-  canvas.fillCircle(x + s, y + 2, s - 2, w);
-  canvas.fillCircle(x - s, y + 3, s - 3, w);
-  canvas.fillCircle(x, y + 4, s + 1, w);
+  uint16_t cloud = rgb(238, 244, 226);
+  canvas.fillRect(x - s, y, s * 3, s / 2 + 2, cloud);
+  canvas.fillRect(x - s / 2, y - s / 2, s * 2, s / 2 + 2, cloud);
+  canvas.fillRect(x - s + 2, y + s / 2 + 2, s * 3 - 4, 2, cloud);
 }
 
 void drawWorldBg() {
   const int horizon = 150;
-  // step=2: half the scanline work, still reads as a soft sky/sea blend
-  gfxu::vGradient(canvas, 0, 0, 320, horizon, rgb(120, 196, 236),
-                  rgb(236, 226, 188), 2);
-  int sx = 268, sy = 52;
-  canvas.fillCircle(sx, sy, 28, blend565(rgb(255, 244, 190), rgb(236, 226, 188), 160));
-  canvas.fillCircle(sx, sy, 16, rgb(255, 236, 150));
+  canvas.fillRect(0, 0, 320, horizon, rgb(111, 181, 207));
+  canvas.fillRect(0, 112, 320, 38, rgb(213, 201, 163));
+  canvas.fillRect(254, 30, 24, 4, theme::kSun);
+  canvas.fillRect(248, 34, 36, 20, theme::kSun);
+  canvas.fillRect(254, 54, 24, 4, theme::kSun);
+  canvas.fillRect(244, 40, 4, 8, theme::kSun);
+  canvas.fillRect(284, 40, 4, 8, theme::kSun);
   softCloud(70, 44, 9);
   softCloud(180, 34, 7);
 
-  gfxu::vGradient(canvas, 0, horizon, 320, 240 - horizon, rgb(46, 154, 176),
-                  rgb(18, 92, 138), 2);
+  canvas.fillRect(0, horizon, 320, 90, rgb(24, 105, 143));
+  canvas.fillRect(0, 184, 320, 56, rgb(18, 79, 121));
   for (int row = 0; row < 5; row++) {
     int y = horizon + 12 + row * 16;
     int off = ((g_anim + row) % 4) * 6;
     for (int x = -20 + off; x < 330; x += 40)
-      canvas.fillRoundRect(x, y, 18, 4, 2, rgb(150, 208, 222));
+      canvas.fillRect(x, y, 18, 3, rgb(150, 208, 222));
+  }
+}
+
+void drawPixelDeck() {
+  const int top = theme::kContentBottom - 56;
+  canvas.fillRect(0, top, theme::kScreenW, 56, theme::kWoodDark);
+  canvas.fillRect(0, top + 3, theme::kScreenW, 53, theme::kWood);
+  canvas.drawFastHLine(0, top + 2, theme::kScreenW, theme::kGoldDim);
+  for (int row = 0; row < 3; row++) {
+    int seamY = top + 20 + row * 17;
+    canvas.drawFastHLine(0, seamY, theme::kScreenW, theme::kWoodDark);
+    int offset = (row & 1) ? 20 : 0;
+    for (int x = offset; x < theme::kScreenW; x += 48) {
+      canvas.drawFastVLine(x, seamY - 17, 17, theme::kWoodDark);
+      canvas.fillRect(x + 8, seamY - 12, 2, 2, theme::kWoodDark);
+    }
   }
 }
 
@@ -282,9 +336,12 @@ void drawWorldBg() {
 //  HUD
 // ---------------------------------------------------------------------------
 void coin(int x, int y, int r) {
-  canvas.fillCircle(x, y, r, theme::kGold);
-  canvas.fillCircle(x - r / 3, y - r / 3, max(1, r / 3), lighten(theme::kGold, 80));
-  canvas.drawCircle(x, y, r, darken(theme::kGold, 60));
+  canvas.fillRect(x - r + 2, y - r, 2 * r - 4, 2 * r, theme::kGold);
+  canvas.fillRect(x - r, y - r + 2, 2 * r, 2 * r - 4, theme::kGold);
+  canvas.drawRect(x - r + 1, y - r + 1, 2 * r - 2, 2 * r - 2,
+                  darken(theme::kGold, 70));
+  canvas.fillRect(x - r / 2, y - r / 2, max(2, r / 2), max(2, r / 2),
+                  lighten(theme::kGold, 80));
 }
 
 void drawHeaderBar() {
@@ -292,12 +349,12 @@ void drawHeaderBar() {
   const int hh = theme::kHeaderH;
   canvas.fillRect(0, 0, theme::kScreenW, hh, theme::kBgDeep);
   canvas.fillRect(0, 0, theme::kScreenW, 3, theme::kPanel);
-  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kGold);
-  canvas.drawFastHLine(0, hh, theme::kScreenW, theme::kTeal);
+  canvas.drawFastHLine(0, hh - 2, theme::kScreenW, theme::kGold);
+  canvas.drawFastHLine(0, hh - 1, theme::kScreenW, theme::kTeal);
 
   // avatar chip
-  canvas.fillCircle(18, hh / 2, 12, theme::kPanelSoft);
-  canvas.drawCircle(18, hh / 2, 12, theme::kBorderHi);
+  canvas.fillRect(5, 5, 27, 27, theme::kPanelSoft);
+  canvas.drawRect(5, 5, 27, 27, theme::kBorderHi);
   coin(18, hh / 2, 7);
 
   canvas.setTextColor(theme::kInk);
@@ -311,10 +368,12 @@ void drawHeaderBar() {
 
   // xp bar
   int bx = 148, bw = 118, by = 6;
-  canvas.fillRoundRect(bx, by, bw, 10, 4, theme::kBg);
-  canvas.drawRoundRect(bx, by, bw, 10, 4, theme::kBorder);
+  canvas.fillRect(bx, by, bw, 10, theme::kBg);
+  canvas.drawRect(bx, by, bw, 10, theme::kBorder);
   int fill = game::levelProgressPct() * (bw - 4) / 100;
-  if (fill > 0) canvas.fillRoundRect(bx + 2, by + 2, fill, 6, 3, theme::kGold);
+  if (fill > 0) canvas.fillRect(bx + 2, by + 2, fill, 6, theme::kGold);
+  for (int px = bx + 12; px < bx + bw; px += 12)
+    canvas.drawFastVLine(px, by + 2, 6, theme::kBgDeep);
   canvas.setTextColor(theme::kInkMuted);
   canvas.setCursor(bx, 20);
   if (game::profile.level >= game::kMaxLevel)
@@ -333,8 +392,9 @@ void drawHeaderBar() {
 void drawToastOverlay() {
   if (millis() > g_toastUntil || g_toast[0] == 0) return;
   int ty = theme::kContentBottom - 30;
-  canvas.fillRoundRect(20, ty, 280, 26, 6, theme::kBgDeep);
-  canvas.drawRoundRect(20, ty, 280, 26, 6, theme::kGold);
+  canvas.fillRect(22, ty + 2, 280, 26, theme::kBgDeep);
+  canvas.fillRect(20, ty, 280, 26, theme::kBg);
+  canvas.drawRect(20, ty, 280, 26, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setTextSize(1);
   canvas.setCursor(32, ty + 9);
@@ -346,8 +406,8 @@ void drawStatusStrip() {
   const int ty = theme::kHeaderH + 2;
   // Full-bleed under tabs: strip runs to just before the DECK tab.
   const int sw = theme::kScreenW - theme::kPad - (54 * 2 + 2) - 4;  // ~206
-  canvas.fillRoundRect(0, ty, sw, theme::kStatusH, 3, theme::kBgDeep);
-  canvas.drawRoundRect(0, ty, sw, theme::kStatusH, 3, theme::kBorder);
+  canvas.fillRect(0, ty, sw, theme::kStatusH, theme::kBgDeep);
+  canvas.drawRect(0, ty, sw, theme::kStatusH, theme::kBorder);
   canvas.setTextSize(1);
   uint16_t pc = power::lowBattery() ? theme::kBad
                                     : (power::usbPowered() ? theme::kGood
@@ -378,9 +438,10 @@ void drawViewTabs() {
   for (int i = 0; i < 2; i++) {
     int tx = tx0 + i * (tw + gap);
     bool on = (g_seaView == (i == 1));
-    canvas.fillRoundRect(tx, ty, tw, th, 5,
-                         on ? theme::kGold : theme::kPanelSoft);
-    if (!on) canvas.drawRoundRect(tx, ty, tw, th, 5, theme::kBorder);
+    canvas.fillRect(tx, ty, tw, th, on ? theme::kGold : theme::kPanelSoft);
+    canvas.drawRect(tx, ty, tw, th,
+            on ? lighten(theme::kGold, 48) : theme::kBorder);
+    if (on) canvas.fillRect(tx + 4, ty + th - 3, tw - 8, 2, theme::kOnGold);
     gfxu::printCentered(canvas, tx, ty, tw, th,
                         on ? theme::kOnGold : theme::kInk, 1, names[i]);
   }
@@ -391,19 +452,13 @@ void drawWorld() {
   int avatar = game::profile.avatar;
   int tier = pc::tierOf(game::profile.level);
 
-  // --- background: art sky (cached blit) or vector fallback ---------------
-  // Skipping drawWorldBg when sky art is present avoids a full-screen
-  // per-scanline gradient every frame (major lag source on CYD).
-  if (!art::drawSky(canvas)) drawWorldBg();
-  art::drawClouds(canvas, (int)(now / 70));
-  art::drawWaves(canvas, (int)(now / 28));
+  drawWorldBg();
 
   int bob = (int)((now / 400) % 2) * 3;
 
   if (g_seaView) {
     // --- SHIP page: the vessel alone on open water, centered on the horizon
-    if (!art::drawShip(canvas, tier, 85, 83 + bob))
-      chibi::drawShip(canvas, 160, 150 + bob, tier);
+    chibi::drawShip(canvas, 160, 150 + bob, tier, (now / 250) % 3);
     drawHeaderBar();
     canvas.setTextColor(theme::kInk);
     canvas.setTextSize(1);
@@ -411,49 +466,31 @@ void drawWorld() {
     canvas.print(game::shipName(game::profile.level));
   } else {
     // --- DECK page: the captain on deck; no ship on this page --------------
-    if (art::haveCaptain(avatar, tier)) {
-      int clip = art::IDLE, frame = 0;
-      if (g_actClip >= 0) {  // a one-shot flourish is playing (two loops)
-        int fc = art::frameCount(avatar, tier, g_actClip);
-        int f = (int)((now - g_actStart) / 150);
-        if (fc > 0 && f < fc * 2) {
-          clip = g_actClip;
-          frame = f % fc;
-        } else {
-          g_actClip = -1;
-          g_nextActAt = now + 5000 + (esp_random() % 9000);
-        }
+    int clip = art::IDLE, frame = 0;
+    if (g_actClip >= 0) {
+      int actionFrame = (int)((now - g_actStart) / 150);
+      if (actionFrame < 6) {
+        clip = g_actClip;
+        frame = actionFrame % 3;
+      } else {
+        g_actClip = -1;
+        g_nextActAt = now + 5000 + (esp_random() % 9000);
       }
-      if (g_actClip < 0 && now >= g_nextActAt) {
-        // the captain does something on their own: wave/fight/jig/look
-        const int acts[4] = {art::WAVE, art::FIGHT, art::JIG, art::LOOK};
-        int have[4], nh = 0;
-        for (int i = 0; i < 4; i++)
-          if (art::frameCount(avatar, tier, acts[i]) > 0) have[nh++] = acts[i];
-        if (nh > 0) {
-          g_actClip = have[esp_random() % nh];
-          g_actStart = now;
-          clip = g_actClip;
-          frame = 0;
-          if (esp_random() % 10 < 6) sayRandom();
-        } else {
-          g_nextActAt = now + 8000;
-        }
-      }
-      if (clip == art::IDLE) {
-        int fc = art::frameCount(avatar, tier, art::IDLE);
-        if (fc < 1) fc = 1;
-        frame = (int)((now / 140) % fc);
-      }
-      int fw = art::frameW(avatar, tier), fh = art::frameH(avatar, tier);
-      art::drawCaptainFrame(canvas, avatar, tier, clip, frame, 160 - fw / 2,
-                            theme::kContentBottom - fh);
-    } else {
-      chibi::drawCaptain(canvas, 128, 96 + bob, avatar, tier);
     }
+    if (g_actClip < 0 && now >= g_nextActAt) {
+      const int acts[4] = {art::WAVE, art::FIGHT, art::JIG, art::LOOK};
+      g_actClip = acts[esp_random() % 4];
+      g_actStart = now;
+      clip = g_actClip;
+      frame = 0;
+      if (esp_random() % 10 < 6) sayRandom();
+    }
+    if (clip == art::IDLE) {
+      frame = (int)((now / 140) % 3);
+    }
+    chibi::drawCaptain(canvas, 128, 96 + bob, avatar, tier, clip, frame);
 
-    // --- foreground deck (drawn over the captain's feet) --------------------
-    art::drawDeck(canvas);
+    drawPixelDeck();
     drawHeaderBar();
     drawSpeechBubble(now);
   }
@@ -475,7 +512,10 @@ void drawWorld() {
   // Flush to the right panel edge (no right gutter).
   const int btnW = 92;
   const int btnX = theme::kScreenW - btnW;
-  canvas.fillRoundRect(btnX, by + 2, btnW, theme::kBottomBarH - 4, 6, theme::kGold);
+  canvas.fillRect(btnX + 2, by + 4, btnW, theme::kBottomBarH - 4, theme::kBgDeep);
+  canvas.fillRect(btnX, by + 2, btnW, theme::kBottomBarH - 4, theme::kGold);
+  canvas.drawRect(btnX, by + 2, btnW, theme::kBottomBarH - 4,
+                  lighten(theme::kGold, 48));
   gfxu::printCentered(canvas, btnX, by + 2, btnW, theme::kBottomBarH - 4,
                       theme::kOnGold, 1, "STATIONS");
 }
@@ -484,32 +524,31 @@ void drawWorld() {
 //  Captain select (full-size carousel)
 // ---------------------------------------------------------------------------
 void drawArrow(int cx, int cy, bool right) {
-  canvas.fillCircle(cx, cy, 16, theme::kPanelSoft);
-  canvas.drawCircle(cx, cy, 16, theme::kGold);
-  int d = right ? 5 : -5;
-  canvas.fillTriangle(cx - d, cy - 8, cx - d, cy + 8, cx + d, cy, theme::kInk);
+  canvas.fillRect(cx - 15, cy - 13, 30, 28, theme::kBgDeep);
+  canvas.fillRect(cx - 15, cy - 15, 30, 28, theme::kPanelSoft);
+  canvas.drawRect(cx - 15, cy - 15, 30, 28, theme::kGold);
+  for (int i = 0; i < 4; i++) {
+    int x = right ? cx - 6 + i * 3 : cx + 6 - i * 3;
+    canvas.fillRect(x, cy - 6 + i * 3, 3, 13 - i * 6, theme::kInk);
+  }
 }
 
 void drawSelect() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
+  drawPixelBackdrop(millis() / 420, 3);
+  canvas.fillRect(48, 5, 224, 27, theme::kPanelSoft);
+  canvas.drawRect(48, 5, 224, 27, theme::kBorderHi);
   canvas.setTextColor(theme::kGold);
   canvas.setTextSize(2);
   canvas.setCursor(64, 8);
   canvas.print("Choose Captain");
 
   const pc::Captain& c = pc::kCaptains[g_sel];
-  // spotlight
-  canvas.fillCircle(160, 118, 74, theme::kPanel);
-  if (art::haveCaptain(g_sel, 2)) {
-    int fc = art::frameCount(g_sel, 2, art::IDLE);
-    if (fc < 1) fc = 1;
-    int frame = (int)((millis() / 160) % fc);
-    int fw = art::frameW(g_sel, 2), fh = art::frameH(g_sel, 2);
-    art::drawCaptainFrame(canvas, g_sel, 2, art::IDLE, frame, 160 - fw / 2,
-                          192 - fh);
-  } else {
-    chibi::drawCaptain(canvas, 160, 104, g_sel, 2);
-  }
+  canvas.fillRect(66, 38, 188, 146, theme::kBg);
+  canvas.fillRect(70, 42, 180, 138, theme::kSea);
+  canvas.drawRect(66, 38, 188, 146, theme::kBorderHi);
+  canvas.drawFastHLine(68, 40, 184, theme::kGold);
+  chibi::drawCaptain(canvas, 160, 104, g_sel, 2, art::IDLE,
+                     (millis() / 160) % 3);
 
   drawArrow(24, 120, false);
   drawArrow(296, 120, true);
@@ -525,15 +564,17 @@ void drawSelect() {
   canvas.setCursor(160 - trW / 2, 196);
   canvas.print(c.trait);
 
-  canvas.fillRoundRect(112, 210, 96, 26, 7, theme::kGold);
+  canvas.fillRect(114, 212, 96, 26, theme::kBgDeep);
+  canvas.fillRect(112, 210, 96, 26, theme::kGold);
+  canvas.drawRect(112, 210, 96, 26, lighten(theme::kGold, 48));
   canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(130, 218);
   canvas.print("SET SAIL");
 
   // dots
   for (int i = 0; i < pc::kCaptainCount; i++)
-    canvas.fillCircle(148 + i * 8, 2, 2,
-                            i == g_sel ? theme::kGold : theme::kLocked);
+    canvas.fillRect(147 + i * 8, 1, 3, 3,
+            i == g_sel ? theme::kGold : theme::kLocked);
 }
 
 // ---------------------------------------------------------------------------
@@ -543,41 +584,53 @@ const char* kKeyRows[4] = {"ABCDEFG", "HIJKLMN", "OPQRSTU", "VWXYZ.-"};
 constexpr int kNameMax = 16;
 
 void drawName() {
-  gfxu::vGradient(canvas, 0, 0, 320, 240, theme::kBg, theme::kBgDeep);
+  drawPixelBackdrop(millis() / 420, 11);
+  canvas.fillRect(42, 5, 236, 27, theme::kPanelSoft);
+  canvas.drawRect(42, 5, 236, 27, theme::kBorderHi);
   canvas.setTextColor(theme::kGold);
   canvas.setTextSize(2);
   canvas.setCursor(66, 8);
   canvas.print("Name yer pirate");
 
-  canvas.fillRoundRect(20, 30, 280, 28, 6, theme::kBgDeep);
-  canvas.drawRoundRect(20, 30, 280, 28, 6, theme::kGold);
+  canvas.fillRect(22, 32, 280, 28, theme::kBgDeep);
+  canvas.fillRect(20, 30, 280, 28, theme::kBg);
+  canvas.drawRect(20, 30, 280, 28, theme::kGold);
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(30, 37);
   canvas.print(g_nameBuf);
   int len = (int)strlen(g_nameBuf);
   if ((millis() / 400) % 2 && len < kNameMax)
-    canvas.fillRect(30 + len * 12, 36, 10, 16, theme::kGold);
+    canvas.fillRect(30 + len * 12, 36, 2, 16, theme::kGold);
 
   for (int r = 0; r < 4; r++) {
     int ry = 66 + r * 34;
     for (int c = 0; c < 7; c++) {
       int cx = 6 + c * 45;
-      canvas.fillRoundRect(cx, ry, 43, 30, 5, theme::kPanel);
+      canvas.fillRect(cx + 2, ry + 2, 43, 30, theme::kBgDeep);
+      canvas.fillRect(cx, ry, 43, 30, theme::kPanel);
+      canvas.drawRect(cx, ry, 43, 30, theme::kBorder);
+      canvas.drawFastHLine(cx + 1, ry + 1, 41, lighten(theme::kPanel, 48));
       canvas.setTextColor(theme::kInk);
       canvas.setTextSize(2);
       canvas.setCursor(cx + 16, ry + 8);
       canvas.printf("%c", kKeyRows[r][c]);
     }
   }
-  canvas.fillRoundRect(6, 204, 130, 32, 5, theme::kPanel);
+  canvas.fillRect(8, 206, 130, 32, theme::kBgDeep);
+  canvas.fillRect(6, 204, 130, 32, theme::kPanel);
+  canvas.drawRect(6, 204, 130, 32, theme::kBorder);
   canvas.setTextColor(theme::kInkDim);
   canvas.setCursor(41, 213);
   canvas.print("SPACE");
-  canvas.fillRoundRect(142, 204, 80, 32, 5, theme::kBad);
+  canvas.fillRect(144, 206, 80, 32, theme::kBgDeep);
+  canvas.fillRect(142, 204, 80, 32, theme::kBad);
+  canvas.drawRect(142, 204, 80, 32, lighten(theme::kBad, 48));
   canvas.setTextColor(theme::kInk);
   canvas.setCursor(164, 213);
   canvas.print("DEL");
-  canvas.fillRoundRect(228, 204, 86, 32, 5, theme::kGold);
+  canvas.fillRect(230, 206, 86, 32, theme::kBgDeep);
+  canvas.fillRect(228, 204, 86, 32, theme::kGold);
+  canvas.drawRect(228, 204, 86, 32, lighten(theme::kGold, 48));
   canvas.setTextColor(theme::kOnGold);
   canvas.setCursor(242, 213);
   canvas.print("DONE");
@@ -599,7 +652,7 @@ void nameCommit() {
 //  Stations menu
 // ---------------------------------------------------------------------------
 void drawMenu() {
-  canvas.fillRect(0, 0, theme::kScreenW, theme::kScreenH, theme::kBgDeep);
+  drawPixelBackdrop(millis() / 500, 17);
   drawHeaderBar();
 
   int total = tools::count();
@@ -610,11 +663,13 @@ void drawMenu() {
 
   const int stripY = theme::kHeaderH + 2;
   canvas.fillRect(0, stripY, theme::kScreenW, 14, theme::kPanelSoft);
-  canvas.drawFastHLine(0, stripY + 13, theme::kScreenW, theme::kBorderHi);
+  canvas.drawFastHLine(0, stripY + 12, theme::kScreenW, theme::kBorderHi);
+  canvas.fillRect(302, stripY + 4, 2, 2,
+                  ((millis() / 500) & 1) ? theme::kGold : theme::kCyan);
   canvas.setTextColor(theme::kTeal);
   canvas.setTextSize(1);
   canvas.setCursor(6, stripY + 3);
-  canvas.print("Ship OS · Stations");
+  canvas.print("Ship OS - Stations");
   canvas.setTextColor(theme::kInkMuted);
   canvas.setCursor(theme::kScreenW - 34, stripY + 3);
   canvas.printf("%d/%d", g_menuPage + 1, pages);
@@ -634,10 +689,11 @@ void drawMenu() {
     int tx = x0 + col * (tileW + gap);
     int ty = y0 + row * (tileH + gap);
     const tools::Tool& t = tools::at(i);
-    // Elevated opaque tile + hairline accent (Pirate Cabin, not crayon).
-    canvas.fillRoundRect(tx, ty, tileW, tileH, 6, theme::kPanelElev);
-    canvas.drawRoundRect(tx, ty, tileW, tileH, 6, theme::kBorder);
-    canvas.fillRect(tx + 1, ty + 3, theme::kAccentW, tileH - 6, t.accent);
+    canvas.fillRect(tx + 2, ty + 2, tileW, tileH, theme::kBgDeep);
+    canvas.fillRect(tx, ty, tileW, tileH, theme::kPanelElev);
+    canvas.drawRect(tx, ty, tileW, tileH, theme::kBorder);
+    canvas.drawFastHLine(tx + 1, ty + 1, tileW - 2, lighten(theme::kPanelElev, 36));
+    canvas.fillRect(tx + 2, ty + 3, theme::kAccentW, tileH - 6, t.accent);
     gfxu::drawGlyph(canvas, tx + tileW / 2, ty + 16, 11, i, t.accent);
     const char* label = (t.tile && t.tile[0]) ? t.tile : t.title;
     gfxu::printCentered(canvas, tx + 4, ty + tileH - 16, tileW - 8, 12,
@@ -648,19 +704,24 @@ void drawMenu() {
   const int by = theme::kContentBottom;
   canvas.fillRect(0, by, theme::kScreenW, theme::kBottomBarH, theme::kBgDeep);
   canvas.drawFastHLine(0, by, theme::kScreenW, theme::kBorder);
-  canvas.fillRoundRect(0, by + 2, 76, theme::kBottomBarH - 4, 6, theme::kGold);
+  canvas.fillRect(2, by + 4, 76, theme::kBottomBarH - 4, theme::kBgDeep);
+  canvas.fillRect(0, by + 2, 76, theme::kBottomBarH - 4, theme::kGold);
+  canvas.drawRect(0, by + 2, 76, theme::kBottomBarH - 4,
+                  lighten(theme::kGold, 48));
   gfxu::printCentered(canvas, 0, by + 2, 76, theme::kBottomBarH - 4,
                       theme::kOnGold, 1, "< DECK");
   if (pages > 1) {
-    canvas.fillRoundRect(148, by + 2, 36, theme::kBottomBarH - 4, 6,
-                         theme::kPanelHi);
+    canvas.fillRect(148, by + 2, 36, theme::kBottomBarH - 4, theme::kPanelHi);
+    canvas.drawRect(148, by + 2, 36, theme::kBottomBarH - 4, theme::kBorderHi);
     gfxu::printCentered(canvas, 148, by + 2, 36, theme::kBottomBarH - 4,
                         theme::kInk, 1, "<");
     canvas.setTextColor(theme::kInkDim);
     canvas.setCursor(192, by + 9);
     canvas.printf("%d/%d", g_menuPage + 1, pages);
-    canvas.fillRoundRect(theme::kScreenW - 40, by + 2, 40, theme::kBottomBarH - 4, 6,
-                         theme::kPanelHi);
+    canvas.fillRect(theme::kScreenW - 40, by + 2, 40, theme::kBottomBarH - 4,
+            theme::kPanelHi);
+    canvas.drawRect(theme::kScreenW - 40, by + 2, 40,
+            theme::kBottomBarH - 4, theme::kBorderHi);
     gfxu::printCentered(canvas, theme::kScreenW - 40, by + 2, 40,
                         theme::kBottomBarH - 4, theme::kInk, 1, ">");
   }
@@ -676,8 +737,8 @@ void drawToolHeader() {
   canvas.drawFastHLine(0, hh, theme::kScreenW, theme::kBorder);
 
   // Back chip (hit zone x<64 in handleTap)
-  canvas.fillRoundRect(6, 5, 48, hh - 10, 5, theme::kPanelSoft);
-  canvas.drawRoundRect(6, 5, 48, hh - 10, 5, theme::kBorderHi);
+  canvas.fillRect(6, 5, 48, hh - 10, theme::kPanelSoft);
+  canvas.drawRect(6, 5, 48, hh - 10, theme::kBorderHi);
   gfxu::printCentered(canvas, 6, 5, 48, hh - 10, theme::kInk, 1, "< Back");
 
   gfxu::drawGlyph(canvas, 70, hh / 2, 10, g_toolIndex, t.accent);
@@ -700,10 +761,7 @@ void drawToolHeader() {
   gfxu::drawBadge(canvas, 214, 6, 48, 12, bat, batFg);
   bool fix = gps::hasFix();
   char gpsLab[10];
-  snprintf(gpsLab, sizeof(gpsLab), "GPS:%s", gps::statusLabel());
-  if ((int)strlen(gpsLab) > 9) {
-    snprintf(gpsLab, sizeof(gpsLab), "%s", gps::statusLabel());
-  }
+  snprintf(gpsLab, sizeof(gpsLab), "%s", fix ? "GPS FIX" : "NO GPS");
   gfxu::drawBadge(canvas, 266, 6, 50, 12, gpsLab,
                   fix ? theme::kGood : theme::kInkMuted);
   // Second row micro-status under badges
@@ -719,6 +777,9 @@ void drawToolHeader() {
 // ---------------------------------------------------------------------------
 void handleTap(int16_t x, int16_t y) {
   g_tapStamp = millis();
+  g_tapFeedbackX = x;
+  g_tapFeedbackY = y;
+  g_tapFeedbackUntil = g_tapStamp + 140;
   switch (g_screen) {
     case Screen::Select:
       if (y >= 90 && y <= 160 && x <= 50) {
@@ -1132,7 +1193,6 @@ void setup() {
 
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
   g_sdReady = SD_MMC.begin("/sdcard", false);
-  art::begin(g_sdReady);
 
   g_screen = (game::profile.level == 0 && game::profile.xp == 0)
                  ? Screen::Select
@@ -1217,8 +1277,10 @@ void loop() {
     present();
   } else if (g_screen == Screen::Menu) {
     bool toastLive = (millis() <= g_toastUntil && g_toast[0]);
-    if (g_menuDirty || (toastLive && now - g_lastDraw > 250)) {
+    bool animateMenu = now - g_lastDraw > 500;
+    if (g_menuDirty || animateMenu || (toastLive && now - g_lastDraw > 250)) {
       g_lastDraw = now;
+      if (animateMenu) g_anim = (g_anim + 1) % 8;
       g_menuDirty = false;
       drawMenu();
       drawToastOverlay();

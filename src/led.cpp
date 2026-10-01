@@ -16,6 +16,8 @@ uint32_t g_lastApply = 0;
 
 const char* kModeNames[ModeCount] = {"Off", "Solid", "Beacon", "Rainbow",
                                      "Alarm"};
+const char* kColorNames[kColorCount] = {"Gold", "Red", "Green", "Blue",
+                                        "Teal", "Purple", "White", "Orange"};
 // gold, red, green, blue, teal, purple, white, orange
 const uint32_t kColors[kColorCount] = {0xF4CA4E, 0xD23C32, 0x2C9858, 0x2C54A0,
                                        0x1E8480, 0x8C46B4, 0xF0F0E6, 0xE07820};
@@ -110,6 +112,7 @@ void setBrightness(uint8_t pct) {
   apply(millis());
 }
 const char* modeName(uint8_t m) { return kModeNames[m % ModeCount]; }
+const char* colorName(uint8_t idx) { return kColorNames[idx % kColorCount]; }
 uint32_t colorRgb(uint8_t idx) { return kColors[idx % kColorCount]; }
 
 }  // namespace led
